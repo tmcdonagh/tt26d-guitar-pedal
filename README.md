@@ -1,42 +1,28 @@
-![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
+# Silicon Guitar Pedal
 
-# Tiny Tapeout Verilog Project Template
+## My attempt at a guitar pedal within a 1x1 Tiny Tapeout digital design.
 
-- [Read the documentation for project](docs/info.md)
+Since the tile itself is digital I chose to use an external ADC and DAC to turn
+the guitar's analog signal into digital values that the tile can act on, then
+it can turn it back into an analog signal with the DAC. Apparently I2S is not too
+difficult to implement so that's what I'm hoping I can go with.
 
-## What is Tiny Tapeout?
+## AI Usage
+This project uses AI heavily. Specifically I've been experimenting with open weight
+models provided through API access like Kimi K2.7 Code and GLM-5.3-Flash.
 
-Tiny Tapeout is an educational project that aims to make it easier and cheaper than ever to get your digital and analog designs manufactured on a real chip.
+| Mode (ui[3:1]) | Effect |
+|---|---|
+| 0 | Bypass |
+| 1 | Octave fuzz (full-wave rectify + clip) |
+| 2 | Distortion (drive gain + hard clip) |
+| 3 | Ring modulator (square-wave LFO sign multiply) |
+| 4 | Tremolo (triangle LFO, depth × rate) |
+| 5 | Bitcrusher (bit-depth quantize + sample-hold decimate) |
+| 6 | Fuzz → distortion chain |
+| 7 | Test tone (internal square wave, no input needed) |
 
-To learn more and get started, visit https://tinytapeout.com.
+Parameters ride `ui[7:4]` (per-effect meaning in the repo README/spec). A
+5-LED peak level meter with per-sample decay drives `uo[5:1]`.
 
-## Set up your Verilog project
-
-1. Add your Verilog files to the `src` folder.
-2. Edit the [info.yaml](info.yaml) and update information about your project, paying special attention to the `source_files` and `top_module` properties. If you are upgrading an existing Tiny Tapeout project, check out our [online info.yaml migration tool](https://tinytapeout.github.io/tt-yaml-upgrade-tool/).
-3. Edit [docs/info.md](docs/info.md) and add a description of your project.
-4. Adapt the testbench to your design. See [test/README.md](test/README.md) for more information.
-
-The GitHub action will automatically build the ASIC files using [LibreLane](https://www.zerotoasiccourse.com/terminology/librelane/).
-
-## Enable GitHub actions to build the results page
-
-- [Enabling GitHub Pages](https://tinytapeout.com/faq/#my-github-action-is-failing-on-the-pages-part)
-
-## Resources
-
-- [FAQ](https://tinytapeout.com/faq/)
-- [Digital design lessons](https://tinytapeout.com/digital_design/)
-- [Learn how semiconductors work](https://tinytapeout.com/siliwiz/)
-- [Join the community](https://tinytapeout.com/discord)
-- [Build your design locally](https://www.tinytapeout.com/guides/local-hardening/)
-
-## What next?
-
-- [Submit your design to the next shuttle](https://app.tinytapeout.com/).
-- Edit [this README](README.md) and explain your design, how it works, and how to test it.
-- Share your project on your social network of choice:
-  - LinkedIn [#tinytapeout](https://www.linkedin.com/search/results/content/?keywords=%23tinytapeout) [@TinyTapeout](https://www.linkedin.com/company/100708654/)
-  - Mastodon [#tinytapeout](https://chaos.social/tags/tinytapeout) [@matthewvenn](https://chaos.social/@matthewvenn)
-  - X (formerly Twitter) [#tinytapeout](https://twitter.com/hashtag/tinytapeout) [@tinytapeout](https://twitter.com/tinytapeout)
-  - Bluesky [@tinytapeout.com](https://bsky.app/profile/tinytapeout.com)
+See [docs/info.md](docs/info.md) for pinout and testing details.
