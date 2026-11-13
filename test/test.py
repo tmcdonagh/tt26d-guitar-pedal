@@ -235,3 +235,293 @@ async def test_reset_state(dut):
     assert tx_data_bits(bits) == 0, \
         f"second frame after reset must be silent, got {tx_data_bits(bits):#06x}"
     assert ((int(dut.uo_out.value) >> 1) & 0x1F) == 0, "LED bar must be dark after reset"
+
+
+@cocotb.test()
+async def test_led_meter(dut):
+    """LED bar = max(|sample|>>11 clamped to 15, bar-1), updated once per
+    frame. Sequence: full-scale -> 15; decay by 1 per sample; 16 zeros
+    reach 0; small sample re-lights to its level (max rule)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def send_and_read_bar(word16):
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, word16 << 8)
+        await ClockCycles(dut.clk, 4)
+        await Timer(1, unit="ns")
+        return (int(dut.uo_out.value) >> 1) & 0x1F
+
+    assert await send_and_read_bar(0x8000) == 15, "|-32768| saturates to bar 15"
+    bar_decay = await send_and_read_bar(0x0000)
+    assert bar_decay == 14, f"one zero frame should decay to 14, got {bar_decay}"
+    for _ in range(16):
+        bar = await send_and_read_bar(0x0000)
+    assert bar == 0, f"16 zero frames must decay to 0, got {bar}"
+    assert await send_and_read_bar(0x0FFF) == 1, "|4095|>>11 = bar 1"
+
+
+# ui byte layout: ui[0]=I2S data (driven by helper), ui[3:1]=mode,
+# ui[5:4]=bit-depth sel, ui[7:6]=decimation sel
+
+@cocotb.test()
+async def test_bitcrush_quantize(dut):
+    """Mode 5, no decimation: output = input with low (16-N) bits masked.
+    N=16 keeps all, N=10 masks 6, N=8 masks 8."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def crush_once(param_byte, word16):
+        dut.ui_in.value = param_byte  # ui[0] rewritten by helper
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, word16 << 8)
+        await _wait_left_start(dut)
+        bits = await i2s_send_and_capture(dut, 0)
+        return tx_data_bits(bits)
+
+    # N=8 (ui[5:4]=10 -> mask 0xFF00), decim=0
+    assert await crush_once(0b0_10_101_0, 0x0FFF) == 0x0F00
+    # N=10 (ui[5:4]=01 -> mask 0xFFC0)
+    assert await crush_once(0b0_01_101_0, 0x0FFF) == 0x0FC0
+    # N=16 (ui[5:4]=00 -> no mask)
+    assert await crush_once(0b0_00_101_0, 0x0FFF) == 0x0FFF
+    # negative values keep sign through masking
+    assert await crush_once(0b0_10_101_0, 0xFF9C) == 0xFF00
+
+
+@cocotb.test()
+async def test_bitcrush_decimate(dut):
+    """Mode 5 with divide-by-2 sample-hold. The latch phase after mid-frame
+    reset is arbitrary, so inject each value twice on consecutive frames;
+    regardless of phase, the output stream must show each value repeated
+    twice, in order (shifted by 0 or 1 frame)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b01_00_101_0  # N=16 (ui[5:4]=00), decim=/2 (ui[7:6]=01)
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    vals = [0x1111, 0x3333, 0x5555, 0x7777, 0xAAAA, 0xCCCC]
+    inputs = [v for v in vals for _ in (0, 1)]  # each value twice
+    outs = []
+    for word16 in inputs:
+        await _wait_left_start(dut)
+        outs.append(tx_data_bits(await i2s_send_and_capture(dut, word16 << 8)))
+
+    expected = inputs  # held stream = each value twice
+    # find the phase: an 8-sample window of outs must equal the held pattern
+    ok = any(outs[o:o + 8] == expected[0:8] for o in (1, 2))
+    assert ok, f"held pattern not found; outs={[hex(o) for o in outs]}"
+
+
+@cocotb.test()
+async def test_ring_mod_square(dut):
+    """Mode 3: output = input * (+/-1) alternating with an LFO whose
+    half-period is 2^(10-k) samples (k = ui[6:4]). DC +1000 in, k=2
+    (half-period 256 frames): sign flips every 256 frames, amplitude
+    exactly +/-1000."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b0010_011_0  # mode 3, k=2 (half-period 256)
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    outs = []
+    for _ in range(600):
+        await _wait_left_start(dut)
+        outs.append(tx_data_bits(await i2s_send_and_capture(dut, 1000 << 8)))
+
+    signed = [o - 0x10000 if o & 0x8000 else o for o in outs]
+    # outs[0] is the partial reset frame (may be 0) — same as Task 3 ruling
+    assert set(signed[1:]) <= {1000, -1000}, \
+        f"ring mod output must be +/-1000, saw {[hex(o) for o in outs[:8]]}..."
+    assert signed[31] == signed[201], "sign must be stable within one phase"
+    assert signed[31] == -signed[287], "sign must flip after one half-period (256)"
+    assert signed[31] == signed[543], "sign must return after a full period (512)"
+
+
+@cocotb.test()
+async def test_distortion_gain(dut):
+    """Mode 2: out = sat16(in * G), G = 1 + ui[5:4] (1..5)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def dist_once(param_byte, word16):
+        dut.ui_in.value = param_byte
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, word16 << 8)
+        await _wait_left_start(dut)
+        bits = await i2s_send_and_capture(dut, 0)
+        out = tx_data_bits(bits)
+        return out - 0x10000 if out & 0x8000 else out
+
+    # G=3 (ui[5:4]=10): 1000*3 = 3000
+    assert await dist_once(0b00_10_010_0, 1000) == 3000
+    # G=5 (ui[5:4]=11): 20000*5 saturates
+    assert await dist_once(0b00_11_010_0, 20000) == 32767
+    assert await dist_once(0b00_11_010_0, -20000) == -32768  # spec sat16: clamp to -32768
+    # G=1 (ui[5:4]=00): clean pass-through
+    assert await dist_once(0b00_00_010_0, 1234) == 1234
+
+
+@cocotb.test()
+async def test_fuzz_rectify(dut):
+    """Mode 1: full-wave rectifier (|x|) with parametric clip T
+    (ui[5:4]: 00->24576, 01->16384, 10->8192, 11->4096)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def fuzz_once(param_byte, word16):
+        dut.ui_in.value = param_byte
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, word16 << 8)
+        await _wait_left_start(dut)
+        bits = await i2s_send_and_capture(dut, 0)
+        return tx_data_bits(bits)
+
+    # T=24576 (default 00): negative input folds positive, small signal unclipped
+    assert await fuzz_once(0b00_00_001_0, -1000) == 1000
+    assert await fuzz_once(0b00_00_001_0, 3000) == 3000
+    # T=8192 (ui[5:4]=10): |−30000| clips to 8192
+    assert await fuzz_once(0b00_10_001_0, -30000) == 8192
+    # T=4096 (ui[5:4]=11): |+3000| = 3000 stays below T
+    assert await fuzz_once(0b00_11_001_0, 3000) == 3000
+    assert await fuzz_once(0b00_11_001_0, -30000) == 4096
+
+
+@cocotb.test()
+async def test_fuzz_dist_chain(dut):
+    """Mode 6: rectify, clip at fixed 16384, then saturating x3."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b00_00_110_0  # mode 6
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def chain_once(word16):
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, word16 << 8)
+        await _wait_left_start(dut)
+        bits = await i2s_send_and_capture(dut, 0)
+        out = tx_data_bits(bits)
+        return out - 0x10000 if out & 0x8000 else out
+
+    assert await chain_once(-20000) == 32767   # 20000->clip 16384->x3->sat
+    assert await chain_once(5000) == 15000     # 5000->5000->x3
+    assert await chain_once(20000) == 32767    # clip then x3
+
+
+@cocotb.test()
+async def test_tremolo(dut):
+    """Mode 4: out = (in * f) >> 8 via the serial multiplier; f = triangle
+    255<->min over 2*2^(10-k) frames. k=7 (ramp=8 frames), min=0.
+    The multiplier uses f of the post-increment LFO counter; with the
+    partial reset frame consuming count 0, the expected output sequence
+    (DC 16384 in) is exactly:"""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b11101000  # mode 4 (ui[3:1]=100), k=7 (ui[7:5]=111), min=0 (ui[4]=0)
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    def ffall(c): return 255 - ((c * 255) >> 3)
+    def frise(c): return (c * 255) >> 3
+    exp_outs = [0,                                   # partial frame: input 0
+                (16384 * ffall(2)) >> 8, (16384 * ffall(3)) >> 8,
+                (16384 * ffall(4)) >> 8, (16384 * ffall(5)) >> 8,
+                (16384 * ffall(6)) >> 8, (16384 * ffall(7)) >> 8,
+                0,                                   # count wraps, rising f(0)=0
+                (16384 * frise(1)) >> 8, (16384 * frise(2)) >> 8,
+                (16384 * frise(3)) >> 8, (16384 * frise(4)) >> 8,
+                (16384 * frise(5)) >> 8, (16384 * frise(6)) >> 8,
+                (16384 * frise(7)) >> 8,
+                (16384 * ffall(0)) >> 8]             # wraps again: f=255
+
+    outs = []
+    for _ in range(len(exp_outs)):
+        await _wait_left_start(dut)
+        outs.append(tx_data_bits(await i2s_send_and_capture(dut, 16384 << 8)))
+    assert outs == exp_outs, \
+        f"tremolo sequence mismatch: got {[hex(o) for o in outs]} exp {exp_outs}"
+
+    # sign preservation: negative DC processed two frames after the sequence
+    # ends, where the deterministic f cycle is at ffall(2) = 192
+    await _wait_left_start(dut)
+    await i2s_send_and_capture(dut, ((-16384) & 0xFFFF) << 8)
+    await _wait_left_start(dut)
+    out_neg = tx_data_bits(await i2s_send_and_capture(dut, 0))
+    out_neg = out_neg - 0x10000 if out_neg & 0x8000 else out_neg
+    assert out_neg == -((16384 * ffall(2)) >> 8), f"negative DC: got {out_neg}"
+
+
+@cocotb.test()
+async def test_tone(dut):
+    """Mode 7: internal square tone, half-period = 55 << k frames
+    (k = ui[6:4]), levels +/-16383, ADC input ignored. Phase after
+    mid-frame reset is deterministic within +/-1 frame, so assert one
+    exact sign change per window and exact amplitude."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b000_111_0  # mode 7 (ui[3:1]=111), k=0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def capture(n):
+        vals = []
+        for _ in range(n):
+            await _wait_left_start(dut)
+            v = tx_data_bits(await i2s_send_and_capture(dut, 0x5151 << 8))
+            vals.append(v - 0x10000 if v & 0x8000 else v)
+        return vals
+
+    # k=0: half-period 55 frames -> exactly one flip in an 80-frame window
+    vals = await capture(80)
+    assert set(vals) == {16383, -16383}, f"tone levels wrong: {set(vals)}"
+    flips = sum(1 for a, b in zip(vals, vals[1:]) if (a > 0) != (b > 0))
+    assert flips == 1, f"k=0 half-period 55: expected 1 flip in 80 frames, got {flips}"
+
+    # k=2: half-period 220 -> exactly one flip in a 250-frame window
+    dut.ui_in.value = 0b0_010_111_0  # mode 7 (ui[3:1]=111), k=2 (ui[6:4]=010)
+    vals = await capture(250)
+    assert set(vals) == {16383, -16383}, f"tone levels wrong (k=2): {set(vals)}"
+    flips = sum(1 for a, b in zip(vals, vals[1:]) if (a > 0) != (b > 0))
+    assert flips == 1, f"k=2 half-period 220: expected 1 flip in 250 frames, got {flips}"
