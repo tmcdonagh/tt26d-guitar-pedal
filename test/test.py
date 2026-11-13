@@ -187,3 +187,51 @@ async def test_i2s_tx_frame(dut):
     assert bits1[0] == 0, "slot 0 must be low (I2S one-slot delay)"
     assert all(b == 0 for b in bits1[17:32]), \
         f"slots 17..31 must stay low: {bits1[17:32]}"
+
+
+@cocotb.test()
+async def test_bypass_loopback(dut):
+    """Mode 0 echoes samples through the full pipeline, one frame later:
+    +100, -100, and -32768 (saturation edge) must all round-trip."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0  # mode 0 = bypass
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    for word16 in (0x0064, 0xFF9C, 0x8000):  # +100, -100, -32768
+        word24 = word16 << 8
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, word24)     # frame N: inject
+        await _wait_left_start(dut)
+        bits = await i2s_send_and_capture(dut, word24)  # frame N+1: echo
+        got = tx_data_bits(bits)
+        assert got == word16, \
+            f"loopback {word16:#06x} -> {got:#06x}"
+
+
+@cocotb.test()
+async def test_reset_state(dut):
+    """After reset (with junk driven on the ADC line), junk may flush
+    through for exactly one frame (reset releases mid-frame); the next
+    frame with a clean (zero) input must be silent, LED bar dark."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    dut.ui_in[0].value = 1  # junk on the data line during reset
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    await _wait_left_start(dut)
+    await i2s_send_and_capture(dut, 0)          # frame A: junk may flush
+    await _wait_left_start(dut)
+    bits = await i2s_send_and_capture(dut, 0)   # frame B: must be silent
+    assert tx_data_bits(bits) == 0, \
+        f"second frame after reset must be silent, got {tx_data_bits(bits):#06x}"
+    assert ((int(dut.uo_out.value) >> 1) & 0x1F) == 0, "LED bar must be dark after reset"
