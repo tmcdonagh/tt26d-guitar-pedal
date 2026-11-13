@@ -119,13 +119,21 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] ring_neg = ~sample_in + 16'd1; // two's complement negate
 
   // ------------------------------------------------------------------
-  // Distortion (mode 2): out = sat16(in * G), G = 1 + ui[5:4] (1..5),
-  // combinational shift-add multiply
+  // Distortion (mode 2): out = sat16(in * G), G = 1 + ui[5:4] (1..4),
+  // shift-add (G is one of 1,2,3,4 — no variable multiplier needed)
   // ------------------------------------------------------------------
-  wire [2:0] dist_g = {1'b0, ui_in[5:4]} + 3'd1; // 1..5
-  wire signed [19:0] dist_prod = $signed(sample_in) * $signed({1'b0, dist_g});
-  wire [15:0] dist_sat = (dist_prod > 20'sd32767)  ? 16'h7FFF
-                       : (dist_prod < -20'sd32768) ? 16'h8000
+  wire signed [16:0] dist_in = $signed(sample_in);
+  reg signed [17:0] dist_prod;
+  always @* begin
+    case (ui_in[5:4])
+      2'd1:    dist_prod = dist_in <<< 1;               // x2
+      2'd2:    dist_prod = dist_in + (dist_in <<< 1);   // x3
+      2'd3:    dist_prod = dist_in <<< 2;               // x4
+      default: dist_prod = dist_in;                     // x1
+    endcase
+  end
+  wire [15:0] dist_sat = (dist_prod > 18'sd32767)  ? 16'h7FFF
+                       : (dist_prod < -18'sd32768) ? 16'h8000
                        : dist_prod[15:0];
 
   // ------------------------------------------------------------------
@@ -140,8 +148,8 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] fuzz_out = (mag > fuzz_t) ? fuzz_t : mag;
 
   wire [15:0] chain_rect = (mag > 16'd16384) ? 16'd16384 : mag;
-  wire signed [19:0] chain_prod = $signed(chain_rect) * 20'sd3;
-  wire [15:0] chain_sat = (chain_prod > 20'sd32767) ? 16'h7FFF : chain_prod[15:0];
+  wire signed [17:0] chain_prod = ($signed(chain_rect) <<< 1) + $signed(chain_rect); // x3
+  wire [15:0] chain_sat = (chain_prod > 18'sd32767) ? 16'h7FFF : chain_prod[15:0];
 
   // ------------------------------------------------------------------
   // Tremolo (mode 4): out = (in * f) >> 8 via serial multiplier.
@@ -153,7 +161,6 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [3:0] trem_exp = 4'd10 - {1'b0, trem_k};
 
   wire [7:0] trem_min = ui_in[4] ? 8'd128 : 8'd0;
-  wire [7:0] trem_span = 8'd255 - trem_min;
 
   reg  [10:0] trem_cnt;
   reg         trem_dir;   // 0 = falling, 1 = rising
@@ -161,7 +168,8 @@ module tt_um_tmcdonagh_guitar_pedal (
   reg         trem_start;
   reg  [15:0] trem_result;
 
-  wire [18:0] trem_ramp = {8'd0, trem_cnt} * {1'b0, trem_span};
+  wire [3:0] trem_rshift = trem_min ? 4'd7 : 4'd8;  // span = 2^rshift - 1
+  wire [18:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {11'd0, trem_cnt};
   wire [7:0]  trem_step = trem_ramp[18:0] >> trem_exp;
   wire [7:0]  trem_f = trem_dir ? (trem_min + trem_step)
                                 : (8'd255 - trem_step);
