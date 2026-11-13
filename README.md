@@ -17,7 +17,7 @@ models provided through API access like Kimi K2.7 Code and GLM-5.3-Flash.
 | 1 | Octave fuzz (full-wave rectify + clip) |
 | 2 | Distortion (drive gain + hard clip) |
 | 3 | Ring modulator (square-wave LFO sign multiply) |
-| 4 | Tremolo (triangle LFO, depth × rate) |
+| 4 | Tremolo (stepped-gain triangle LFO: 0/−6/−12/−18 dB) |
 | 5 | Bitcrusher (bit-depth quantize + sample-hold decimate) |
 | 6 | Fuzz → distortion chain |
 | 7 | Test tone (internal square wave, no input needed) |

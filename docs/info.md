@@ -18,9 +18,9 @@ Each received sample is latched and passed through a mode-selected effect:
 |---|---|
 | 000 | Bypass |
 | 001 | Octave fuzz: full-wave rectifier + parametric clip |
-| 010 | Distortion: drive gain (×1..×5) + hard clip |
+| 010 | Distortion: drive gain (×1..×4) + hard clip |
 | 011 | Ring modulator: multiply by a square-LFO ±1 sign |
-| 100 | Tremolo: triangle LFO gain (serial shift-add multiplier) |
+| 100 | Tremolo: stepped-gain triangle LFO (0/−6/−12/−18 dB steps) |
 | 101 | Bitcrusher: bit-depth quantize + sample-hold decimate |
 | 110 | Fuzz → distortion chain |
 | 111 | Test tone: internal ~436 Hz square wave (input ignored) |
