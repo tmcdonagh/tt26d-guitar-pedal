@@ -446,10 +446,10 @@ async def test_fuzz_dist_chain(dut):
 
 @cocotb.test()
 async def test_tremolo(dut):
-    """Mode 4: out = (in * f) >> 8 via the serial multiplier; f = triangle
-    255<->min over 2*2^(10-k) frames. k=7 (ramp=8 frames), min=0.
-    The multiplier uses f of the post-increment LFO counter; with the
-    partial reset frame consuming count 0, the expected output sequence
+    """Mode 4: stepped-gain tremolo: out = in >>> s, s = LFO gap >> 6
+    (gains 1, 1/2, 1/4, 1/8; min=0 via ui[4]=0). k=7 -> ramp of 8 frames.
+    The LFO counter value sampled by the shift is the post-increment one;
+    with the partial reset frame consuming count 0 the expected sequence
     (DC 16384 in) is exactly:"""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
@@ -460,18 +460,19 @@ async def test_tremolo(dut):
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    def ffall(c): return 255 - ((c * 255) >> 3)
-    def frise(c): return (c * 255) >> 3
+    def gapfall(c): return (c * 255) >> 3
+    def grise(c): return (c * 255) >> 3
+    def out_for(gap): return 16384 >> (gap >> 6)
     exp_outs = [0,                                   # partial frame: input 0
-                (16384 * ffall(2)) >> 8, (16384 * ffall(3)) >> 8,
-                (16384 * ffall(4)) >> 8, (16384 * ffall(5)) >> 8,
-                (16384 * ffall(6)) >> 8, (16384 * ffall(7)) >> 8,
-                0,                                   # count wraps, rising f(0)=0
-                (16384 * frise(1)) >> 8, (16384 * frise(2)) >> 8,
-                (16384 * frise(3)) >> 8, (16384 * frise(4)) >> 8,
-                (16384 * frise(5)) >> 8, (16384 * frise(6)) >> 8,
-                (16384 * frise(7)) >> 8,
-                (16384 * ffall(0)) >> 8]             # wraps again: f=255
+                out_for(gapfall(2)), out_for(gapfall(3)),
+                out_for(gapfall(4)), out_for(gapfall(5)),
+                out_for(gapfall(6)), out_for(gapfall(7)),
+                out_for(255),                        # count wraps: rising starts at max gap
+                out_for(255 - grise(1)), out_for(255 - grise(2)),
+                out_for(255 - grise(3)), out_for(255 - grise(4)),
+                out_for(255 - grise(5)), out_for(255 - grise(6)),
+                out_for(255 - grise(7)),
+                out_for(gapfall(0))]                 # wraps again: full gain
 
     outs = []
     for _ in range(len(exp_outs)):
@@ -480,14 +481,13 @@ async def test_tremolo(dut):
     assert outs == exp_outs, \
         f"tremolo sequence mismatch: got {[hex(o) for o in outs]} exp {exp_outs}"
 
-    # sign preservation: negative DC processed two frames after the sequence
-    # ends, where the deterministic f cycle is at ffall(2) = 192
+    # sign preservation: negative DC in, capture one frame later
     await _wait_left_start(dut)
     await i2s_send_and_capture(dut, ((-16384) & 0xFFFF) << 8)
     await _wait_left_start(dut)
     out_neg = tx_data_bits(await i2s_send_and_capture(dut, 0))
     out_neg = out_neg - 0x10000 if out_neg & 0x8000 else out_neg
-    assert out_neg == -((16384 * ffall(2)) >> 8), f"negative DC: got {out_neg}"
+    assert out_neg == -(16384 >> (gapfall(2) >> 6)), f"negative DC: got {out_neg}"
 
 
 @cocotb.test()

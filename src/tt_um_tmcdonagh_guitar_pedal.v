@@ -71,9 +71,10 @@ module tt_um_tmcdonagh_guitar_pedal (
   // decimation. N: ui[5:4] 00->16, 01->10, 10->8, 11->6 (shift 0/6/8/10).
   // Decimation: ui[7:6] = 0..3 -> divide by 1,2,4,8.
   // ------------------------------------------------------------------
-  wire [5:0] qshift = (ui_in[5:4] == 2'b00) ? 6'd0
-                    : ({3'd0, ui_in[5:4], 1'b0} + 6'd4);
-  wire [15:0] crushed = sample_in & (16'hFFFF << qshift);
+  wire [15:0] crushed = sample_in & ((ui_in[5:4] == 2'b00) ? 16'hFFFF
+                                   : (ui_in[5:4] == 2'b01) ? 16'hFFC0
+                                   : (ui_in[5:4] == 2'b10) ? 16'hFF00
+                                   : 16'hFC00);
 
   wire [1:0] decim   = ui_in[7:6];
   wire [2:0] dec_mask = (3'b001 << decim) - 3'd1; // /2,/4,/8 -> 1,3,7
@@ -132,9 +133,10 @@ module tt_um_tmcdonagh_guitar_pedal (
       default: dist_prod = dist_in;                     // x1
     endcase
   end
-  wire [15:0] dist_sat = (dist_prod > 18'sd32767)  ? 16'h7FFF
-                       : (dist_prod < -18'sd32768) ? 16'h8000
-                       : dist_prod[15:0];
+  // overflow iff the result's top bits stop looking sign-extended
+  wire dist_ovf = (dist_prod[17] != dist_prod[16]) || (dist_prod[16] != dist_prod[15]);
+  wire [15:0] dist_sat = dist_ovf ? (dist_prod[17] ? 16'h8000 : 16'h7FFF)
+                                  : dist_prod[15:0];
 
   // ------------------------------------------------------------------
   // Octave fuzz (mode 1): full-wave rectifier + parametric clip.
@@ -149,67 +151,44 @@ module tt_um_tmcdonagh_guitar_pedal (
 
   wire [15:0] chain_rect = (mag > 16'd16384) ? 16'd16384 : mag;
   wire signed [17:0] chain_prod = ($signed(chain_rect) <<< 1) + $signed(chain_rect); // x3
-  wire [15:0] chain_sat = (chain_prod > 18'sd32767) ? 16'h7FFF : chain_prod[15:0];
+  // chain_rect <= 16384 so x3 fits 17 bits; overflow iff top bits disagree
+  wire chain_ovf = chain_prod[16] != chain_prod[15];
+  wire [15:0] chain_sat = chain_ovf ? 16'h7FFF : chain_prod[15:0];
 
   // ------------------------------------------------------------------
-  // Tremolo (mode 4): out = (in * f) >> 8 via serial multiplier.
-  // f = triangle between min and 255; rate k = ui[7:5] (8 rates, ramp
-  // = 2^(10-k) frames per direction); depth ui[4]: 0 -> min 0 (full),
-  // 1 -> min 128 (subtle). (Plan's ui[6:4]+ui[5:4] layout overlapped.)
+  // Tremolo (mode 4): stepped-gain tremolo: out = in >>> s, gain steps
+  // 1, 1/2, 1/4, 1/8 driven by the triangle LFO (gap = distance from
+  // full gain). Rate k = ui[7:5] (ramp = 2^(10-k) frames per direction);
+  // depth ui[4]: 0 -> span 255 (4 steps), 1 -> span 127 (2 steps).
+  // (v1: step-gain replaces the exact multiply to fit the tile; smooth
+  // multiply is the documented refinement.)
   // ------------------------------------------------------------------
   wire [2:0] trem_k   = ui_in[7:5];
   wire [3:0] trem_exp = 4'd10 - {1'b0, trem_k};
 
-  wire [7:0] trem_min = ui_in[4] ? 8'd128 : 8'd0;
+  wire [7:0] trem_span = ui_in[4] ? 8'd127 : 8'd255;
+  wire [3:0] trem_rshift = ui_in[4] ? 4'd7 : 4'd8;  // span = 2^rshift - 1
 
   reg  [10:0] trem_cnt;
-  reg         trem_dir;   // 0 = falling, 1 = rising
-  reg  [15:0] trem_sample;
-  reg         trem_start;
-  reg  [15:0] trem_result;
-
-  wire [3:0] trem_rshift = trem_min ? 4'd7 : 4'd8;  // span = 2^rshift - 1
-  wire [18:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {11'd0, trem_cnt};
-  wire [7:0]  trem_step = trem_ramp[18:0] >> trem_exp;
-  wire [7:0]  trem_f = trem_dir ? (trem_min + trem_step)
-                                : (8'd255 - trem_step);
-
-  wire signed [15:0] trem_p;
-  wire               trem_done;
-
-  serial_mult u_trem_mult (
-      .clk   (clk),
-      .rst_n (rst_n),
-      .a     (trem_sample),
-      .b     (trem_f),
-      .start (trem_start),
-      .p     (trem_p),
-      .done  (trem_done)
-  );
-
+  reg         trem_dir;   // 0 = falling (gain down), 1 = rising
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      trem_cnt    <= 11'd0;
-      trem_dir    <= 1'b0;
-      trem_sample <= 16'd0;
-      trem_start  <= 1'b0;
-      trem_result <= 16'd0;
-    end else begin
-      trem_start <= 1'b0;
-      if (sample_strobe) begin
-        trem_sample <= rx_shift;  // same edge as sample_in; reading sample_in
-                                  // here would fetch the PREVIOUS frame's value
-        trem_start  <= 1'b1;
-        if (trem_cnt == ((11'd1 << trem_exp) - 11'd1)) begin
-          trem_cnt <= 11'd0;
-          trem_dir <= ~trem_dir;
-        end else begin
-          trem_cnt <= trem_cnt + 11'd1;
-        end
+      trem_cnt <= 11'd0;
+      trem_dir <= 1'b0;
+    end else if (sample_strobe) begin
+      if (trem_cnt == ((11'd1 << trem_exp) - 11'd1)) begin
+        trem_cnt <= 11'd0;
+        trem_dir <= ~trem_dir;
+      end else begin
+        trem_cnt <= trem_cnt + 11'd1;
       end
-      if (trem_done) trem_result <= trem_p;
     end
   end
+
+  wire [18:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {11'd0, trem_cnt};
+  wire [7:0]  trem_gap = trem_dir ? (trem_span - (trem_ramp >> trem_exp))
+                                  : (trem_ramp >> trem_exp);
+  wire [15:0] trem_out = $signed(sample_in) >>> (trem_gap >> 6);
 
   // ------------------------------------------------------------------
   // Test tone (mode 7): internal square wave, half-period = 55 << k
@@ -246,7 +225,7 @@ module tt_um_tmcdonagh_guitar_pedal (
       3'd1:    effect_sample = fuzz_out;
       3'd2:    effect_sample = dist_sat;
       3'd3:    effect_sample = ring_sign ? ring_neg : sample_in;
-      3'd4:    effect_sample = trem_result;
+      3'd4:    effect_sample = trem_out;
       3'd6:    effect_sample = chain_sat;
       3'd7:    effect_sample = tone_out;
       3'd5:    effect_sample = crush_hold;
