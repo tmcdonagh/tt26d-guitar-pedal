@@ -16,6 +16,7 @@ Usage (from test/):
 """
 import array
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -93,6 +94,60 @@ def gl_cmd():
             os.path.join(HERE, "gate_level_netlist.v")]
 
 
+GLVL_LIB = os.path.join(HERE, "obj_dir_gl", "sky130_fd_sc_hd_glv.v")
+
+
+def glvl_make_lib():
+    """Write a Verilator-compatible copy of the cell library: the _pp$PG$N
+    UDP instantiations skip NOTIFIER with an empty positional argument
+    (`, ,`), which Verilator 5.032 rejects. 1'bx is exact for our stub
+    models (NOTIFIER is ignored under FUNCTIONAL) and for the real UDP
+    (constant input -> no table row fires)."""
+    lib = os.path.join(os.environ.get("PDK_ROOT", ""),
+                       "sky130A", "libs.ref", "sky130_fd_sc_hd", "verilog",
+                       "sky130_fd_sc_hd.v")
+    os.makedirs(os.path.dirname(GLVL_LIB), exist_ok=True)
+    with open(lib) as f, open(GLVL_LIB, "w") as out:
+        for line in f:
+            if "sky130_fd_sc_hd__udp_" in line:
+                line = re.sub(r",\s*,", ", 1'bx,", line)
+            # Verilator parses `#1 inst` (the UNIT_DELAY expansion) as a
+            # parameter override, not an instance delay — strip it; zero
+            # delay on cell instances is exact for this tb's sampling
+            # scheme (outputs only move on clk edges).
+            line = line.replace("`UNIT_DELAY ", "")
+            out.write(line)
+
+
+def glvl_cmd():
+    """Verilator gate-level audio build — the fast GL path (iverilog GL is
+    ~7 h/mode on a 1x1 netlist; Verilator compiles the same FUNCTIONAL cell
+    models to C++, typically 10-100x faster, and is required for 2x2-sized
+    netlists). primitives.v (UDP models) is omitted: with -DFUNCTIONAL the
+    cells come from the behavioral models in the transformed library copy,
+    and the UDPs themselves come from glvl_stub.v."""
+    out = os.path.join(HERE, "obj_dir_gl")
+    return ["verilator", "--binary", "--timing", "-j", "16",
+            "-Wno-fatal", "-o", "sim_audio_glv",
+            "--Mdir", out,
+            "-DGL_TEST", "-DFUNCTIONAL", "-DUSE_POWER_PINS", "-DSIM",
+            "-DUNIT_DELAY=#1", "--top-module", "tb_audio_gl",
+            os.path.join(HERE, "tb_audio_gl.v"),
+            os.path.join(HERE, "glvl_stub.v"),
+            GLVL_LIB,
+            os.path.join(HERE, "gate_level_netlist.v")]
+
+
+def glvl_build():
+    netlist = os.path.join(HERE, "gate_level_netlist.v")
+    if not os.path.exists(netlist):
+        raise SystemExit(f"missing {netlist} — copy it from the GDS run artifacts (gl_wav_tool.md)")
+    if not os.environ.get("PDK_ROOT"):
+        raise SystemExit("PDK_ROOT must point at the sky130A PDK (see gl_wav_tool.md)")
+    glvl_make_lib()
+    subprocess.check_call(glvl_cmd(), cwd=HERE)
+
+
 def gl_build():
     netlist = os.path.join(HERE, "gate_level_netlist.v")
     if not os.path.exists(netlist):
@@ -119,17 +174,20 @@ def gl_parity():
 
 
 def run_mode(name, en, params, n, sim):
-    out = os.path.join(OUT_DIR_GL if sim == "gl" else OUT_DIR, f"{name}.hex")
+    out = os.path.join(OUT_DIR_GL if sim.startswith("gl") else OUT_DIR, f"{name}.hex")
     if sim == "gl":
         cmd = ["vvp", GL_VVP, f"+EN={en}", f"+PARAMS={params}",
                f"+N={n}", f"+OUT={out}"]
+    elif sim == "glvl":
+        exe = os.path.join(HERE, "obj_dir_gl", "sim_audio_glv")
+        cmd = [exe, f"+EN={en}", f"+PARAMS={params}", f"+N={n}", f"+OUT={out}"]
     elif sim == "verilator":
         exe = os.path.join(HERE, "obj_dir", "sim_audio_vl")
         cmd = [exe, f"+EN={en}", f"+PARAMS={params}", f"+N={n}", f"+OUT={out}"]
     else:
         cmd = ["vvp", "sim_audio.vvp", f"+EN={en}", f"+PARAMS={params}",
                f"+N={n}", f"+OUT={out}"]
-    log = open(os.path.join(OUT_DIR_GL if sim == "gl" else OUT_DIR, f"{name}.log"), "w")
+    log = open(os.path.join(OUT_DIR_GL if sim.startswith("gl") else OUT_DIR, f"{name}.log"), "w")
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
 
 
@@ -145,15 +203,21 @@ def main():
             print(f"{p}: {n} samples")
     elif what == "gl-cmd":
         print(shlex.join(gl_cmd()))
+    elif what == "glvl-cmd":
+        print(shlex.join(glvl_cmd()))
     elif what == "gl-build":
         gl_build()
+    elif what == "glvl-build":
+        glvl_build()
     elif what == "gl-parity":
         gl_parity()
     elif what == "run":
-        out_dir = OUT_DIR_GL if sim == "gl" else OUT_DIR
+        out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
         os.makedirs(out_dir, exist_ok=True)
         if sim == "gl":
             gl_build()
+        elif sim == "glvl":
+            glvl_build()
         n = wav2hex()
         procs = [run_mode(name, en, params, n, sim) for name, en, params in MODES]
         for p in procs:

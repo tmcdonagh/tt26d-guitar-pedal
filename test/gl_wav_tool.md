@@ -18,6 +18,19 @@ input-edge-determined, so no tolerance is expected.
 - iverilog + the RTL baseline: first run `python3 wav_tool.py run` (verilator,
   default SIM) so `audio_out/*.wav` is fresh RTL evidence.
 
+## Modes (SIM env var)
+
+- `SIM=glvl` — **Verilator GL: the default for parity work** (minutes per
+  full 10-mode pass). Compiles the same FUNCTIONAL cell models to C++.
+  Requires two build-time pieces created for this (see `glvl_stub.v` and
+  `wav_tool.py glvl_make_lib()`): behavioral models for the primitives.v
+  UDPs (Verilator cannot compile UDPs; all 17 transcribed from their
+  tables, power-guarded per the `_pp$PG$N` semantics), and a transformed
+  library copy (strips `#1` instance delays, which Verilator parses as
+  parameter overrides; rewrites skipped NOTIFIER positional args as `1'bx`).
+- `SIM=gl` — iverilog GL: same defines/sources as the Makefile `GATES=yes`
+  path, correct but slow (~7 h/mode on a 1×1 netlist). Fallback only.
+
 ## 1. The compile command
 
 `test/tb_audio_gl.v` is `tb_audio.v` with the GL power-pin instantiation from
@@ -84,12 +97,12 @@ or a real synthesis bug (that's the point of the gate).
 
 ## Known risks / notes
 
-- `tb_audio_gl.v` probes `dut.effect_sample`. Yosys preserves public
-  top-level wire names in the netlist (as escaped identifiers), so the probe
-  should compile; if a future flow purges it, the compile fails loudly —
-  fallback is capturing the 16 DAC bits from `uio_out[1]` during slots 1–16
-  of the following frame's left half (value-equal: the TX shift loads
-  `effect_sample` at slot 0 and nothing updates mid-half).
+- Output capture is port-based: `tb_audio_gl.v` reassembles the DAC sample
+  from `uio_out[1]` (slots 1–16, mid-slot) — the RTL's internal
+  `effect_sample` alias does NOT survive netlist flattening (proven by the
+  first GL compile; opt_clean collapses it). The tb handles the one-frame
+  DAC lag internally (flush frame + print alignment), so GL logs stay
+  index-aligned with the RTL logs and `gl-parity` compares 1:1.
 - The netlist is flat (sub-module internals exist only as escaped net
   names); only top-level names are probeable.
 - `UNIT_DELAY=#1` gives every cell a unit delay — if deep paths ever
