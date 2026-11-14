@@ -6,8 +6,11 @@
  * I2S master in/out (codec-agnostic), serial effect chain fuzz ->
  * distortion -> bitcrusher -> tremolo with per-stage enable bypass
  * (v2.2: ring mod, test tone, and the v1 8-way mode mux retired).
- * Enables: preset ROM (EC11 encoder on ui[3:1]) OR DIP ui[7:4], all
- * forced off by the latching stomp bypass. Params P3..P0 on uio[5:2].
+ * Enables: DIP switches direct on ui[7:4] (v2.2 amendment: the EC11
+ * encoder/preset ROM, 7-seg digit, and stomp bypass are dropped;
+ * ui[3:1] and uo[6:0] are reserved for the 2x2 v3 project, and true
+ * bypass is wired externally with a 3PDT switch). Params P3..P0 on
+ * uio[5:2]; uo[7] = dp clip LED.
  * See docs/info.md and the spec in the ai-dev-archive.
  */
 
@@ -71,33 +74,17 @@ module tt_um_tmcdonagh_guitar_pedal (
   end
 
   // ------------------------------------------------------------------
-  // Control plane (v2.2 task 2): EC11 encoder (A=ui[1], B=ui[2]) and
-  // stomp (ui[3]), sampled once per audio frame on sample_valid.
-  // pedal_panel debounces the lines, decodes quadrature x2, counts
-  // presets 0..7 (ROM enable table), and drives the 7-seg preset digit
-  // — blank while the bypass latch is engaged.
+  // Effect chain + enables (v2.2 amendment): serial fuzz -> dist ->
+  // crush -> trem, enable-bypass per stage, en bit order = chain order
+  // (en[0]=fuzz, en[1]=dist, en[2]=crush, en[3]=trem) — now DIP
+  // switches direct on ui[7:4]. The panel control plane (EC11 encoder,
+  // preset ROM, 7-seg digit, latching stomp bypass) was dropped;
+  // ui[3:1] are unused inputs (reserved for the v3 project) and bypass
+  // is true bypass, wired externally with a 3PDT switch around the
+  // pedal (all-off DIP = "digital clean": audio still runs through
+  // the ADC -> identity chain -> DAC, a distinct mode from true bypass).
   // ------------------------------------------------------------------
-  wire [3:0] panel_en;
-  wire       panel_bypass;
-  wire [6:0] panel_seg;
-
-  pedal_panel u_panel (
-      .clk       (clk),
-      .rst_n     (rst_n),
-      .tick      (sample_valid),
-      .panel_in  (ui_in[3:1]),
-      .preset_en (panel_en),
-      .bypass    (panel_bypass),
-      .seg       (panel_seg)
-  );
-
-  // ------------------------------------------------------------------
-  // Effect chain (v2.2 task 3): serial fuzz -> dist -> crush -> trem,
-  // enable-bypass per stage. en bit order = chain order: en[0]=fuzz,
-  // en[1]=dist, en[2]=crush, en[3]=trem — preset ROM pattern OR DIP
-  // ui[7:4], forced all-off while the stomp bypass latch is engaged.
-  // ------------------------------------------------------------------
-  wire [3:0] en = panel_bypass ? 4'b0000 : (panel_en | ui_in[7:4]);
+  wire [3:0] en = ui_in[7:4];
 
   wire [15:0] s0 = sample_in;
 
@@ -317,15 +304,16 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  assign uo_out  = {dp_q, panel_seg}; // uo[6:0] = 7-seg a..g; uo[7] = dp clip LED (peak-hold)
+  assign uo_out  = {dp_q, 7'b000_0000}; // uo[7] = dp clip LED (peak-hold); uo[6:0] reserved for v3, driven 0
 
   assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
   assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P3..P0)
 
   // List all unused inputs to prevent warnings
   // (uio[5:2] = params P3..P0, all live after task 5; uio[7:6]/[1:0] are
-  // clock/data outputs, their input side is unused)
-  wire _unused = &{ena, uio_in[7:6], uio_in[1:0], 1'b0};
+  // clock/data outputs, their input side is unused; ui[3:1] reserved
+  // for v3, unconnected after the panel was dropped)
+  wire _unused = &{ena, ui_in[3:1], uio_in[7:6], uio_in[1:0], 1'b0};
 
 endmodule
 

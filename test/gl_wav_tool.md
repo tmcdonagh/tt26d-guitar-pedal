@@ -90,8 +90,8 @@ or a real synthesis bug (that's the point of the gate).
   fallback is capturing the 16 DAC bits from `uio_out[1]` during slots 1–16
   of the following frame's left half (value-equal: the TX shift loads
   `effect_sample` at slot 0 and nothing updates mid-half).
-- The netlist is flat (`u_panel` etc. exist only as escaped net names); only
-  top-level names are probeable.
+- The netlist is flat (sub-module internals exist only as escaped net
+  names); only top-level names are probeable.
 - `UNIT_DELAY=#1` gives every cell a unit delay — if deep paths ever
   misbehave (X / parity FAIL only under GL), check path depth vs the 40.5 ns
   clock period; the CI `gl_test` job shares this risk and is the cross-check.

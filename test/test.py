@@ -1,7 +1,8 @@
 # SPDX-FileCopyrightText: © 2024 Tiny Tapeout
 # SPDX-FileCopyrightText: © 2026 Thomas McDonagh
 # SPDX-License-Identifier: Apache-2.0
-# Internal-state probes are RTL-only (guarded); gate-level CI runs port-level assertions (v1 precedent).
+# Internal-state probes are RTL-only (guarded getattr — names may vanish
+# in the flat GL netlist); port-level assertions carry the GL coverage.
 
 import cocotb
 from cocotb.clock import Clock
@@ -24,10 +25,11 @@ async def test_skeleton_baseline(dut):
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    # Reset state: DAC data low, preset digit "0" on the 7-seg (uo[6:0])
+    # Reset state: DAC data low, uo dark — dp clip LED (uo[7]) reset low,
+    # uo[6:0] reserved for v3 and driven 0
     assert dut.uio_out[1].value == 0, "DAC data not low after reset"
-    assert int(dut.uo_out.value) == 0x3F, \
-        "preset digit must show 0 after reset (uo[6:0]=0x3F, dp=0)"
+    assert int(dut.uo_out.value) == 0x00, \
+        "uo must read 0 after reset (dp dark, uo[6:0] reserved driven 0)"
 
     # MCLK output enabled on uio[0] and following clk.
     # Sample away from clock edges (comb outputs need settle time).
@@ -54,10 +56,10 @@ async def test_skeleton_baseline(dut):
             break
     assert toggled, "LRCLK never toggled — frame counter not running"
 
-    # DIP enables all on (en = 0xF), panel lines idle, zero input: every
-    # stage maps 0 to 0, so DAC data stays low (v2.2: no mode mux — ui[7:4]
-    # are the effect enables, ui[3:1] the panel lines).
-    dut.ui_in.value = 0b1111_0000  # en[3:0] = 1111, encoder idle, stomp up
+    # DIP enables all on (en = 0xF), zero input: every stage maps 0 to 0,
+    # so DAC data stays low (v2.2: no mode mux — ui[7:4] are the effect
+    # enables; ui[3:1] reserved for v3, driven 0 here).
+    dut.ui_in.value = 0b1111_0000  # en[3:0] = 1111, ui[3:1] = 0 (reserved)
     await ClockCycles(dut.clk, 1)
     assert dut.uio_out[1].value == 0, "unexpected DAC output with zero input"
 
@@ -266,13 +268,13 @@ async def test_stereo_halves_match(dut):
 
 @cocotb.test()
 async def test_bypass_loopback(dut):
-    """en = 0 (preset 0 ROM all-off, DIP clear, stomp up) echoes samples
+    """en = 0 (DIP all-off — the "digital clean" mode) echoes samples
     through the full pipeline, one frame later: +100, -100, and -32768
     (saturation edge) must all round-trip."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0  # en = 0: preset 0 + DIP clear -> identity
+    dut.ui_in.value = 0  # en = 0: DIP all-off -> identity chain
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -293,7 +295,7 @@ async def test_bypass_loopback(dut):
 async def test_reset_state(dut):
     """After reset (with junk driven on the ADC line), junk may flush
     through for exactly one frame (reset releases mid-frame); the next
-    frame with a clean (zero) input must be silent, preset digit 0."""
+    frame with a clean (zero) input must be silent, uo dark."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -310,280 +312,15 @@ async def test_reset_state(dut):
     bits = await i2s_send_and_capture(dut, 0)   # frame B: must be silent
     assert tx_data_bits(bits) == 0, \
         f"second frame after reset must be silent, got {tx_data_bits(bits):#06x}"
-    assert int(dut.uo_out.value) == 0x3F, \
-        "preset digit must show 0 after reset (uo[6:0]=0x3F, dp=0)"
+    assert int(dut.uo_out.value) == 0x00, \
+        "uo must read 0 after reset (dp dark, uo[6:0] reserved driven 0)"
 
 
-# ---------------------------------------------------------------------
-# Panel control plane (v2.2 task 2): EC11 encoder A=ui[1], B=ui[2] and
-# stomp ui[3], sampled once per audio frame (512 clk) on sample_valid.
-# The bounce filter accepts a level only after 48 consecutive equal
-# frame samples, so tests hold each level 50 frames (a real detent) or
-# 47 (a sub-detent glitch, which must be rejected). Quadrature is x2 on
-# accepted A edges: rose -> B low +1 / B high -1; fell -> B high +1 /
-# B low -1; preset_cnt wraps mod 8. Tests interleave B between A edges
-# (a real EC11 never changes both lines on the same frame; the decode
-# reads the settled B level at each A edge). The display blanks while
-# the bypass latch is engaged.
-# ---------------------------------------------------------------------
 
-async def _detent(dut, a, b):
-    """Set encoder levels A=ui[1], B=ui[2] and hold 50 frames (512 clk
-    each) — long enough for the 48-consecutive-sample bounce filter to
-    accept them. Settles 1 ns so comb outputs are readable after."""
-    dut.ui_in[1].value = a
-    dut.ui_in[2].value = b
-    await ClockCycles(dut.clk, 512 * 50)
-    await Timer(1, unit="ns")
-
-
-@cocotb.test()
-async def test_encoder_fwd_rev(dut):
-    """x2 quadrature on accepted A edges, direction from accepted B:
-    rose with B low +1 / B high -1; fell with B high +1 / B low -1
-    (controller ruling — standard x2 table). A full forward detent
-    (A 0->1->0 with B interleaved 0->1 between the edges, as a real
-    EC11 does) counts +2; reversed counts -2; rev from 0 wraps to 7;
-    fwd from 7 wraps to 0. B-only steps settle B one hold before the
-    A edge that reads it (the panel never sees A and B change on the
-    same frame)."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    # add a settle after reset release: the digit PORT assert below reads
-    # comb logic (preset_cnt -> seg case), which in the unit-delay GL
-    # netlist needs a moment after rst_n rises
-    await Timer(1, unit="ns")
-
-    def pc():
-        # internal preset counter — RTL-only probe: getattr misses in the
-        # flat GL netlist (u_panel hierarchy gone) and returns None, which
-        # voids the counter asserts; every checkpoint below also asserts
-        # the 7-seg digit PORT (1:1 with preset_cnt: all 8 patterns
-        # distinct), which stays active in GL and verifies the decode
-        # end-to-end there
-        u = getattr(dut.user_project, "u_panel", None)
-        return None if u is None else int(u.preset_cnt.value)
-
-    seg_pats = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07]
-
-    assert pc() in (None, 0), "preset must start at 0 after reset"
-    assert int(dut.uo_out.value) == seg_pats[0], "port: digit 0 after reset"
-
-    # forward detent (A edges: rose with B low, fell with B high) -> +2
-    await _detent(dut, 1, 0)
-    assert pc() in (None, 1), "rose with B low must be +1"
-    assert int(dut.uo_out.value) == seg_pats[1], "port: digit 1 after +1"
-    await _detent(dut, 1, 1)                 # B 0->1 (no A edge: no count)
-    assert pc() in (None, 1), "B-only step must not count"
-    assert int(dut.uo_out.value) == seg_pats[1], "port: B-only step keeps digit 1"
-    await _detent(dut, 0, 1)
-    assert pc() in (None, 2), "fell with B high must be +1"
-    assert int(dut.uo_out.value) == seg_pats[2], "port: digit 2 after full fwd detent"
-    await _detent(dut, 0, 0)                 # back to idle (A=B=0)
-    assert pc() in (None, 2), "full forward detent must count +2"
-    assert int(dut.uo_out.value) == seg_pats[2], "port: digit 2 at idle"
-
-    # reversed detent (A edges: rose with B high, fell with B low) -> -2
-    await _detent(dut, 0, 1)                 # B lead-in
-    assert pc() in (None, 2), "B-only step must not count"
-    await _detent(dut, 1, 1)
-    assert pc() in (None, 1), "rose with B high must be -1"
-    assert int(dut.uo_out.value) == seg_pats[1], "port: digit 1 after -1"
-    await _detent(dut, 1, 0)                 # B lead-in
-    assert pc() in (None, 1), "B-only step must not count"
-    await _detent(dut, 0, 0)
-    assert pc() in (None, 0), "fell with B low must be -1 (full reverse detent -2)"
-    assert int(dut.uo_out.value) == seg_pats[0], "port: digit 0 after full rev detent"
-
-    # reverse from 0 wraps to 7 (rose with B high)
-    await _detent(dut, 0, 1)                 # B lead-in
-    await _detent(dut, 1, 1)
-    assert pc() in (None, 7), "rev from 0 must wrap to 7"
-    assert int(dut.uo_out.value) == seg_pats[7], "port: digit 7 after rev wrap"
-
-    # forward from 7 wraps to 0 (fell with B high; B already settled)
-    await _detent(dut, 0, 1)
-    assert pc() in (None, 0), "fwd from 7 must wrap to 0"
-    assert int(dut.uo_out.value) == seg_pats[0], "port: digit 0 after fwd wrap"
-
-
-@cocotb.test()
-async def test_encoder_bounce(dut):
-    """Bounce filter: A high for 47 frames — one short of the
-    48-consecutive-sample threshold — is ignored; a level held exactly
-    48 frames (the acceptance boundary itself) still counts; a full
-    50-frame level also counts (sub-detent glitches rejected, real
-    detents counted). The 48-frame hold is frame-locked (started just
-    after a WS fall) so its window provably spans ticks f0..f47 — 48
-    equal samples — pinning the a_cnt == 46 acceptance edge that the
-    47/50 bracket alone leaves ambiguous (Task 2 review carry-in)."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    # settle after reset release for the digit PORT assert (GL comb delay)
-    await Timer(1, unit="ns")
-
-    def pc():
-        # internal counter, RTL-only probe (flat GL netlist: no u_panel) —
-        # None voids the counter asserts; the digit PORT asserts below stay
-        # active in GL and pin the same accept/reject/boundary outcomes
-        # (a wrongly counted glitch would move the digit)
-        u = getattr(dut.user_project, "u_panel", None)
-        return None if u is None else int(u.preset_cnt.value)
-
-    seg_pats = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07]
-
-    assert pc() in (None, 0), "preset must start at 0 after reset"
-    assert int(dut.uo_out.value) == seg_pats[0], "port: digit 0 after reset"
-
-    # 47-frame glitch on A: below the 48-sample acceptance threshold
-    dut.ui_in[1].value = 1
-    await ClockCycles(dut.clk, 512 * 47)
-    dut.ui_in[1].value = 0                # back to idle
-    await ClockCycles(dut.clk, 512 * 50)
-    await Timer(1, unit="ns")
-    assert pc() in (None, 0), "47-frame glitch must be rejected"
-    assert int(dut.uo_out.value) == seg_pats[0], "port: glitch must not move the digit"
-
-    # control: a full 50-frame level is accepted (rose, B low -> +1)
-    await _detent(dut, 1, 0)
-    assert pc() in (None, 1), "50-frame level must be counted"
-    assert int(dut.uo_out.value) == seg_pats[1], "port: accepted level moves digit to 1"
-
-    # exactly 48 frames: the boundary itself must count. A 1->0 fall
-    # with B low counts -1 (pc 1 -> 0). Frame-locked start so the
-    # 512*48 window covers exactly the 48 equal samples f0..f47.
-    await _wait_left_start(dut)
-    dut.ui_in[1].value = 0                # A falls; hold EXACTLY 48 frames
-    await ClockCycles(dut.clk, 512 * 48)
-    await Timer(1, unit="ns")
-    assert pc() in (None, 0), "exact 48-frame hold must be counted (fell, B low: -1)"
-    assert int(dut.uo_out.value) == seg_pats[0], "port: boundary hold returns digit to 0"
-
-
-@cocotb.test()
-async def test_stomp_toggle(dut):
-    """Stomp (ui[3]) is a latching toggle on the debounced press edge:
-    press -> bypass on and the display goes blank; release changes
-    nothing; a second press toggles back (v2.2 errata 2: latching,
-    not momentary)."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-    await Timer(1, unit="ns")
-
-    # internal bypass latch — RTL-only probe (flat GL netlist: no
-    # u_panel); None voids the latch asserts. The digit PORT asserts at
-    # every phase below (visible -> blank -> blank -> visible) carry the
-    # full toggle/latch behavior in GL
-    u_panel = getattr(dut.user_project, "u_panel", None)
-
-    assert u_panel is None or int(u_panel.bypass.value) == 0, "bypass must start clear"
-    assert int(dut.uo_out.value) == 0x3F, "preset 0 digit must be visible"
-
-    # press 1: bypass latched, digit blank (uo[6:0] = 0)
-    dut.ui_in[3].value = 1
-    await ClockCycles(dut.clk, 512 * 50)
-    await Timer(1, unit="ns")
-    assert u_panel is None or int(u_panel.bypass.value) == 1, "press must latch bypass"
-    assert (int(dut.uo_out.value) & 0x7F) == 0, "bypass must blank the digit"
-
-    # release: the latch holds (latching, not momentary)
-    dut.ui_in[3].value = 0
-    await ClockCycles(dut.clk, 512 * 50)
-    await Timer(1, unit="ns")
-    assert u_panel is None or int(u_panel.bypass.value) == 1, "release must not clear the latch"
-    assert (int(dut.uo_out.value) & 0x7F) == 0, "digit must stay blank"
-
-    # press 2: toggles back — effect on, digit visible again
-    dut.ui_in[3].value = 1
-    await ClockCycles(dut.clk, 512 * 50)
-    await Timer(1, unit="ns")
-    assert u_panel is None or int(u_panel.bypass.value) == 0, "second press must toggle back"
-    assert int(dut.uo_out.value) == 0x3F, "digit must return with the effect"
-
-
-@cocotb.test()
-async def test_seg_patterns(dut):
-    """7-seg patterns (seg[0]=a..seg[6]=g, active high) and the preset
-    ROM enable table, walked preset 0..7 with one forward A edge each
-    (rose with B low and fell with B high, alternating — +1 per edge,
-    B settled one hold ahead). The dp (uo[7]) stays dark here — no
-    I2S input is driven, so effect_sample never saturates (dp clip
-    LED behavior lives in test_clip_dp)."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-    await Timer(1, unit="ns")
-
-    # index = preset: segment patterns and ROM enables (provisional)
-    seg_pats = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07]
-    rom_pats = [0b0000, 0b0001, 0b0010, 0b0100,
-                0b1000, 0b1100, 0b1101, 0b1111]
-
-    def pc():
-        # internal counter, RTL-only probe (flat GL netlist: no u_panel) —
-        # the per-preset uo_out digit assert below is PORT-level and stays
-        # active in GL (it verifies the full walk 0..7 there)
-        u = getattr(dut.user_project, "u_panel", None)
-        return None if u is None else int(u.preset_cnt.value)
-
-    def pe():
-        # internal ROM output, RTL-only probe (same guard; no port
-        # equivalent in this test — enable bits are observable only
-        # through audio behavior, covered by the I2S-port tests)
-        u = getattr(dut.user_project, "u_panel", None)
-        return None if u is None else int(u.preset_en.value)
-
-    assert pc() in (None, 0), "preset must start at 0 after reset"
-    assert int(dut.uo_out.value) == 0x3F, "preset 0 must show digit 0"
-    assert pe() in (None, rom_pats[0]), "preset 0 ROM pattern"
-
-    # walk presets 1..7 one +1 edge at a time, alternating the two
-    # forward A edges (rose with B low, fell with B high) with a B-only
-    # settle hold between edges — B must be accepted before the A edge
-    # that reads it
-    for k in range(1, 8):
-        if k % 2:                 # odd k: A rises with B low (from A=0, B=0)
-            await _detent(dut, 1, 0)
-        else:                     # even k: A falls with B high (from A=1, B=1)
-            await _detent(dut, 0, 1)
-        assert pc() in (None, k), f"step {k}: preset must advance to {k}"
-        assert int(dut.uo_out.value) == seg_pats[k], \
-            f"preset {k}: uo {int(dut.uo_out.value):#04x} != {seg_pats[k]:#04x}"
-        assert pe() in (None, rom_pats[k]), \
-            f"preset {k}: ROM pattern {pe():#06b}"
-        if k < 7:                 # settle B for the next edge (no count)
-            await _detent(dut, k % 2, k % 2)
-
-
-# ui byte layout (v2.2): ui[0]=I2S data (driven by the helper), ui[3:1]=
-# panel lines {stomp, enc_b, enc_a} (kept 0 = idle/stomp-up in these
-# tests, so preset stays 0 and the ROM contributes nothing), ui[7:4]=DIP
-# effect enables en[3:0] (en[0]=fuzz .. en[3]=trem = chain order).
+# ui byte layout (v2.2 amendment): ui[0]=I2S data (driven by the helper),
+# ui[3:1] reserved for v3 (driven 0 in these tests), ui[7:4]=DIP effect
+# enables en[3:0] (en[0]=fuzz .. en[3]=trem = chain order) — en comes from
+# the DIP nibble alone.
 # uio byte layout: uio[5:2]=params P3..P0, all four live as of task 5 —
 # P0=uio[2] (dist knee), P1=uio[3] (crush depth base), P2=uio[4] (trem
 # rate), P3=uio[5] (trem depth).
@@ -617,7 +354,7 @@ async def test_autolofi_env(dut):
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0100_0000  # en[2] crush only; panel idle (preset 0)
+    dut.ui_in.value = 0b0100_0000  # en[2] crush only; ui[3:1] = 0 (reserved)
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -725,7 +462,7 @@ async def test_dist_softknee(dut):
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0010_0000  # en[1] dist only; panel idle
+    dut.ui_in.value = 0b0010_0000  # en[1] dist only; ui[3:1] = 0 (reserved)
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
@@ -759,7 +496,7 @@ async def test_fuzz_rectify(dut):
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0001_0000  # en[0] fuzz only; panel idle
+    dut.ui_in.value = 0b0001_0000  # en[0] fuzz only; ui[3:1] = 0 (reserved)
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -824,7 +561,7 @@ async def test_tremolo(dut):
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b1000_0000  # en[3] trem only; panel idle
+    dut.ui_in.value = 0b1000_0000  # en[3] trem only; ui[3:1] = 0 (reserved)
     dut.uio_in.value = 0           # P2=0, P3=0 (k=0, span 255) — set per config below
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -869,8 +606,8 @@ async def test_tremolo(dut):
 
 @cocotb.test()
 async def test_chain_enables(dut):
-    """Serial chain enable matrix (v2.2 task 3): with preset 0 (ROM
-    all-off) and the panel idle, ui[7:4] alone sets en. For each stage:
+    """Serial chain enable matrix (v2.2 task 3): ui[7:4] alone sets en
+    (amendment: DIP-direct, no preset ROM). For each stage:
     ON applies its effect to known vectors (incl. -32768 — the output
     also proves every DOWNSTREAM stage passes bit-exact when disabled);
     with all en=0 the chain is bit-exact identity and +-32768 round-trip
@@ -887,7 +624,7 @@ async def test_chain_enables(dut):
     dut.rst_n.value = 1
 
     async def stage_once(en_nibble, word16):
-        dut.ui_in.value = en_nibble << 4      # ui[7:4] = en; panel idle
+        dut.ui_in.value = en_nibble << 4      # ui[7:4] = en; ui[3:1] = 0 (reserved)
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
         await _wait_left_start(dut)
@@ -958,17 +695,17 @@ async def test_clip_dp(dut):
     and reloads an 11-bit counter to 0; without a hit the counter runs
     to 2047 (~2048 frames ~ 43 ms at 48 kHz) and clears dp_q on the
     wrap edge; a new hit mid-hold restarts it (peak-hold).
-    Full-scale is driven with en=0 (bypass): dist never emits
-    full-scale (soft ceiling 20479) and fuzz clips at 16384, but the
-    identity chain passes sample_in = 0x7FFF exactly. Phases, preset 0
-    / DIP clear / stomp up throughout:
+    Full-scale is driven with en=0 (DIP all-off — digital clean): dist never
+    emits full-scale (soft ceiling 20479) and fuzz clips at 16384, but the
+    identity chain passes sample_in = 0x7FFF exactly. Phases, DIP all-off
+    throughout:
       - 100 mid-level (0x1000) frames: dp stays dark (the LED is
         sticky for ~2048 frames, so one end-of-phase probe covers all
         100 frames);
       - ONE 0x7FFF frame: dp still dark right after the drive (the hit
         clocks at the frame's sample_valid edge, early in the right
-        half), lit by the end of that frame; uo[6:0] still tracks
-        panel_seg (preset-0 digit 0x3F);
+        half), lit by the end of that frame; uo[6:0] (reserved, driven
+        0) stay 0;
       - input returns to 0x1000: dp holds on its own — still lit 1000
         frames later, and at hold-frame 2040 (a half-length hold would
         already be dark; the clear comes at 2048);
@@ -978,7 +715,7 @@ async def test_clip_dp(dut):
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0     # en=0: preset-0 ROM all-off + DIP clear -> identity
+    dut.ui_in.value = 0     # en=0: DIP all-off -> identity (digital clean)
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -987,16 +724,10 @@ async def test_clip_dp(dut):
     def dp():
         return int(dut.uo_out[7].value)
 
-    # internal panel_seg wire — RTL-only probe if the flat GL netlist
-    # drops the name; fallback: this test holds preset 0 with the stomp
-    # idle throughout, so panel_seg is the preset-0 digit 0x3F
-    _panel_seg = getattr(dut.user_project, "panel_seg", None)
-
     def seg_ok():
-        # the dp must never disturb the preset digit: uo[6:0] == panel_seg
-        # (RTL) / == preset-0 digit 0x3F (GL fallback) — PORT-level either way
-        ref = int(_panel_seg.value) if _panel_seg is not None else 0x3F
-        return (int(dut.uo_out.value) & 0x7F) == ref
+        # uo[6:0] are reserved for v3 and driven 0: the dp must never
+        # disturb them — PORT-level assert, active in GL too
+        return (int(dut.uo_out.value) & 0x7F) == 0
 
     await _wait_left_start(dut)   # start of frame 0
 
@@ -1006,7 +737,7 @@ async def test_clip_dp(dut):
         await ClockCycles(dut.clk, 256)
     await Timer(1, unit="ns")
     assert dp() == 0, "mid-level frames must never light the dp"
-    assert seg_ok(), "uo[6:0] must track panel_seg with the dp dark"
+    assert seg_ok(), "uo[6:0] must stay 0 (reserved) with the dp dark"
 
     # frame 100: ONE full-scale frame. The helper returns at the start
     # of the right half, before the strobe edge, so dp is still dark
@@ -1018,8 +749,7 @@ async def test_clip_dp(dut):
     await ClockCycles(dut.clk, 256)              # rest of the clip frame
     await Timer(1, unit="ns")
     assert dp() == 1, "one full-scale frame must light the dp (uo[7])"
-    assert seg_ok() and (_panel_seg is None or int(_panel_seg.value) == 0x3F), \
-        "7-seg must be unchanged during clip (preset-0 digit still 0x3F)"
+    assert seg_ok(), "uo[6:0] must stay 0 during the clip (reserved)"
 
     # frame 101: input returns to mid-level — from here the dp must
     # hold with no full-scale anywhere in the input
@@ -1044,4 +774,4 @@ async def test_clip_dp(dut):
     await ClockCycles(dut.clk, 512 * 172)
     await Timer(1, unit="ns")
     assert dp() == 0, "dp must clear within 2048+64 frames of the clip frame"
-    assert seg_ok(), "uo[6:0] must still track panel_seg after the dp clears"
+    assert seg_ok(), "uo[6:0] must still read 0 after the dp clears"

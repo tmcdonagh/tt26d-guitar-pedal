@@ -9,13 +9,11 @@
 // ui[7:4] (+EN=, 0..15: bit order = chain order, en[0]=fuzz..en[3]=trem)
 // and the params on uio[5:2] (+PARAMS=, P3..P0: P2=trem rate, P3=trem
 // depth, P0=dist knee, P1=crush depth base — all live as of task 5).
-// ui[3:1] stay 0 (encoder
-// stomp up) so the preset stays 0 and the ROM contributes nothing —
-// en comes from the DIP byte alone; ui[0] is still the per-slot ADC
-// data bit, assigned separately below.
+// ui[3:1] are reserved (v3) and stay 0 — en comes from the DIP byte
+// alone; ui[0] is still the per-slot ADC data bit, assigned separately
+// below.
 //
-// Compile (icarus; ../src/*.v so the top's pedal_panel instance is
-// picked up):
+// Compile (icarus; ../src/*.v picks up the top module and its sources):
 //   $ iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/*.v
 // Listening-sim build (Verilator; the binary wav_tool.py runs). The
 // -Wno waivers cover WIDTH warnings in the trem arithmetic and the
@@ -65,7 +63,7 @@ module tb_audio;
     dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("PARAMS=%d", params);
     dummy = $value$plusargs("N=%d", n_in);
-    ui_in[7:1] = {en_dip[3:0], 3'b000};       // ui[7:4]=enables, ui[3:1]=0 (enc idle, stomp up)
+    ui_in[7:1] = {en_dip[3:0], 3'b000};       // ui[7:4]=enables, ui[3:1]=reserved (driven 0)
     uio_in     = {2'b00, params[3:0], 2'b00}; // P3..P0 on uio[5:2]
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen

@@ -46,48 +46,58 @@ serial effect chain — a disabled stage passes its input through bit-exactly:
 Fuzz and distortion are pure functions of the latched sample; the crush
 depth and tremolo gain follow per-frame state (envelope / LFO).
 
-**Panel.** An EC11 rotary encoder on `ui[1]`/`ui[2]` selects one of 8
-presets: quadrature decoded ×2 on accepted A edges (direction from the B
-level), preset counter wraps mod 8 in both directions. All panel lines are
-sampled once per audio frame and a level is accepted only after 48
-consecutive equal samples (~1 ms bounce filter), so contact glitches are
-rejected. The preset number shows on a 7-seg digit — active-high segments
-a–g on `uo[0..6]`. A stomp switch on `ui[3]` toggles a **latching** bypass:
-each press-release cycle flips it; while bypassed every enable is forced
-off (clean pass-through) and the display goes blank. The decimal point
-`uo[7]` is a clip LED: it lights when the output sample hits full scale
-(0x7FFF or −32768) and holds ~43 ms (2048 frames).
+**Controls.** The effect enables are DIP switches wired **directly** to
+`ui[7:4]` — bit order = chain order (`ui[4]`=fuzz, `ui[5]`=distortion,
+`ui[6]`=crush, `ui[7]`=tremolo), no internal preset logic:
 
-**Enables** — each stage's enable is the OR of its preset-ROM bit and its
-DIP switch (bit order = chain order), forced all-off while bypassed:
+`en = ui[7:4]`
 
-`en = bypass ? 4'b0000 : (ROM[preset] | ui[7:4])`
+With every DIP switch off the pedal is in its **digital clean** mode: audio
+still runs through the ADC, the (all-disabled, bit-exact identity) chain,
+and the DAC — the signal is digitized and re-reconstructed, a distinct mode
+from true bypass (below) and a convenient A/D–D/A reference for the analog
+front end.
+
+**True bypass.** The ASIC has no bypass role: a latching **3PDT footswitch
+wired externally** routes the guitar — one pole sends the signal either
+straight to the output jack (true bypass, the tile entirely out of the
+audio path) or into the preamp → ADC → tile → DAC → output jack. This is
+the standard pedal 3PDT wiring; the remaining pole is free for the usual
+bypass-LED/grounding convention. Because it's a hard analog switch, bypass
+needs no power and adds no conversion.
+
+**Clip LED.** The decimal point `uo[7]` is a clip indicator: it lights when
+the output sample hits full scale (0x7FFF or −32768) and holds ~43 ms
+(2048 frames), so short clips are visible.
+
+**Reserved pins.** `ui[3:1]` and `uo[6:0]` are unused by this design and
+reserved for the 2×2-tile v3 project; the reserved outputs are driven 0.
 
 **Params** — one character bit per effect, P3..P0 on `uio[5:2]` (tables
 below).
 
-Preset ROM patterns, distortion knee constants, crush envelope shifts, and
-tremolo rates are provisional — tuned by listening session.
+Distortion knee constants, crush envelope shifts, and tremolo rates are
+provisional — tuned by listening session.
 
 ## Signal table
 
 | Pin | Dir | Function |
 |-----|-----|----------|
 | ui[0] | in | I2S ADC data in |
-| ui[1] | in | Encoder A (ext. pull-down, common to 3V3) |
-| ui[2] | in | Encoder B (ext. pull-down, common to 3V3) |
-| ui[3] | in | Stomp switch (ext. pull-down, common to 3V3, latching) |
+| ui[1] | in | Reserved (v3) |
+| ui[2] | in | Reserved (v3) |
+| ui[3] | in | Reserved (v3) |
 | ui[4] | in | Enable: fuzz |
 | ui[5] | in | Enable: distortion |
 | ui[6] | in | Enable: crush |
 | ui[7] | in | Enable: tremolo |
-| uo[0] | out | 7-seg segment a (active high) |
-| uo[1] | out | 7-seg segment b (active high) |
-| uo[2] | out | 7-seg segment c (active high) |
-| uo[3] | out | 7-seg segment d (active high) |
-| uo[4] | out | 7-seg segment e (active high) |
-| uo[5] | out | 7-seg segment f (active high) |
-| uo[6] | out | 7-seg segment g (active high) |
+| uo[0] | out | Reserved (v3) |
+| uo[1] | out | Reserved (v3) |
+| uo[2] | out | Reserved (v3) |
+| uo[3] | out | Reserved (v3) |
+| uo[4] | out | Reserved (v3) |
+| uo[5] | out | Reserved (v3) |
+| uo[6] | out | Reserved (v3) |
 | uo[7] | out | dp = clip LED (peak hold ~43 ms) |
 | uio[0] | out | MCLK (24.576 MHz output) |
 | uio[1] | out | I2S DAC data out |
@@ -101,19 +111,6 @@ tremolo rates are provisional — tuned by listening session.
 uio pin directions: `uio_oe = 8'b1100_0011` — uio[7:6] and uio[1:0] are
 outputs (LRCLK/BCLK, MCLK/DAC data), uio[5:2] are inputs (params).
 
-### Preset ROM (enable bits in chain order: fuzz, dist, crush, trem)
-
-| Preset (7-seg digit) | fuzz | dist | crush | trem |
-|---|---|---|---|---|
-| 0 (0) | | | | |
-| 1 (1) | x | | | |
-| 2 (2) | | x | | |
-| 3 (3) | | | x | |
-| 4 (4) | | | | x |
-| 5 (5) | x | x | | |
-| 6 (6) | x | x | x | |
-| 7 (7) | x | x | x | x |
-
 ### Param bits (P3..P0 on uio[5:2])
 
 | Param | Pin | Effect | 0 | 1 |
@@ -125,38 +122,36 @@ outputs (LRCLK/BCLK, MCLK/DAC data), uio[5:2] are inputs (params).
 
 ### DIP enables (ui[7:4])
 
-ui[4]=fuzz, ui[5]=distortion, ui[6]=crush, ui[7]=tremolo — OR'd with the
-preset ROM bits, all forced off while the stomp bypass is engaged.
+ui[4]=fuzz, ui[5]=distortion, ui[6]=crush, ui[7]=tremolo — each switch is
+its stage's enable directly (bit order = chain order); all four off =
+digital clean.
 
 ## How to test
 
 Hook up an I2S codec slave with all four I2S lines on uio: MCLK `uio[0]`,
 BCLK `uio[6]`, LRCLK `uio[7]`, DAC data `uio[1]`, and ADC data on `ui[0]`
 — e.g. a PCM1808 + PCM5102, or a Pico programmed as an I2S slave to inject
-and capture audio. Play some music: turning the encoder walks presets 0–7,
-shown on the 7-seg digit (preset 0 = all stages off). The stomp switch
-blanks the display and passes audio through clean; the next press-release
-re-engages the chain. Drive a full-scale sample (easiest with the chain
-bypassed, or through crush, which keeps the sign bit) and the dp clip LED
-lights with its ~43 ms hold.
+and capture audio. Play some music and flip the `ui[7:4]` DIP switches:
+each bit turns its stage on/off live, and any combination stacks in chain
+order. All-off is the digital-clean reference; stomping the external 3PDT
+switch compares it against true bypass. Drive a full-scale sample (easiest
+through crush, which keeps the sign bit, or in digital clean) and the dp
+clip LED on `uo[7]` lights with its ~43 ms hold.
 
 Without hardware, the cocotb suite covers the I2S framing, every chain
-stage and the enable matrix, the panel (encoder direction/wrap/bounce,
-stomp latch, 7-seg + ROM), the auto-lofi envelope, and the clip LED:
+stage and the enable matrix, the auto-lofi envelope, and the clip LED:
 `cd test && make -B`.
 
 ## External hardware
 
 - **I2S codec**: PCM1808 ADC + PCM5102 DAC, configured as I2S **slaves**;
   the PCM1808's SCKI comes from `uio[0]` (MCLK, 24.576 MHz).
-- **EC11 encoder + stomp switch**: external 10 kΩ pull-downs to GND are
-  **required** on `ui[1]`, `ui[2]`, `ui[3]`, with the encoder and stomp
-  switch commons tied to 3.3 V — the ASIC has no internal pull resistors on
-  ui pins, so the lines float without them. Idle-low wiring also matches the
-  panel's reset state, so the pedal boots at preset 0, unbypassed, with no
-  spurious edges.
-- **Display**: the Tiny Tapeout demoboard's onboard 7-seg digit, attached
-  to `uo[0..7]` via the demoboard solder jumpers (segments active high).
+- **Clip LED**: the demoboard's onboard 7-seg decimal point, attached to
+  `uo[7]` via the demoboard solder jumpers — no other display is needed.
+- **True bypass**: a latching 3PDT footswitch — guitar to the common pole;
+  throw A routes the signal straight to the output jack, throw B through
+  the preamp → ADC → tile → DAC → output jack. The spare pole follows the
+  usual bypass-LED/ground convention.
 - **Guitar front end**: a high-impedance JFET-input preamp (TL072) with
   mid-rail bias ahead of the ADC input.
 - **Controls**: DIP switches (or a Pico) drive the enables `ui[7:4]` and

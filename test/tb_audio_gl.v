@@ -32,8 +32,8 @@
 //         .log file in audio_out_gl/), converted to .wav by wav_tool.py
 //
 // +EN/+PARAMS/+N interface and ui/uio byte layout: identical to tb_audio.v
-// (ui[7:4]=enables en[0]=fuzz..en[3]=trem, ui[3:1]=0 panel idle, ui[0]=ADC
-// data; P3..P0 on uio[5:2]).
+// (ui[7:4]=enables en[0]=fuzz..en[3]=trem, ui[3:1]=reserved driven 0,
+// ui[0]=ADC data; P3..P0 on uio[5:2]).
 
 `timescale 1ps/1ps
 
@@ -85,7 +85,7 @@ module tb_audio_gl;
     dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("PARAMS=%d", params);
     dummy = $value$plusargs("N=%d", n_in);
-    ui_in[7:1] = {en_dip[3:0], 3'b000};       // ui[7:4]=enables, ui[3:1]=0 (enc idle, stomp up)
+    ui_in[7:1] = {en_dip[3:0], 3'b000};       // ui[7:4]=enables, ui[3:1]=reserved (driven 0)
     uio_in     = {2'b00, params[3:0], 2'b00}; // P3..P0 on uio[5:2]
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen

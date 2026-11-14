@@ -3,7 +3,7 @@ project:
   title:        "Silicon Guitar Pedal"        # Project title
   author:       "Thomas McDonagh"      # Your name
   discord:      "dedicatedhippo"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "I2S stereo-mono pedal with encoder-selected effect chain, presets, stomp bypass, 7-seg display" # One line description of what your project does
+  description:  "I2S serial-effect guitar pedal (fuzz, distortion, bitcrush, tremolo) with DIP-switch enables; true bypass is wired externally via a 3PDT switch" # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     24576000       # Clock frequency in Hz (or 0 if not applicable)
 
@@ -18,29 +18,28 @@ project:
   # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
     - "tt_um_tmcdonagh_guitar_pedal.v"
-    - "panel.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
   ui[0]: "I2S ADC data in"
-  ui[1]: "Encoder A (ext. pull-down, common to 3V3)"
-  ui[2]: "Encoder B (ext. pull-down, common to 3V3)"
-  ui[3]: "Stomp switch (ext. pull-down, common to 3V3, latching)"
+  ui[1]: "Reserved (v3)"
+  ui[2]: "Reserved (v3)"
+  ui[3]: "Reserved (v3)"
   ui[4]: "Enable: fuzz"
   ui[5]: "Enable: distortion"
   ui[6]: "Enable: crush"
   ui[7]: "Enable: tremolo"
 
   # Outputs
-  uo[0]: "7-seg segment a (active high)"
-  uo[1]: "7-seg segment b (active high)"
-  uo[2]: "7-seg segment c (active high)"
-  uo[3]: "7-seg segment d (active high)"
-  uo[4]: "7-seg segment e (active high)"
-  uo[5]: "7-seg segment f (active high)"
-  uo[6]: "7-seg segment g (active high)"
+  uo[0]: "Reserved (v3)"
+  uo[1]: "Reserved (v3)"
+  uo[2]: "Reserved (v3)"
+  uo[3]: "Reserved (v3)"
+  uo[4]: "Reserved (v3)"
+  uo[5]: "Reserved (v3)"
+  uo[6]: "Reserved (v3)"
   uo[7]: "dp = clip LED (peak hold ~43 ms)"
 
   # Bidirectional pins
