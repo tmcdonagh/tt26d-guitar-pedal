@@ -21,17 +21,19 @@ IN_WAV = os.path.join(HERE, "audio_in.wav")
 IN_HEX = os.path.join(HERE, "audio_in.hex")
 OUT_DIR = os.path.join(HERE, "audio_out")
 
-# name, mode, params
+# name, en (ui[7:4], bit order = chain order en[0]=fuzz..en[3]=trem),
+# params (P3..P0 on uio[5:2])
 MODES = [
-    ("bypass", 0, 0x0),
-    ("fuzz",   1, 0x0),   # T=24576
-    ("dist1",  2, 0x1),   # G=2
-    ("dist2",  2, 0x2),   # G=3
-    ("dist3",  2, 0x3),   # G=4
-    ("ring",   3, 0x0),   # slowest LFO (k=0)
-    ("trem",   4, 0x0),   # k=7, min=0 (full steps)
-    ("crush8", 5, 0x2),   # N=8, no decimation
-    ("chain",  6, 0x0),
+    ("bypass",   0x0, 0x0),
+    ("fuzz",     0x1, 0x0),   # fixed clip 16384
+    ("dist",     0x2, 0x0),   # interim: hard clip, x3
+    ("distX",    0x2, 0x1),   # P0 — no-op until task 4 (soft knee)
+    ("crush",    0x4, 0x0),   # interim: N=8 fixed
+    ("crushQ",   0x4, 0x2),   # P1 — no-op until task 5 (auto-lofi)
+    ("trem",     0x8, 0x0),   # k=0 (~23.4 Hz), span 255 (4 steps)
+    ("tremS",    0x8, 0xC),   # k=1 (~46.9 Hz), span 127 (2 steps)
+    ("fuzzdist", 0x3, 0x0),   # = the v1 mode-6 chain
+    ("all4",     0xF, 0x0),   # full stack
 ]
 
 
@@ -68,13 +70,13 @@ def hex2wav(name):
     return path, len(samples)
 
 
-def run_mode(name, mode, params, n, sim):
+def run_mode(name, en, params, n, sim):
     out = os.path.join(OUT_DIR, f"{name}.hex")
     if sim == "verilator":
         exe = os.path.join(HERE, "obj_dir", "sim_audio_vl")
-        cmd = [exe, f"+MODE={mode}", f"+PARAMS={params}", f"+N={n}", f"+OUT={out}"]
+        cmd = [exe, f"+EN={en}", f"+PARAMS={params}", f"+N={n}", f"+OUT={out}"]
     else:
-        cmd = ["vvp", "sim_audio.vvp", f"+MODE={mode}", f"+PARAMS={params}",
+        cmd = ["vvp", "sim_audio.vvp", f"+EN={en}", f"+PARAMS={params}",
                f"+N={n}", f"+OUT={out}"]
     log = open(os.path.join(OUT_DIR, f"{name}.log"), "w")
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
@@ -92,7 +94,7 @@ def main():
             print(f"{p}: {n} samples")
     elif what == "run":
         n = wav2hex()
-        procs = [run_mode(name, mode, params, n, sim) for name, mode, params in MODES]
+        procs = [run_mode(name, en, params, n, sim) for name, en, params in MODES]
         for p in procs:
             p.wait()
         for name, _, _ in MODES:

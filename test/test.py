@@ -53,10 +53,12 @@ async def test_skeleton_baseline(dut):
             break
     assert toggled, "LRCLK never toggled — frame counter not running"
 
-    # Mode select bits reach the mux (retired mode 7 falls to bypass; sample_in=0)
-    dut.ui_in.value = 0b0000_1110  # mode 7, params 0
+    # DIP enables all on (en = 0xF), panel lines idle, zero input: every
+    # stage maps 0 to 0, so DAC data stays low (v2.2: no mode mux — ui[7:4]
+    # are the effect enables, ui[3:1] the panel lines).
+    dut.ui_in.value = 0b1111_0000  # en[3:0] = 1111, encoder idle, stomp up
     await ClockCycles(dut.clk, 1)
-    assert dut.uio_out[1].value == 0, "unexpected DAC output in skeleton"
+    assert dut.uio_out[1].value == 0, "unexpected DAC output with zero input"
 
 
 # ---------------------------------------------------------------------
@@ -129,6 +131,28 @@ def tx_data_bits(bits):
     return v
 
 
+async def _trem_probe(dut, cur, count, x=16384):
+    """LFO-count-locked capture for the trem tests. With the sim at the
+    start of frame `cur` (right after a WS fall; frames < cur may already
+    have been driven), advance/drive/capture so the returned value is
+    frame `count`'s output — the effect of frame count-1's input x,
+    produced with post-strobe LFO count == count (frame F's strobe
+    leaves count F+1; probe counts here stay in the falling direction
+    unless they cross a wrap). Consecutive counts reuse the previous
+    capture round's drive (it drove the same x). Returns (new cur, out).
+
+    Requires: count >= cur (increasing probes) and, when count == cur,
+    the previous round must have driven x on frame count-1."""
+    if cur <= count - 1:
+        await ClockCycles(dut.clk, 512 * (count - 1 - cur))
+        await i2s_send_and_capture(dut, (x & 0xFFFF) << 8)   # drive frame count-1
+        await _wait_left_start(dut)                          # start of frame count
+    bits = await i2s_send_and_capture(dut, (x & 0xFFFF) << 8)  # capture frame count
+    await _wait_left_start(dut)                              # start of frame count+1
+    out = tx_data_bits(bits)
+    return count + 1, (out - 0x10000 if out & 0x8000 else out)
+
+
 @cocotb.test()
 async def test_bclk_lrclk_ratios(dut):
     """BCLK toggles every 4 clk (period 8); LRCLK toggles once per 256 clk."""
@@ -197,7 +221,7 @@ async def test_stereo_halves_match(dut):
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0  # bypass
+    dut.ui_in.value = 0  # en = 0 (identity chain; L=R mono contract)
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -237,12 +261,13 @@ async def test_stereo_halves_match(dut):
 
 @cocotb.test()
 async def test_bypass_loopback(dut):
-    """Mode 0 echoes samples through the full pipeline, one frame later:
-    +100, -100, and -32768 (saturation edge) must all round-trip."""
+    """en = 0 (preset 0 ROM all-off, DIP clear, stomp up) echoes samples
+    through the full pipeline, one frame later: +100, -100, and -32768
+    (saturation edge) must all round-trip."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0  # mode 0 = bypass
+    dut.ui_in.value = 0  # en = 0: preset 0 + DIP clear -> identity
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -365,9 +390,13 @@ async def test_encoder_fwd_rev(dut):
 @cocotb.test()
 async def test_encoder_bounce(dut):
     """Bounce filter: A high for 47 frames — one short of the
-    48-consecutive-sample threshold — is ignored; a full 50-frame
-    level still counts (sub-detent glitches rejected, real detents
-    counted)."""
+    48-consecutive-sample threshold — is ignored; a level held exactly
+    48 frames (the acceptance boundary itself) still counts; a full
+    50-frame level also counts (sub-detent glitches rejected, real
+    detents counted). The 48-frame hold is frame-locked (started just
+    after a WS fall) so its window provably spans ticks f0..f47 — 48
+    equal samples — pinning the a_cnt == 46 acceptance edge that the
+    47/50 bracket alone leaves ambiguous (Task 2 review carry-in)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -394,6 +423,15 @@ async def test_encoder_bounce(dut):
     # control: a full 50-frame level is accepted (rose, B low -> +1)
     await _detent(dut, 1, 0)
     assert pc() == 1, "50-frame level must be counted"
+
+    # exactly 48 frames: the boundary itself must count. A 1->0 fall
+    # with B low counts -1 (pc 1 -> 0). Frame-locked start so the
+    # 512*48 window covers exactly the 48 equal samples f0..f47.
+    await _wait_left_start(dut)
+    dut.ui_in[1].value = 0                # A falls; hold EXACTLY 48 frames
+    await ClockCycles(dut.clk, 512 * 48)
+    await Timer(1, unit="ns")
+    assert pc() == 0, "exact 48-frame hold must be counted (fell, B low: -1)"
 
 
 @cocotb.test()
@@ -491,83 +529,55 @@ async def test_seg_patterns(dut):
             await _detent(dut, k % 2, k % 2)
 
 
-# ui byte layout (interim): ui[0]=I2S data (driven by helper), ui[3:1]=mode
-# (also the panel lines {stomp, enc_b, enc_a} since task 2 — the mode decode
-# moves off them in task 3), ui[5:4]=bit-depth sel, ui[7:6]=decimation sel
+# ui byte layout (v2.2): ui[0]=I2S data (driven by the helper), ui[3:1]=
+# panel lines {stomp, enc_b, enc_a} (kept 0 = idle/stomp-up in these
+# tests, so preset stays 0 and the ROM contributes nothing), ui[7:4]=DIP
+# effect enables en[3:0] (en[0]=fuzz .. en[3]=trem = chain order).
+# uio byte layout: uio[5:2]=params P3..P0 — task 3 wires P2=uio[4] (trem
+# rate) and P3=uio[5] (trem depth); P0/P1 land in tasks 4-5.
 
 @cocotb.test()
 async def test_bitcrush_quantize(dut):
-    """Mode 5, no decimation: output = input with low (16-N) bits masked.
-    N=16 keeps all, N=10 masks 6, N=8 masks 8."""
+    """Crush stage (en[2]), interim task 3: quantize-only at fixed N=8 —
+    out = in & 0xFF00 (low 8 bits masked, sign kept), latched each frame;
+    decimator deleted (auto-lofi depth arrives in task 5)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
+    dut.ui_in.value = 0b0100_0000  # en[2] crush only; panel idle
+    dut.uio_in.value = 0           # P1 unused until task 5
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def crush_once(param_byte, word16):
-        dut.ui_in.value = param_byte  # ui[0] rewritten by helper
+    async def crush_once(word16):
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, word16 << 8)
         await _wait_left_start(dut)
         bits = await i2s_send_and_capture(dut, 0)
         return tx_data_bits(bits)
 
-    # N=8 (ui[5:4]=10 -> mask 0xFF00), decim=0
-    assert await crush_once(0b0_10_101_0, 0x0FFF) == 0x0F00
-    # N=10 (ui[5:4]=01 -> mask 0xFFC0)
-    assert await crush_once(0b0_01_101_0, 0x0FFF) == 0x0FC0
-    # N=16 (ui[5:4]=00 -> no mask)
-    assert await crush_once(0b0_00_101_0, 0x0FFF) == 0x0FFF
-    # negative values keep sign through masking
-    assert await crush_once(0b0_10_101_0, 0xFF9C) == 0xFF00
-
-
-@cocotb.test()
-async def test_bitcrush_decimate(dut):
-    """Mode 5 with divide-by-2 sample-hold. The latch phase after mid-frame
-    reset is arbitrary, so inject each value twice on consecutive frames;
-    regardless of phase, the output stream must show each value repeated
-    twice, in order (shifted by 0 or 1 frame)."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0b01_00_101_0  # N=16 (ui[5:4]=00), decim=/2 (ui[7:6]=01)
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    vals = [0x1111, 0x3333, 0x5555, 0x7777, 0xAAAA, 0xCCCC]
-    inputs = [v for v in vals for _ in (0, 1)]  # each value twice
-    outs = []
-    for word16 in inputs:
-        await _wait_left_start(dut)
-        outs.append(tx_data_bits(await i2s_send_and_capture(dut, word16 << 8)))
-
-    expected = inputs  # held stream = each value twice
-    # find the phase: an 8-sample window of outs must equal the held pattern
-    ok = any(outs[o:o + 8] == expected[0:8] for o in (1, 2))
-    assert ok, f"held pattern not found; outs={[hex(o) for o in outs]}"
+    assert await crush_once(0x0FFF) == 0x0F00, "low 8 bits masked"
+    assert await crush_once(0xFF9C) == 0xFF00, "negative keeps sign through mask"
+    assert await crush_once(0x7FFF) == 0x7F00, "+full-scale masks to 0x7F00"
+    assert await crush_once(0x8000) == 0x8000, "-32768 masks to 0x8000"
 
 
 @cocotb.test()
 async def test_distortion_gain(dut):
-    """Mode 2: out = sat16(in * G), G = 1 + ui[5:4] (1..4)."""
+    """Dist stage (en[1]), interim task 3: v1 hard clip with the drive
+    fixed at x3 — out = sat16(in * 3) on the stage input (no rectify;
+    fuzz is off). Task 4 replaces this with the soft-knee shaper."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0
-    dut.uio_in.value = 0
+    dut.ui_in.value = 0b0010_0000  # en[1] dist only; panel idle
+    dut.uio_in.value = 0           # P0 unused until task 4
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def dist_once(param_byte, word16):
-        dut.ui_in.value = param_byte
+    async def dist_once(word16):
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, word16 << 8)
         await _wait_left_start(dut)
@@ -575,53 +585,55 @@ async def test_distortion_gain(dut):
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
-    # G=3 (ui[5:4]=10): 1000*3 = 3000
-    assert await dist_once(0b00_10_010_0, 1000) == 3000
-    # G=4 (ui[5:4]=11): 20000*4 saturates (G max is 4)
-    assert await dist_once(0b00_11_010_0, 20000) == 32767
-    assert await dist_once(0b00_11_010_0, -20000) == -32768  # spec sat16: clamp to -32768
-    # G=1 (ui[5:4]=00): clean pass-through
-    assert await dist_once(0b00_00_010_0, 1234) == 1234
+    # clean x3 (positive and negative)
+    assert await dist_once(1000) == 3000
+    assert await dist_once(1234) == 3702
+    assert await dist_once(-1234) == -3702
+    # saturation both ways (spec sat16: +32767 / -32768)
+    assert await dist_once(20000) == 32767
+    assert await dist_once(-20000) == -32768
+    # -32768 * 3 = -98304 saturates to -32768
+    assert await dist_once(-32768) == -32768
 
 
 @cocotb.test()
 async def test_fuzz_rectify(dut):
-    """Mode 1: full-wave rectifier (|x|) with parametric clip T
-    (ui[5:4]: 00->24576, 01->16384, 10->8192, 11->4096)."""
+    """Fuzz stage (en[0]): full-wave rectifier + fixed clip at 16384 —
+    the v1 chain value (v2.2: fuzz gets no param bit)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0
+    dut.ui_in.value = 0b0001_0000  # en[0] fuzz only; panel idle
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def fuzz_once(param_byte, word16):
-        dut.ui_in.value = param_byte
+    async def fuzz_once(word16):
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, word16 << 8)
         await _wait_left_start(dut)
         bits = await i2s_send_and_capture(dut, 0)
         return tx_data_bits(bits)
 
-    # T=24576 (default 00): negative input folds positive, small signal unclipped
-    assert await fuzz_once(0b00_00_001_0, -1000) == 1000
-    assert await fuzz_once(0b00_00_001_0, 3000) == 3000
-    # T=8192 (ui[5:4]=10): |−30000| clips to 8192
-    assert await fuzz_once(0b00_10_001_0, -30000) == 8192
-    # T=4096 (ui[5:4]=11): |+3000| = 3000 stays below T
-    assert await fuzz_once(0b00_11_001_0, 3000) == 3000
-    assert await fuzz_once(0b00_11_001_0, -30000) == 4096
+    # negative folds positive; small signal stays below the clip
+    assert await fuzz_once(-1000) == 1000
+    assert await fuzz_once(3000) == 3000
+    # |x| > 16384 clips, both input polarities (v1 chain vectors)
+    assert await fuzz_once(-20000) == 16384
+    assert await fuzz_once(20000) == 16384
+    # -32768: |x| saturates to 32767, then clips
+    assert await fuzz_once(-32768) == 16384
 
 
 @cocotb.test()
 async def test_fuzz_dist_chain(dut):
-    """Mode 6: rectify, clip at fixed 16384, then saturating x3."""
+    """Fuzz + dist stacked (en = 0x3): rectify, clip at 16384, then
+    saturating x3 — bit-equal to the v1 mode-6 chain."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b00_00_110_0  # mode 6
+    dut.ui_in.value = 0b0011_0000  # en[1:0] fuzz + dist
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -642,67 +654,116 @@ async def test_fuzz_dist_chain(dut):
 
 @cocotb.test()
 async def test_tremolo(dut):
-    """Mode 4: stepped-gain tremolo: out = in >>> s, s = LFO gap >> 6
-    (gains 1, 1/2, 1/4, 1/8; min=0 via ui[4]=0). k=7 -> ramp of 8 frames.
-    The LFO counter value sampled by the shift is the post-increment one;
-    with the partial reset frame consuming count 0 the expected sequence
-    (DC 16384 in) is exactly:"""
+    """Trem stage (en[3]): stepped-gain triangle LFO as built (v1) —
+    out = in >>> s, s = LFO gap >> 6 (gains 1, 1/2, 1/4, 1/8). v2.2
+    params on uio: P2=uio[4] rate, P3=uio[5] depth. The LFO counter
+    value sampled by each output is the post-increment one; frame F's
+    input is output in frame F+1 with count F+1 (validated against the
+    v1 k=7 sequence). 16 exact values across both P2 rates x both P3
+    depths, probed at the gain-step boundary counts, plus a sign probe
+    and a wrap/direction probe (v1 parity)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b11101000  # mode 4 (ui[3:1]=100), k=7 (ui[7:5]=111), min=0 (ui[4]=0)
-    dut.uio_in.value = 0
+    dut.ui_in.value = 0b1000_0000  # en[3] trem only; panel idle
+    dut.uio_in.value = 0           # P2=0, P3=0 (k=0, span 255) — set per config below
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    def gapfall(c): return (c * 255) >> 3
-    def grise(c): return (c * 255) >> 3
-    def out_for(gap): return 16384 >> (gap >> 6)
-    exp_outs = [0,                                   # partial frame: input 0
-                out_for(gapfall(2)), out_for(gapfall(3)),
-                out_for(gapfall(4)), out_for(gapfall(5)),
-                out_for(gapfall(6)), out_for(gapfall(7)),
-                out_for(255),                        # count wraps: rising starts at max gap
-                out_for(255 - grise(1)), out_for(255 - grise(2)),
-                out_for(255 - grise(3)), out_for(255 - grise(4)),
-                out_for(255 - grise(5)), out_for(255 - grise(6)),
-                out_for(255 - grise(7)),
-                out_for(gapfall(0))]                 # wraps again: full gain
+    # (uio byte, probes) per P2 x P3 setting: uio[4]=P2 rate (k=0 ->
+    # 2^10-frame ramp/dir ~23.4 Hz, k=1 -> 2^9 ~46.9 Hz), uio[5]=P3
+    # depth (0 -> span 255 = 4 gain steps, 1 -> span 127 = 2 steps).
+    # Each probe is (post-strobe LFO count, input x, expected output):
+    # out = x >>> (gap >> 6) with gap = ((cnt << rs) - cnt) >> exp
+    # (falling) — counts chosen at the gain-step boundaries so the ramp
+    # arithmetic is pinned exactly (gap 63/64, 127/128, 191/192).
+    CONFIGS = [
+        # k=0, span 255 (rs 8, exp 10): boundary counts 257/258/515/772
+        (0x00, [(257, 16384, 16384), (258, 16384, 8192),
+                (515, 16384, 4096), (772, 16384, 2048)]),
+        # k=1, span 255 (rs 8, exp 9): boundaries 128/129/258/386, sign
+        # probe at 302, wrap probe at 512 (rising starts at max gap 255)
+        (0x10, [(128, 16384, 16384), (129, 16384, 8192),
+                (258, 16384, 4096), (302, -16384, -4096),
+                (386, 16384, 2048), (512, 16384, 2048)]),
+        # k=0, span 127 (rs 7, exp 10): s=1 boundary at 516/517
+        (0x20, [(256, 16384, 16384), (516, 16384, 16384),
+                (517, 16384, 8192), (900, 16384, 8192)]),
+        # k=1, span 127 (rs 7, exp 9): s=1 boundary at 258/259
+        (0x30, [(128, 16384, 16384), (258, 16384, 16384),
+                (259, 16384, 8192), (450, 16384, 8192)]),
+    ]
 
-    outs = []
-    for _ in range(len(exp_outs)):
+    for uio_byte, probes in CONFIGS:
+        dut.uio_in.value = uio_byte
+        dut.rst_n.value = 0
+        await ClockCycles(dut.clk, 10)
+        dut.rst_n.value = 1
         await _wait_left_start(dut)
-        outs.append(tx_data_bits(await i2s_send_and_capture(dut, 16384 << 8)))
-    assert outs == exp_outs, \
-        f"tremolo sequence mismatch: got {[hex(o) for o in outs]} exp {exp_outs}"
-
-    # sign preservation: negative DC in, capture one frame later
-    await _wait_left_start(dut)
-    await i2s_send_and_capture(dut, ((-16384) & 0xFFFF) << 8)
-    await _wait_left_start(dut)
-    out_neg = tx_data_bits(await i2s_send_and_capture(dut, 0))
-    out_neg = out_neg - 0x10000 if out_neg & 0x8000 else out_neg
-    assert out_neg == -(16384 >> (gapfall(2) >> 6)), f"negative DC: got {out_neg}"
+        cur = 1
+        for count, x, exp in probes:
+            cur, out = await _trem_probe(dut, cur, count, x)
+            assert out == exp, \
+                f"uio={uio_byte:#04x} count={count} x={x}: got {out}, exp {exp}"
 
 
 @cocotb.test()
-async def test_bitcrush_n6(dut):
-    """Bitcrush N=6 (ui[5:4]=11, mask 0xFC00): deep quantize."""
+async def test_chain_enables(dut):
+    """Serial chain enable matrix (v2.2 task 3): with preset 0 (ROM
+    all-off) and the panel idle, ui[7:4] alone sets en. For each stage:
+    ON applies its effect to known vectors (incl. -32768 — the output
+    also proves every DOWNSTREAM stage passes bit-exact when disabled);
+    with all en=0 the chain is bit-exact identity and +-32768 round-trip
+    (Review Focus 3: no disabled stage may corrupt the sample). Fuzz +
+    dist stacked must equal the v1 mode-6 chain output."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0_11_101_0  # mode 5, N=6, decim=0
+    dut.ui_in.value = 0
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def crush_once(word16):
+    async def stage_once(en_nibble, word16):
+        dut.ui_in.value = en_nibble << 4      # ui[7:4] = en; panel idle
         await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, word16 << 8)
+        await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
         await _wait_left_start(dut)
-        return tx_data_bits(await i2s_send_and_capture(dut, 0))
+        bits = await i2s_send_and_capture(dut, 0)
+        out = tx_data_bits(bits)
+        return out - 0x10000 if out & 0x8000 else out
 
-    assert await crush_once(0x0FFF) == 0x0C00, "N=6 mask 0xFC00"
-    assert await crush_once(0xFF9C) == 0xFC00, "negative keeps sign through mask"
+    # trem first (needs the LFO advanced from reset: gap >> 6 = 2 at
+    # post-strobe counts 600/603 on the k=0 / span-255 default params)
+    dut.ui_in.value = 0b1000_0000             # en[3] trem only
+    await _wait_left_start(dut)
+    cur = 1
+    cur, out = await _trem_probe(dut, cur, 600, 16384)
+    assert out == 4096, f"trem ON: 16384 >>> 2, got {out}"
+    cur, out = await _trem_probe(dut, cur, 603, -32768)
+    assert out == -8192, f"trem ON: -32768 >>> 2, got {out}"
+
+    # fuzz ON: rectify + clip 16384 (-32768 folds and clips; 5000 below)
+    assert await stage_once(0x1, -32768) == 16384
+    assert await stage_once(0x1, 5000) == 5000
+
+    # dist ON: sat16(x*3); 1234 pins the fuzz-off pass-through exact
+    assert await stage_once(0x2, -32768) == -32768
+    assert await stage_once(0x2, 1234) == 3702
+    assert await stage_once(0x2, 20000) == 32767
+
+    # crush ON: & 0xFF00 (0x0FFF is corruption-sensitive through the
+    # off fuzz/dist stages; -32768 keeps its sign)
+    assert await stage_once(0x4, 0x0FFF) == 0x0F00
+    assert await stage_once(0x4, -32768) == -32768
+
+    # fuzz + dist stacked = the v1 mode-6 chain
+    assert await stage_once(0x3, -20000) == 32767
+    assert await stage_once(0x3, 5000) == 15000
+    assert await stage_once(0x3, 20000) == 32767
+
+    # all stages OFF: bit-exact identity, +-full-scale through
+    assert await stage_once(0x0, 32767) == 32767
+    assert await stage_once(0x0, -32768) == -32768

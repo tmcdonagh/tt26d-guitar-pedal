@@ -5,25 +5,25 @@
 // 16-bit samples through the real I2S input pins and writes one output
 // sample per frame. Runs entirely inside Icarus — ~30 s per mode.
 //
-// v2.2 pin map (task 1): BCLK/LRCLK/DAC data moved to uio[6]/uio[7]/uio[1]
-// (MCLK stays uio[0]); ADC data stays on ui[0]. This tb drives ui[0] and
-// taps dut.effect_sample directly, so its wiring is unchanged. Modes 3
-// (ring mod) and 7 (test tone) are retired in v2.2 and now bypass.
-// Task 2 adds pedal_panel on ui[3:1]: this tb drives those bits as MODE,
-// so the panel's preset digit wanders — harmless, uo_out is unconnected
-// here and the audio path ignores the panel until task 3.
+// v2.2 task 3 byte layout: this tb drives the DIP effect enables on
+// ui[7:4] (+EN=, 0..15: bit order = chain order, en[0]=fuzz..en[3]=trem)
+// and the params on uio[5:2] (+PARAMS=, P3..P0: P2=trem rate, P3=trem
+// depth live; P0/P1 land in tasks 4-5). ui[3:1] stay 0 (encoder idle,
+// stomp up) so the preset stays 0 and the ROM contributes nothing —
+// en comes from the DIP byte alone; ui[0] is still the per-slot ADC
+// data bit, assigned separately below.
 //
 // Compile (icarus; ../src/*.v so the top's pedal_panel instance is
 // picked up):
 //   $ iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/*.v
 // Listening-sim build (Verilator; the binary wav_tool.py runs). The
-// -Wno waivers cover pre-existing WIDTH warnings in the v1 dist/chain/
-// trem arithmetic (tasks 4-5 rewrite it) and the template placeholder
+// -Wno waivers cover pre-existing WIDTH warnings in the dist/trem
+// arithmetic (tasks 4-5 rewrite it) and the template placeholder
 // src/project.v; --top-module pins the tb as the sim top:
 //   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
 //       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-MULTITOP tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
-//   vvp sim_audio.vvp +MODE=2 +PARAMS=2 +OUT=audio_out/dist2.hex
+//   vvp sim_audio.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out/distX.hex
 // Input:  audio_in.hex (one 16-bit sample per line, from audio_in.wav)
 // Output: $OUT, one 16-bit sample per frame
 
@@ -55,23 +55,24 @@ module tb_audio;
 
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
-  integer mode = 0, params = 0, n_in = 0;
+  integer en_dip = 0, params = 0, n_in = 0;
   integer i, slot;
   reg [15:0] word;
   integer dummy;
 
   initial begin
-    dummy = $value$plusargs("MODE=%d", mode);
+    dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("PARAMS=%d", params);
     dummy = $value$plusargs("N=%d", n_in);
-    ui_in = {params[3:0], mode[2:0], 1'b0}; // ui[7:4]=params, ui[3:1]=mode
+    ui_in[7:1] = {en_dip[3:0], 3'b000};       // ui[7:4]=enables, ui[3:1]=0 (enc idle, stomp up)
+    uio_in     = {2'b00, params[3:0], 2'b00}; // P3..P0 on uio[5:2]
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
     $readmemh("audio_in.hex", mem);
     n_samples = n_in;
-    $display("loaded %0d samples, MODE=%0d PARAMS=%0d", n_samples, mode, params);
+    $display("loaded %0d samples, EN=%0d PARAMS=%0d", n_samples, en_dip, params);
 
     // reset
     rst_n = 1'b0;

@@ -3,9 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Silicon Guitar Pedal — multi-effect DSP core.
- * I2S master in/out (codec-agnostic), 5 effects + bypass (ring mod and
- * test tone retired in v2.2), panel control plane (v2.2): EC11 encoder
- * + stomp on ui[3:1], 7-seg preset digit on uo[6:0].
+ * I2S master in/out (codec-agnostic), serial effect chain fuzz ->
+ * distortion -> bitcrusher -> tremolo with per-stage enable bypass
+ * (v2.2: ring mod, test tone, and the v1 8-way mode mux retired).
+ * Enables: preset ROM (EC11 encoder on ui[3:1]) OR DIP ui[7:4], all
+ * forced off by the latching stomp bypass. Params P3..P0 on uio[5:2].
  * See docs/info.md and the spec in the ai-dev-archive.
  */
 
@@ -69,84 +71,91 @@ module tt_um_tmcdonagh_guitar_pedal (
   end
 
   // ------------------------------------------------------------------
-  // Bitcrusher (mode 5): quantize to N bits (mask low bits) + sample-hold
-  // decimation. N: ui[5:4] 00->16, 01->10, 10->8, 11->6 (shift 0/6/8/10).
-  // Decimation: ui[7:6] = 0..3 -> divide by 1,2,4,8.
+  // Control plane (v2.2 task 2): EC11 encoder (A=ui[1], B=ui[2]) and
+  // stomp (ui[3]), sampled once per audio frame on sample_valid.
+  // pedal_panel debounces the lines, decodes quadrature x2, counts
+  // presets 0..7 (ROM enable table), and drives the 7-seg preset digit
+  // — blank while the bypass latch is engaged.
   // ------------------------------------------------------------------
-  wire [15:0] crushed = sample_in & ((ui_in[5:4] == 2'b00) ? 16'hFFFF
-                                   : (ui_in[5:4] == 2'b01) ? 16'hFFC0
-                                   : (ui_in[5:4] == 2'b10) ? 16'hFF00
-                                   : 16'hFC00);
+  wire [3:0] panel_en;
+  wire       panel_bypass;
+  wire [6:0] panel_seg;
 
-  wire [1:0] decim   = ui_in[7:6];
-  wire [2:0] dec_mask = (3'b001 << decim) - 3'd1; // /2,/4,/8 -> 1,3,7
-  reg  [2:0] decim_cnt;
-  reg [15:0] crush_hold;
-  wire crush_latch = sample_valid &&
-                     ((decim == 2'd0) || ((decim_cnt & dec_mask) == 3'd0));
-
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      decim_cnt  <= 3'd0;
-      crush_hold <= 16'd0;
-    end else begin
-      if (sample_valid) decim_cnt <= decim_cnt + 3'd1;
-      if (crush_latch)  crush_hold <= crushed;
-    end
-  end
+  pedal_panel u_panel (
+      .clk       (clk),
+      .rst_n     (rst_n),
+      .tick      (sample_valid),
+      .panel_in  (ui_in[3:1]),
+      .preset_en (panel_en),
+      .bypass    (panel_bypass),
+      .seg       (panel_seg)
+  );
 
   // ------------------------------------------------------------------
-  // Distortion (mode 2): out = sat16(in * G), G = 1 + ui[5:4] (1..4),
-  // shift-add (G is one of 1,2,3,4 — no variable multiplier needed)
+  // Effect chain (v2.2 task 3): serial fuzz -> dist -> crush -> trem,
+  // enable-bypass per stage. en bit order = chain order: en[0]=fuzz,
+  // en[1]=dist, en[2]=crush, en[3]=trem — preset ROM pattern OR DIP
+  // ui[7:4], forced all-off while the stomp bypass latch is engaged.
   // ------------------------------------------------------------------
-  wire signed [16:0] dist_in = $signed(sample_in);
-  reg signed [17:0] dist_prod;
-  always @* begin
-    case (ui_in[5:4])
-      2'd1:    dist_prod = dist_in <<< 1;               // x2
-      2'd2:    dist_prod = dist_in + (dist_in <<< 1);   // x3
-      2'd3:    dist_prod = dist_in <<< 2;               // x4
-      default: dist_prod = dist_in;                     // x1
-    endcase
-  end
-  // overflow iff the result's top bits stop looking sign-extended
-  wire dist_ovf = (dist_prod[17] != dist_prod[16]) || (dist_prod[16] != dist_prod[15]);
-  wire [15:0] dist_sat = dist_ovf ? (dist_prod[17] ? 16'h8000 : 16'h7FFF)
-                                  : dist_prod[15:0];
+  wire [3:0] en = panel_bypass ? 4'b0000 : (panel_en | ui_in[7:4]);
+
+  wire [15:0] s0 = sample_in;
 
   // ------------------------------------------------------------------
-  // Octave fuzz (mode 1): full-wave rectifier + parametric clip.
-  // T: ui[5:4] 00->24576, 01->16384, 10->8192, 11->4096.
-  // Fuzz->dist chain (mode 6): clip at fixed 16384, then sat x3.
+  // Stage 1 — octave fuzz: full-wave rectifier + fixed clip at 16384
+  // (the v1 chain value; v2.2 gives fuzz no param bit).
   // ------------------------------------------------------------------
   wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
                     : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
 
-  wire [15:0] fuzz_t = (ui_in[5:4] == 2'b00) ? 16'd24576
-                     : (ui_in[5:4] == 2'b01) ? 16'd16384
-                     : (ui_in[5:4] == 2'b10) ? 16'd8192
-                     : 16'd4096;
+  wire [15:0] fuzz_t   = 16'd16384;
   wire [15:0] fuzz_out = (mag > fuzz_t) ? fuzz_t : mag;
 
-  wire [15:0] chain_rect = (mag > 16'd16384) ? 16'd16384 : mag;
-  wire signed [17:0] chain_prod = ($signed(chain_rect) <<< 1) + $signed(chain_rect); // x3
-  // chain_rect <= 16384 so x3 fits 17 bits; overflow iff top bits disagree
-  wire chain_ovf = chain_prod[16] != chain_prod[15];
-  wire [15:0] chain_sat = chain_ovf ? 16'h7FFF : chain_prod[15:0];
+  wire [15:0] s1 = en[0] ? fuzz_out : s0;
 
   // ------------------------------------------------------------------
-  // Tremolo (mode 4): stepped-gain tremolo: out = in >>> s, gain steps
-  // 1, 1/2, 1/4, 1/8 driven by the triangle LFO (gap = distance from
-  // full gain). Rate k = ui[7:5] (ramp = 2^(10-k) frames per direction);
-  // depth ui[4]: 0 -> span 255 (4 steps), 1 -> span 127 (2 steps).
-  // (v1: step-gain replaces the exact multiply to fit the tile; smooth
-  // multiply is the documented refinement.)
+  // Stage 2 — distortion (interim, task 3): v1 hard clip, drive fixed
+  // x3 (shift-add). Task 4 replaces this with the soft-knee PWL
+  // shaper (P0 on uio[2]).
   // ------------------------------------------------------------------
-  wire [2:0] trem_k   = ui_in[7:5];
+  wire signed [16:0] dist_in = $signed(s1);
+  wire signed [17:0] dist_prod = (dist_in <<< 1) + dist_in;  // x3
+  // overflow iff the result's top bits stop looking sign-extended
+  wire dist_ovf = (dist_prod[17] != dist_prod[16]) || (dist_prod[16] != dist_prod[15]);
+  wire [15:0] dist_out = dist_ovf ? (dist_prod[17] ? 16'h8000 : 16'h7FFF)
+                                  : dist_prod[15:0];
+
+  wire [15:0] s2 = en[1] ? dist_out : s1;
+
+  // ------------------------------------------------------------------
+  // Stage 3 — bitcrusher (interim, task 3): quantize-only, N=8 fixed
+  // (mask 0xFF00), latched per audio frame (the v1 sample-hold
+  // decimator is deleted). Task 5 replaces the constant mask with the
+  // envelope-driven auto-lofi depth (P1 on uio[3]).
+  // ------------------------------------------------------------------
+  wire [15:0] crushed = s2 & 16'hFF00;
+
+  reg [15:0] crush_hold;
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)            crush_hold <= 16'd0;
+    else if (sample_valid) crush_hold <= crushed;
+  end
+
+  wire [15:0] s3 = en[2] ? crush_hold : s2;
+
+  // ------------------------------------------------------------------
+  // Stage 4 — tremolo: stepped-gain tremolo as built (v1): out =
+  // in >>> s with gain steps 1, 1/2, 1/4, 1/8, s = LFO gap >> 6
+  // (gap = distance from full gain), triangle LFO. v2.2 params: rate
+  // P2 = uio[4] (k=0 -> ramp 2^10 frames per direction ~23.4 Hz,
+  // k=1 -> 2^9 ~46.9 Hz); depth P3 = uio[5] (0 -> span 255 = 4 steps,
+  // 1 -> span 127 = 2 steps).
+  // ------------------------------------------------------------------
+  wire [2:0] trem_k   = uio_in[4] ? 3'd1 : 3'd0;
   wire [3:0] trem_exp = 4'd10 - {1'b0, trem_k};
 
-  wire [7:0] trem_span = ui_in[4] ? 8'd127 : 8'd255;
-  wire [3:0] trem_rshift = ui_in[4] ? 4'd7 : 4'd8;  // span = 2^rshift - 1
+  wire [7:0] trem_span = uio_in[5] ? 8'd127 : 8'd255;
+  wire [3:0] trem_rshift = uio_in[5] ? 4'd7 : 4'd8;  // span = 2^rshift - 1
 
   reg  [10:0] trem_cnt;
   reg         trem_dir;   // 0 = falling (gain down), 1 = rising
@@ -167,48 +176,16 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [18:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {11'd0, trem_cnt};
   wire [7:0]  trem_gap = trem_dir ? (trem_span - (trem_ramp >> trem_exp))
                                   : (trem_ramp >> trem_exp);
-  wire [15:0] trem_out = $signed(sample_in) >>> (trem_gap >> 6);
+  wire [15:0] trem_out = $signed(s3) >>> (trem_gap >> 6);
+
+  wire [15:0] s4 = en[3] ? trem_out : s3;
 
   // ------------------------------------------------------------------
-  // Effect mux (mode on ui[3:1]); ring mod (3) and test tone (7) were
-  // retired in v2.2 and fall to the bypass default.
+  // Chain output (name kept from v1: the audio tooling probes
+  // dut.effect_sample).
   // ------------------------------------------------------------------
-  wire [2:0] mode = ui_in[3:1];
-
   reg [15:0] effect_sample;
-  always @* begin
-    case (mode)
-      3'd1:    effect_sample = fuzz_out;
-      3'd2:    effect_sample = dist_sat;
-      3'd4:    effect_sample = trem_out;
-      3'd6:    effect_sample = chain_sat;
-      3'd5:    effect_sample = crush_hold;
-      default: effect_sample = sample_in; // mode 0 bypass (+ retired 3/7)
-    endcase
-  end
-
-  // ------------------------------------------------------------------
-  // Control plane (v2.2 task 2): EC11 encoder (A=ui[1], B=ui[2]) and
-  // stomp (ui[3]), sampled once per audio frame on sample_valid.
-  // pedal_panel debounces the lines, decodes quadrature x2, counts
-  // presets 0..7 (ROM enable table), and drives the 7-seg preset digit
-  // — blank while the bypass latch is engaged. preset_en/bypass feed
-  // the effect chain in task 3; they are tied off below until then.
-  // (The v1 LED level meter lived here; retired with the pin move.)
-  // ------------------------------------------------------------------
-  wire [3:0] panel_en;
-  wire       panel_bypass;
-  wire [6:0] panel_seg;
-
-  pedal_panel u_panel (
-      .clk       (clk),
-      .rst_n     (rst_n),
-      .tick      (sample_valid),
-      .panel_in  (ui_in[3:1]),
-      .preset_en (panel_en),
-      .bypass    (panel_bypass),
-      .seg       (panel_seg)
-  );
+  always @* effect_sample = s4;
 
   // ------------------------------------------------------------------
   // I2S transmit: uio_out[1], MSB first. Loaded at slot 0 and slot 32
@@ -232,10 +209,12 @@ module tt_um_tmcdonagh_guitar_pedal (
   assign uo_out  = {1'b0, panel_seg}; // uo[6:0] = 7-seg a..g; uo[7] = dp clip LED (task 6)
 
   assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
-  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params, later task)
+  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P3..P0)
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in, panel_en, panel_bypass, 1'b0};
+  // (uio[3:2] = P0/P1 land in tasks 4-5; uio[7:6]/[1:0] are clock/data
+  // outputs, their input side is unused)
+  wire _unused = &{ena, uio_in[7:6], uio_in[3:0], 1'b0};
 
 endmodule
 
