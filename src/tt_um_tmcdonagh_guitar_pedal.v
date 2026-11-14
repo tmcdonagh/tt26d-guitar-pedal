@@ -122,8 +122,13 @@ module tt_um_tmcdonagh_guitar_pedal (
   // so a stacked fuzz always feeds the shaped region. No multipliers —
   // subtract + shift only.
   // ------------------------------------------------------------------
-  wire [15:0] dist_mag = (s1 == 16'h8000) ? 16'h7FFF   // saturating |s1|
-                        : s1[15] ? (~s1 + 16'd1) : s1;
+  // Shaper input magnitude, shared from the chain (area trim (b)):
+  // s1 = fuzz_out when fuzz is on — already a non-negative magnitude
+  // clamped to [0, 16384], so never the 0x8000 saturation edge — and
+  // sample_in otherwise, whose saturating |x| IS the stage-1 mag wire.
+  // Value-equal to saturating |s1| in every reachable state; sharing
+  // drops a second |x| block (comparator + negater + muxes).
+  wire [15:0] dist_mag = en[0] ? fuzz_out : mag;
 
   wire [15:0] dist_t = uio_in[2] ? 16'd4096 : 16'd8192;
 
@@ -268,7 +273,51 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire dac_data = (slot == 6'd0 || slot == 6'd32) ? 1'b0
                 : (data_window ? tx_shift[15] : 1'b0);
 
-  assign uo_out  = {1'b0, panel_seg}; // uo[6:0] = 7-seg a..g; uo[7] = dp clip LED (task 6)
+  // ------------------------------------------------------------------
+  // Clip LED (v2.2 task 6): dp on uo[7] with ~2048-frame (~43 ms)
+  // peak-hold. hit = (effect_sample == 16'h7FFF) || (effect_sample ==
+  // 16'h8000) — the two saturation rails (full-scale positive and
+  // -32768), which are bitwise complements, so no single equality
+  // covers both. Written as the value-equal reduction form (0x7FFF =
+  // 0_111111111111111: bit 15 clear, low 15 all ones; 0x8000 =
+  // 1_000000000000000: bit 15 set, low 15 all zeros) — one mux of two
+  // 15-bit reduction trees instead of two 16-bit comparator expands:
+  //   x[15]=0 -> &x[14:0]  (x == 0x7FFF)
+  //   x[15]=1 -> ~|x[14:0] (x == 0x8000)
+  // The compare is evaluated once per output frame on sample_valid —
+  // the same edge env and crush_hold clock on, one clk after the
+  // strobe latched the frame's input — so the detect sees each
+  // transmitted sample exactly once (bypass and the comb stages: the
+  // very value the TX shift sends next frame; crush's hold register
+  // contributes its usual one-frame lag when enabled — the same phase
+  // the env mask already pins). Hold: a hit lights dp_q and reloads
+  // the 11-bit counter to 0; otherwise, while lit, the counter runs up
+  // to 2047 and clears dp_q on the edge it wraps (2047 + 1 = 0 in 11
+  // bits, so the terminal state needs no separate reset path). A hit
+  // mid-hold restarts the hold.
+  // ------------------------------------------------------------------
+  wire hit = effect_sample[15] ? ~|effect_sample[14:0]   // 0x8000
+                               :  &effect_sample[14:0];  // 0x7FFF
+
+  reg        dp_q;
+  reg [10:0] dp_cnt;
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dp_q   <= 1'b0;
+      dp_cnt <= 11'd0;
+    end else if (sample_valid) begin
+      if (hit) begin
+        dp_q   <= 1'b1;
+        dp_cnt <= 11'd0;
+      end else if (dp_q) begin
+        dp_cnt <= dp_cnt + 11'd1;
+        if (dp_cnt == 11'd2047) dp_q <= 1'b0;
+      end
+    end
+  end
+
+  assign uo_out  = {dp_q, panel_seg}; // uo[6:0] = 7-seg a..g; uo[7] = dp clip LED (peak-hold)
 
   assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
   assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P3..P0)

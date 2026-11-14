@@ -487,8 +487,9 @@ async def test_seg_patterns(dut):
     """7-seg patterns (seg[0]=a..seg[6]=g, active high) and the preset
     ROM enable table, walked preset 0..7 with one forward A edge each
     (rose with B low and fell with B high, alternating — +1 per edge,
-    B settled one hold ahead). uo[7] is the dp placeholder (0 until
-    task 6)."""
+    B settled one hold ahead). The dp (uo[7]) stays dark here — no
+    I2S input is driven, so effect_sample never saturates (dp clip
+    LED behavior lives in test_clip_dp)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -886,3 +887,98 @@ async def test_chain_enables(dut):
     # all stages OFF: bit-exact identity, +-full-scale through
     assert await stage_once(0x0, 32767) == 32767
     assert await stage_once(0x0, -32768) == -32768
+
+
+@cocotb.test()
+async def test_clip_dp(dut):
+    """dp clip LED (uo[7]), v2.2 task 6: peak-hold on output saturation.
+    hit = (effect_sample == 0x7FFF) || (effect_sample == 0x8000)
+    (0x7FFF = 0_111111111111111, 0x8000 = 1_000000000000000 — bitwise
+    complements, so no single equality covers both), evaluated once per
+    output frame on sample_valid — the same edge env/crush_hold clock
+    on, one clk after the strobe latched the frame's input, so the
+    compare sees exactly the value the TX shift sends for the frame
+    (en=0 here: effect_sample IS sample_in). Hold: a hit lights dp_q
+    and reloads an 11-bit counter to 0; without a hit the counter runs
+    to 2047 (~2048 frames ~ 43 ms at 48 kHz) and clears dp_q on the
+    wrap edge; a new hit mid-hold restarts it (peak-hold).
+    Full-scale is driven with en=0 (bypass): dist never emits
+    full-scale (soft ceiling 20479) and fuzz clips at 16384, but the
+    identity chain passes sample_in = 0x7FFF exactly. Phases, preset 0
+    / DIP clear / stomp up throughout:
+      - 100 mid-level (0x1000) frames: dp stays dark (the LED is
+        sticky for ~2048 frames, so one end-of-phase probe covers all
+        100 frames);
+      - ONE 0x7FFF frame: dp still dark right after the drive (the hit
+        clocks at the frame's sample_valid edge, early in the right
+        half), lit by the end of that frame; uo[6:0] still tracks
+        panel_seg (preset-0 digit 0x3F);
+      - input returns to 0x1000: dp holds on its own — still lit 1000
+        frames later, and at hold-frame 2040 (a half-length hold would
+        already be dark; the clear comes at 2048);
+      - cleared by clip-frame + 2048 + 64. Frames after the return
+        frame advance in bulk (ui[0] idles low — silence, exactly as
+        non-hitting as 0x1000; the hold is what's pinned)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0     # en=0: preset-0 ROM all-off + DIP clear -> identity
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    def dp():
+        return int(dut.uo_out[7].value)
+
+    def seg_ok():
+        # the dp must never disturb the preset digit: uo[6:0] == panel_seg
+        return (int(dut.uo_out.value) & 0x7F) == int(dut.user_project.panel_seg.value)
+
+    await _wait_left_start(dut)   # start of frame 0
+
+    # 100 mid-level frames (frames 0..99): dp never lights
+    for _ in range(100):
+        await i2s_send_and_capture(dut, 0x1000 << 8)
+        await ClockCycles(dut.clk, 256)
+    await Timer(1, unit="ns")
+    assert dp() == 0, "mid-level frames must never light the dp"
+    assert seg_ok(), "uo[6:0] must track panel_seg with the dp dark"
+
+    # frame 100: ONE full-scale frame. The helper returns at the start
+    # of the right half, before the strobe edge, so dp is still dark
+    # here; the hit clocks at the sample_valid edge (lr_cnt 257) and dp
+    # is lit by the end of the frame.
+    await i2s_send_and_capture(dut, 0x7FFF << 8)
+    await Timer(1, unit="ns")
+    assert dp() == 0, "dp must not light before the clip frame's valid edge"
+    await ClockCycles(dut.clk, 256)              # rest of the clip frame
+    await Timer(1, unit="ns")
+    assert dp() == 1, "one full-scale frame must light the dp (uo[7])"
+    assert seg_ok() and int(dut.user_project.panel_seg.value) == 0x3F, \
+        "7-seg must be unchanged during clip (preset-0 digit still 0x3F)"
+
+    # frame 101: input returns to mid-level — from here the dp must
+    # hold with no full-scale anywhere in the input
+    await i2s_send_and_capture(dut, 0x1000 << 8)
+    await ClockCycles(dut.clk, 256)
+    await Timer(1, unit="ns")
+    assert dp() == 1, "dp must stay lit right after the input returns to mid-level"
+
+    # frame 1101 = 1000 frames after the return frame: still lit — the
+    # hold, not the input, keeps the dp on
+    await ClockCycles(dut.clk, 512 * 999)
+    await Timer(1, unit="ns")
+    assert dp() == 1, "dp must hold lit 1000 frames after the input returns to mid-level"
+
+    # frame 2040: still lit — pins the hold near its full length (the
+    # clear comes at clip-frame + 2048 = 2148; 8 frames of slack)
+    await ClockCycles(dut.clk, 512 * 939)
+    await Timer(1, unit="ns")
+    assert dp() == 1, "dp must still hold at hold-frame 2040 (~2048-frame hold)"
+
+    # frame 2212 = clip frame + 2048 + 64: cleared
+    await ClockCycles(dut.clk, 512 * 172)
+    await Timer(1, unit="ns")
+    assert dp() == 0, "dp must clear within 2048+64 frames of the clip frame"
+    assert seg_ok(), "uo[6:0] must still track panel_seg after the dp clears"
