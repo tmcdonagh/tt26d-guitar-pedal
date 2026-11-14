@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2026 Tom McDonagh
+// SPDX-FileCopyrightText: © 2026 Thomas McDonagh
 // SPDX-License-Identifier: Apache-2.0
 //
 // Audio listening runner (Verilog-native, no cocotb): streams a hex file of
@@ -9,9 +9,19 @@
 // (MCLK stays uio[0]); ADC data stays on ui[0]. This tb drives ui[0] and
 // taps dut.effect_sample directly, so its wiring is unchanged. Modes 3
 // (ring mod) and 7 (test tone) are retired in v2.2 and now bypass.
+// Task 2 adds pedal_panel on ui[3:1]: this tb drives those bits as MODE,
+// so the panel's preset digit wanders — harmless, uo_out is unconnected
+// here and the audio path ignores the panel until task 3.
 //
-// Compile:
-//   iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/tt_um_tmcdonagh_guitar_pedal.v
+// Compile (icarus; ../src/*.v so the top's pedal_panel instance is
+// picked up):
+//   $ iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/*.v
+// Listening-sim build (Verilator; the binary wav_tool.py runs). The
+// -Wno waivers cover pre-existing WIDTH warnings in the v1 dist/chain/
+// trem arithmetic (tasks 4-5 rewrite it) and the template placeholder
+// src/project.v; --top-module pins the tb as the sim top:
+//   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
+//       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-MULTITOP tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
 //   vvp sim_audio.vvp +MODE=2 +PARAMS=2 +OUT=audio_out/dist2.hex
 // Input:  audio_in.hex (one 16-bit sample per line, from audio_in.wav)

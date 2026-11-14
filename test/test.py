@@ -1,5 +1,5 @@
 # SPDX-FileCopyrightText: © 2024 Tiny Tapeout
-# SPDX-FileCopyrightText: © 2026 Tom McDonagh
+# SPDX-FileCopyrightText: © 2026 Thomas McDonagh
 # SPDX-License-Identifier: Apache-2.0
 
 import cocotb
@@ -23,9 +23,10 @@ async def test_skeleton_baseline(dut):
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    # Reset state: DAC data low, LED bar dark
+    # Reset state: DAC data low, preset digit "0" on the 7-seg (uo[6:0])
     assert dut.uio_out[1].value == 0, "DAC data not low after reset"
-    assert ((int(dut.uo_out.value) >> 1) & 0x1F) == 0, "LED bar not dark after reset"
+    assert int(dut.uo_out.value) == 0x3F, \
+        "preset digit must show 0 after reset (uo[6:0]=0x3F, dp=0)"
 
     # MCLK output enabled on uio[0] and following clk.
     # Sample away from clock edges (comb outputs need settle time).
@@ -262,7 +263,7 @@ async def test_bypass_loopback(dut):
 async def test_reset_state(dut):
     """After reset (with junk driven on the ADC line), junk may flush
     through for exactly one frame (reset releases mid-frame); the next
-    frame with a clean (zero) input must be silent, LED bar dark."""
+    frame with a clean (zero) input must be silent, preset digit 0."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -279,13 +280,43 @@ async def test_reset_state(dut):
     bits = await i2s_send_and_capture(dut, 0)   # frame B: must be silent
     assert tx_data_bits(bits) == 0, \
         f"second frame after reset must be silent, got {tx_data_bits(bits):#06x}"
-    assert ((int(dut.uo_out.value) >> 1) & 0x1F) == 0, "LED bar must be dark after reset"
+    assert int(dut.uo_out.value) == 0x3F, \
+        "preset digit must show 0 after reset (uo[6:0]=0x3F, dp=0)"
+
+
+# ---------------------------------------------------------------------
+# Panel control plane (v2.2 task 2): EC11 encoder A=ui[1], B=ui[2] and
+# stomp ui[3], sampled once per audio frame (512 clk) on sample_valid.
+# The bounce filter accepts a level only after 48 consecutive equal
+# frame samples, so tests hold each level 50 frames (a real detent) or
+# 47 (a sub-detent glitch, which must be rejected). Quadrature is x2 on
+# accepted A edges: rose -> B low +1 / B high -1; fell -> B high +1 /
+# B low -1; preset_cnt wraps mod 8. Tests interleave B between A edges
+# (a real EC11 never changes both lines on the same frame; the decode
+# reads the settled B level at each A edge). The display blanks while
+# the bypass latch is engaged.
+# ---------------------------------------------------------------------
+
+async def _detent(dut, a, b):
+    """Set encoder levels A=ui[1], B=ui[2] and hold 50 frames (512 clk
+    each) — long enough for the 48-consecutive-sample bounce filter to
+    accept them. Settles 1 ns so comb outputs are readable after."""
+    dut.ui_in[1].value = a
+    dut.ui_in[2].value = b
+    await ClockCycles(dut.clk, 512 * 50)
+    await Timer(1, unit="ns")
 
 
 @cocotb.test()
-async def test_led_meter(dut):
-    """LED bar = max(|sample|>>10 (0..31, all 5 LEDs), bar-1), updated once
-    per frame. Full-scale -> 31; decay by 1 per sample; 32 zeros reach 0."""
+async def test_encoder_fwd_rev(dut):
+    """x2 quadrature on accepted A edges, direction from accepted B:
+    rose with B low +1 / B high -1; fell with B high +1 / B low -1
+    (controller ruling — standard x2 table). A full forward detent
+    (A 0->1->0 with B interleaved 0->1 between the edges, as a real
+    EC11 does) counts +2; reversed counts -2; rev from 0 wraps to 7;
+    fwd from 7 wraps to 0. B-only steps settle B one hold before the
+    A edge that reads it (the panel never sees A and B change on the
+    same frame)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -295,24 +326,174 @@ async def test_led_meter(dut):
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def send_and_read_bar(word16):
-        await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, word16 << 8)
-        await ClockCycles(dut.clk, 4)
-        await Timer(1, unit="ns")
-        return (int(dut.uo_out.value) >> 1) & 0x1F
+    def pc():
+        # tb.v instantiates the design top as user_project
+        return int(dut.user_project.u_panel.preset_cnt.value)
 
-    assert await send_and_read_bar(0x8000) == 31, "|-32768| saturates to bar 31 (all 5 LEDs)"
-    bar_decay = await send_and_read_bar(0x0000)
-    assert bar_decay == 30, f"one zero frame should decay to 30, got {bar_decay}"
-    for _ in range(32):
-        bar = await send_and_read_bar(0x0000)
-    assert bar == 0, f"32 zero frames must decay to 0, got {bar}"
-    assert await send_and_read_bar(0x0FFF) == 3, "|4095|>>10 = bar 3"
+    assert pc() == 0, "preset must start at 0 after reset"
+
+    # forward detent (A edges: rose with B low, fell with B high) -> +2
+    await _detent(dut, 1, 0)
+    assert pc() == 1, "rose with B low must be +1"
+    await _detent(dut, 1, 1)                 # B 0->1 (no A edge: no count)
+    assert pc() == 1, "B-only step must not count"
+    await _detent(dut, 0, 1)
+    assert pc() == 2, "fell with B high must be +1"
+    await _detent(dut, 0, 0)                 # back to idle (A=B=0)
+    assert pc() == 2, "full forward detent must count +2"
+
+    # reversed detent (A edges: rose with B high, fell with B low) -> -2
+    await _detent(dut, 0, 1)                 # B lead-in
+    assert pc() == 2, "B-only step must not count"
+    await _detent(dut, 1, 1)
+    assert pc() == 1, "rose with B high must be -1"
+    await _detent(dut, 1, 0)                 # B lead-in
+    assert pc() == 1, "B-only step must not count"
+    await _detent(dut, 0, 0)
+    assert pc() == 0, "fell with B low must be -1 (full reverse detent -2)"
+
+    # reverse from 0 wraps to 7 (rose with B high)
+    await _detent(dut, 0, 1)                 # B lead-in
+    await _detent(dut, 1, 1)
+    assert pc() == 7, "rev from 0 must wrap to 7"
+
+    # forward from 7 wraps to 0 (fell with B high; B already settled)
+    await _detent(dut, 0, 1)
+    assert pc() == 0, "fwd from 7 must wrap to 0"
 
 
-# ui byte layout: ui[0]=I2S data (driven by helper), ui[3:1]=mode,
-# ui[5:4]=bit-depth sel, ui[7:6]=decimation sel
+@cocotb.test()
+async def test_encoder_bounce(dut):
+    """Bounce filter: A high for 47 frames — one short of the
+    48-consecutive-sample threshold — is ignored; a full 50-frame
+    level still counts (sub-detent glitches rejected, real detents
+    counted)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    def pc():
+        # tb.v instantiates the design top as user_project
+        return int(dut.user_project.u_panel.preset_cnt.value)
+
+    assert pc() == 0, "preset must start at 0 after reset"
+
+    # 47-frame glitch on A: below the 48-sample acceptance threshold
+    dut.ui_in[1].value = 1
+    await ClockCycles(dut.clk, 512 * 47)
+    dut.ui_in[1].value = 0                # back to idle
+    await ClockCycles(dut.clk, 512 * 50)
+    await Timer(1, unit="ns")
+    assert pc() == 0, "47-frame glitch must be rejected"
+
+    # control: a full 50-frame level is accepted (rose, B low -> +1)
+    await _detent(dut, 1, 0)
+    assert pc() == 1, "50-frame level must be counted"
+
+
+@cocotb.test()
+async def test_stomp_toggle(dut):
+    """Stomp (ui[3]) is a latching toggle on the debounced press edge:
+    press -> bypass on and the display goes blank; release changes
+    nothing; a second press toggles back (v2.2 errata 2: latching,
+    not momentary)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+    await Timer(1, unit="ns")
+
+    # tb.v instantiates the design top as user_project
+    u_panel = dut.user_project.u_panel
+
+    assert int(u_panel.bypass.value) == 0, "bypass must start clear"
+    assert int(dut.uo_out.value) == 0x3F, "preset 0 digit must be visible"
+
+    # press 1: bypass latched, digit blank (uo[6:0] = 0)
+    dut.ui_in[3].value = 1
+    await ClockCycles(dut.clk, 512 * 50)
+    await Timer(1, unit="ns")
+    assert int(u_panel.bypass.value) == 1, "press must latch bypass"
+    assert (int(dut.uo_out.value) & 0x7F) == 0, "bypass must blank the digit"
+
+    # release: the latch holds (latching, not momentary)
+    dut.ui_in[3].value = 0
+    await ClockCycles(dut.clk, 512 * 50)
+    await Timer(1, unit="ns")
+    assert int(u_panel.bypass.value) == 1, "release must not clear the latch"
+    assert (int(dut.uo_out.value) & 0x7F) == 0, "digit must stay blank"
+
+    # press 2: toggles back — effect on, digit visible again
+    dut.ui_in[3].value = 1
+    await ClockCycles(dut.clk, 512 * 50)
+    await Timer(1, unit="ns")
+    assert int(u_panel.bypass.value) == 0, "second press must toggle back"
+    assert int(dut.uo_out.value) == 0x3F, "digit must return with the effect"
+
+
+@cocotb.test()
+async def test_seg_patterns(dut):
+    """7-seg patterns (seg[0]=a..seg[6]=g, active high) and the preset
+    ROM enable table, walked preset 0..7 with one forward A edge each
+    (rose with B low and fell with B high, alternating — +1 per edge,
+    B settled one hold ahead). uo[7] is the dp placeholder (0 until
+    task 6)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+    await Timer(1, unit="ns")
+
+    # index = preset: segment patterns and ROM enables (provisional)
+    seg_pats = [0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07]
+    rom_pats = [0b0000, 0b0001, 0b0010, 0b0100,
+                0b1000, 0b1100, 0b1101, 0b1111]
+
+    def pc():
+        # tb.v instantiates the design top as user_project
+        return int(dut.user_project.u_panel.preset_cnt.value)
+
+    def pe():
+        return int(dut.user_project.u_panel.preset_en.value)
+
+    assert pc() == 0, "preset must start at 0 after reset"
+    assert int(dut.uo_out.value) == 0x3F, "preset 0 must show digit 0"
+    assert pe() == rom_pats[0], "preset 0 ROM pattern"
+
+    # walk presets 1..7 one +1 edge at a time, alternating the two
+    # forward A edges (rose with B low, fell with B high) with a B-only
+    # settle hold between edges — B must be accepted before the A edge
+    # that reads it
+    for k in range(1, 8):
+        if k % 2:                 # odd k: A rises with B low (from A=0, B=0)
+            await _detent(dut, 1, 0)
+        else:                     # even k: A falls with B high (from A=1, B=1)
+            await _detent(dut, 0, 1)
+        assert pc() == k, f"step {k}: preset must advance to {k}"
+        assert int(dut.uo_out.value) == seg_pats[k], \
+            f"preset {k}: uo {int(dut.uo_out.value):#04x} != {seg_pats[k]:#04x}"
+        assert pe() == rom_pats[k], \
+            f"preset {k}: ROM pattern {pe():#06b}"
+        if k < 7:                 # settle B for the next edge (no count)
+            await _detent(dut, k % 2, k % 2)
+
+
+# ui byte layout (interim): ui[0]=I2S data (driven by helper), ui[3:1]=mode
+# (also the panel lines {stomp, enc_b, enc_a} since task 2 — the mode decode
+# moves off them in task 3), ui[5:4]=bit-depth sel, ui[7:6]=decimation sel
 
 @cocotb.test()
 async def test_bitcrush_quantize(dut):

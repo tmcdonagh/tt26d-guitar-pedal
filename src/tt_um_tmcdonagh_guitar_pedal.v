@@ -1,10 +1,11 @@
 /*
- * Copyright (c) 2026 Tom McDonagh
+ * Copyright (c) 2026 Thomas McDonagh
  * SPDX-License-Identifier: Apache-2.0
  *
  * Silicon Guitar Pedal — multi-effect DSP core.
  * I2S master in/out (codec-agnostic), 5 effects + bypass (ring mod and
- * test tone retired in v2.2), LED level meter.
+ * test tone retired in v2.2), panel control plane (v2.2): EC11 encoder
+ * + stomp on ui[3:1], 7-seg preset digit on uo[6:0].
  * See docs/info.md and the spec in the ai-dev-archive.
  */
 
@@ -118,6 +119,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   // T: ui[5:4] 00->24576, 01->16384, 10->8192, 11->4096.
   // Fuzz->dist chain (mode 6): clip at fixed 16384, then sat x3.
   // ------------------------------------------------------------------
+  wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
+                    : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
+
   wire [15:0] fuzz_t = (ui_in[5:4] == 2'b00) ? 16'd24576
                      : (ui_in[5:4] == 2'b01) ? 16'd16384
                      : (ui_in[5:4] == 2'b10) ? 16'd8192
@@ -184,25 +188,27 @@ module tt_um_tmcdonagh_guitar_pedal (
   end
 
   // ------------------------------------------------------------------
-  // Output pins (v2.2 task 1): BCLK/LRCLK/DAC data moved from uo to uio
-  // to free uo for the 7-seg display (later task). uio[0]=MCLK,
-  // uio[1]=DAC data, uio[6]=BCLK, uio[7]=LRCLK; the LED bar keeps its
-  // v1 pin uo[5:1] until the display lands.
+  // Control plane (v2.2 task 2): EC11 encoder (A=ui[1], B=ui[2]) and
+  // stomp (ui[3]), sampled once per audio frame on sample_valid.
+  // pedal_panel debounces the lines, decodes quadrature x2, counts
+  // presets 0..7 (ROM enable table), and drives the 7-seg preset digit
+  // — blank while the bypass latch is engaged. preset_en/bypass feed
+  // the effect chain in task 3; they are tied off below until then.
+  // (The v1 LED level meter lived here; retired with the pin move.)
   // ------------------------------------------------------------------
-  // ------------------------------------------------------------------
-  // LED level meter: bar = max(|sample| >> 11 (clamped 15), bar - 1),
-  // updated once per sample on the sample_valid pulse
-  // ------------------------------------------------------------------
-  wire [15:0] mag   = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
-                      : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
-  wire [4:0]  level = mag[15:10];  // 0..31, monotonic; uses all 5 LEDs
-  wire [4:0]  decayed = (led_bar == 5'd0) ? 5'd0 : led_bar - 5'd1;
+  wire [3:0] panel_en;
+  wire       panel_bypass;
+  wire [6:0] panel_seg;
 
-  reg [4:0] led_bar;
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)          led_bar <= 5'd0;
-    else if (sample_valid) led_bar <= (level > decayed) ? level : decayed;
-  end
+  pedal_panel u_panel (
+      .clk       (clk),
+      .rst_n     (rst_n),
+      .tick      (sample_valid),
+      .panel_in  (ui_in[3:1]),
+      .preset_en (panel_en),
+      .bypass    (panel_bypass),
+      .seg       (panel_seg)
+  );
 
   // ------------------------------------------------------------------
   // I2S transmit: uio_out[1], MSB first. Loaded at slot 0 and slot 32
@@ -223,13 +229,13 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire dac_data = (slot == 6'd0 || slot == 6'd32) ? 1'b0
                 : (data_window ? tx_shift[15] : 1'b0);
 
-  assign uo_out  = {2'b0, led_bar, 1'b0}; // uo[5:1] = LED bar (interim)
+  assign uo_out  = {1'b0, panel_seg}; // uo[6:0] = 7-seg a..g; uo[7] = dp clip LED (task 6)
 
   assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
   assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params, later task)
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in, 1'b0};
+  wire _unused = &{ena, uio_in, panel_en, panel_bypass, 1'b0};
 
 endmodule
 

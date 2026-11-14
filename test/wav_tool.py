@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# SPDX-FileCopyrightText: © 2026 Tom McDonagh
+# SPDX-FileCopyrightText: © 2026 Thomas McDonagh
 # SPDX-License-Identifier: Apache-2.0
 """Audio listening pass: WAV -> hex -> simulator -> hex -> WAV, all modes.
 
