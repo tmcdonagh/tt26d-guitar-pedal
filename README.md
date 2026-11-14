@@ -22,7 +22,7 @@ models provided through API access like Kimi K2.7 Code and GLM-5.3-Flash.
 | 6 | Fuzz → distortion chain |
 | 7 | Test tone (internal square wave, no input needed) |
 
-Parameters ride `ui[7:4]` (per-effect meaning in the repo README/spec). A
-5-LED peak level meter with per-sample decay drives `uo[5:1]`.
+Parameters ride `ui[7:4]` (per-effect meaning in [docs/info.md](docs/info.md)).
+A 5-LED peak level meter with per-sample decay drives `uo[5:1]`.
 
 See [docs/info.md](docs/info.md) for pinout and testing details.

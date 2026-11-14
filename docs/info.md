@@ -29,9 +29,11 @@ Parameters ride `ui[7:4]`:
 
 | Param bits | Dist (010) | Ring mod (011) | Tremolo (100) | Bitcrusher (101) | Fuzz (001) | Tone (111) |
 |---|---|---|---|---|---|---|
-| `ui[5:4]` | drive G = value+1 (×1..×4) | — | depth (min gain) | bit depth N | clip threshold | — |
-| `ui[7:6]` | — | LFO rate k: half-period 2^(10−k) samples | rate k | decimation ÷2^k | — | tone rate k |
-| `ui[4]` | — | — | min gain: 0 / 128 | — | — | — |
+| `ui[7:5]` | — | — | rate k: LFO half-period 2^(10−k) frames (8 rates) | — | — | — |
+| `ui[7:6]` | — | — | — | decimation ÷2^k (÷1/÷2/÷4/÷8) | — | — |
+| `ui[6:4]` | — | rate k: half-period 2^(10−k) samples | — | — | — | rate k: half-period 55·2^k frames |
+| `ui[5:4]` | drive G = value+1 (×1..×4) | — | — | bit depth N (00→11 = 16/10/8/6 bits) | clip threshold (00→11 = 24576/16384/8192/4096) | — |
+| `ui[4]` | — | — | depth: 0 → 4 steps (0/−6/−12/−18 dB), 1 → 2 steps (0/−6 dB) | — | — | — |
 
 All arithmetic saturates; every effect is a pure function of the
 latched sample. A 5-LED peak meter with per-sample decay drives `uo[5:1]`.
