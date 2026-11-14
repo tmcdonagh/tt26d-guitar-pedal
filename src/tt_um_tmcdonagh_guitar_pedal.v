@@ -3,7 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Silicon Guitar Pedal — multi-effect DSP core.
- * I2S master in/out (codec-agnostic), 8 runtime modes, LED level meter.
+ * I2S master in/out (codec-agnostic), 5 effects + bypass (ring mod and
+ * test tone retired in v2.2), LED level meter.
  * See docs/info.md and the spec in the ai-dev-archive.
  */
 
@@ -94,33 +95,6 @@ module tt_um_tmcdonagh_guitar_pedal (
   end
 
   // ------------------------------------------------------------------
-  // Ring modulator (mode 3): multiply by a square-LFO sign (+/-1).
-  // LFO half-period = 2^(10-k) samples, k = ui[6:4].
-  // ------------------------------------------------------------------
-  wire [2:0] ring_k   = ui_in[6:4];
-  wire [3:0] ring_exp = 4'd10 - {1'b0, ring_k};
-  wire [10:0] ring_half = 11'd1 << ring_exp;
-
-  reg [10:0] ring_cnt;
-  reg        ring_sign;
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      ring_cnt  <= 11'd0;
-      ring_sign <= 1'b0;
-    end else if (sample_strobe) begin
-      if (ring_cnt == ring_half - 11'd1) begin
-        ring_cnt  <= 11'd0;
-        ring_sign <= ~ring_sign;
-      end else begin
-        ring_cnt <= ring_cnt + 11'd1;
-      end
-    end
-  end
-
-  wire [15:0] ring_neg = (sample_in == 16'h8000) ? 16'h7FFF  // sat16 negate
-                       : ~sample_in + 16'd1;
-
-  // ------------------------------------------------------------------
   // Distortion (mode 2): out = sat16(in * G), G = 1 + ui[5:4] (1..4),
   // shift-add (G is one of 1,2,3,4 — no variable multiplier needed)
   // ------------------------------------------------------------------
@@ -192,31 +166,8 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] trem_out = $signed(sample_in) >>> (trem_gap >> 6);
 
   // ------------------------------------------------------------------
-  // Test tone (mode 7): internal square wave, half-period = 55 << k
-  // frames (k = ui[6:4]); levels +/-16383; ADC input ignored.
-  // ------------------------------------------------------------------
-  wire [2:0] tone_k = ui_in[6:4];
-  wire [12:0] tone_half = 13'd55 << tone_k; // 55..7040 frames
-
-  reg [12:0] tone_cnt;
-  reg        tone_sign;
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      tone_cnt  <= 13'd0;
-      tone_sign <= 1'b0;
-    end else if (sample_strobe) begin
-      if (tone_cnt == tone_half - 13'd1) begin
-        tone_cnt  <= 13'd0;
-        tone_sign <= ~tone_sign;
-      end else begin
-        tone_cnt <= tone_cnt + 13'd1;
-      end
-    end
-  end
-  wire [15:0] tone_out = tone_sign ? 16'd16383 : (-16'd16383);
-
-  // ------------------------------------------------------------------
-  // Effect mux (mode on ui[3:1]); effects filled in by later tasks.
+  // Effect mux (mode on ui[3:1]); ring mod (3) and test tone (7) were
+  // retired in v2.2 and fall to the bypass default.
   // ------------------------------------------------------------------
   wire [2:0] mode = ui_in[3:1];
 
@@ -225,17 +176,18 @@ module tt_um_tmcdonagh_guitar_pedal (
     case (mode)
       3'd1:    effect_sample = fuzz_out;
       3'd2:    effect_sample = dist_sat;
-      3'd3:    effect_sample = ring_sign ? ring_neg : sample_in;
       3'd4:    effect_sample = trem_out;
       3'd6:    effect_sample = chain_sat;
-      3'd7:    effect_sample = tone_out;
       3'd5:    effect_sample = crush_hold;
-      default: effect_sample = sample_in; // mode 0 bypass (+ stubs)
+      default: effect_sample = sample_in; // mode 0 bypass (+ retired 3/7)
     endcase
   end
 
   // ------------------------------------------------------------------
-  // Output pins (uo[7]=LRCLK, uo[6]=BCLK, uo[5:1]=LED bar, uo[0]=DAC data)
+  // Output pins (v2.2 task 1): BCLK/LRCLK/DAC data moved from uo to uio
+  // to free uo for the 7-seg display (later task). uio[0]=MCLK,
+  // uio[1]=DAC data, uio[6]=BCLK, uio[7]=LRCLK; the LED bar keeps its
+  // v1 pin uo[5:1] until the display lands.
   // ------------------------------------------------------------------
   // ------------------------------------------------------------------
   // LED level meter: bar = max(|sample| >> 11 (clamped 15), bar - 1),
@@ -253,7 +205,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   end
 
   // ------------------------------------------------------------------
-  // I2S transmit: uo_out[0], MSB first. Loaded at slot 0 and slot 32
+  // I2S transmit: uio_out[1], MSB first. Loaded at slot 0 and slot 32
   // (start of each half), shifted out one bit per slot at the slot's
   // last clk; dac_data therefore only changes on BCLK falling edges.
   // ------------------------------------------------------------------
@@ -271,10 +223,10 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire dac_data = (slot == 6'd0 || slot == 6'd32) ? 1'b0
                 : (data_window ? tx_shift[15] : 1'b0);
 
-  assign uo_out = {lrclk, bclk, led_bar, dac_data};
+  assign uo_out  = {2'b0, led_bar, 1'b0}; // uo[5:1] = LED bar (interim)
 
-  assign uio_out = {7'b0, clk}; // uio[0] = MCLK = clk (512 fs)
-  assign uio_oe  = 8'b0000_0001;
+  assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
+  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params, later task)
 
   // List all unused inputs to prevent warnings
   wire _unused = &{ena, uio_in, 1'b0};

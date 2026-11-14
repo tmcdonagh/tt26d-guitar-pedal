@@ -5,6 +5,11 @@
 // 16-bit samples through the real I2S input pins and writes one output
 // sample per frame. Runs entirely inside Icarus — ~30 s per mode.
 //
+// v2.2 pin map (task 1): BCLK/LRCLK/DAC data moved to uio[6]/uio[7]/uio[1]
+// (MCLK stays uio[0]); ADC data stays on ui[0]. This tb drives ui[0] and
+// taps dut.effect_sample directly, so its wiring is unchanged. Modes 3
+// (ring mod) and 7 (test tone) are retired in v2.2 and now bypass.
+//
 // Compile:
 //   iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/tt_um_tmcdonagh_guitar_pedal.v
 // Run (per mode, in parallel):

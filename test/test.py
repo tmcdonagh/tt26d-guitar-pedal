@@ -24,12 +24,12 @@ async def test_skeleton_baseline(dut):
     dut.rst_n.value = 1
 
     # Reset state: DAC data low, LED bar dark
-    assert dut.uo_out[0].value == 0, "DAC data not low after reset"
+    assert dut.uio_out[1].value == 0, "DAC data not low after reset"
     assert ((int(dut.uo_out.value) >> 1) & 0x1F) == 0, "LED bar not dark after reset"
 
     # MCLK output enabled on uio[0] and following clk.
     # Sample away from clock edges (comb outputs need settle time).
-    assert dut.uio_oe.value == 0b0000_0001, "uio_oe must enable only uio[0]"
+    assert dut.uio_oe.value == 0b1100_0011, "uio_oe must enable only uio[7:6] and uio[1:0]"
     vals = []
     toggles = 0
     prev = None
@@ -42,42 +42,42 @@ async def test_skeleton_baseline(dut):
         vals.append(v)
     assert toggles >= 2, f"MCLK must follow clk (sampled {vals})"
 
-    # Frame clock is running: LRCLK (uo[7]) must toggle within one frame (512 clk)
-    start = dut.uo_out[7].value
+    # Frame clock is running: LRCLK (uio[7]) must toggle within one frame (512 clk)
+    start = dut.uio_out[7].value
     toggled = False
     for _ in range(600):
         await ClockCycles(dut.clk, 1)
-        if dut.uo_out[7].value != start:
+        if dut.uio_out[7].value != start:
             toggled = True
             break
     assert toggled, "LRCLK never toggled — frame counter not running"
 
-    # Mode select bits reach the mux (bypass stub returns sample_in=0)
+    # Mode select bits reach the mux (retired mode 7 falls to bypass; sample_in=0)
     dut.ui_in.value = 0b0000_1110  # mode 7, params 0
     await ClockCycles(dut.clk, 1)
-    assert dut.uo_out[0].value == 0, "unexpected DAC output in skeleton"
+    assert dut.uio_out[1].value == 0, "unexpected DAC output in skeleton"
 
 
 # ---------------------------------------------------------------------
 # I2S helpers (used by all frame-level tests).
 #
-# Framing: 512 clk per frame; BCLK (uo[6]) rises mid-slot (clk cycles
+# Framing: 512 clk per frame; BCLK (uio[6]) rises mid-slot (clk cycles
 # 8k+4) and falls at slot boundaries (8k). Slots 0..31 = left half (WS
 # low), 32..63 = right half. Data bits ride slots 1..16, MSB first,
 # after the one-slot I2S delay. ADC data in on ui[0], DAC data out on
-# uo[0]. All sampling uses a settle Timer to avoid edge races.
+# uio[1]. All sampling uses a settle Timer to avoid edge races.
 # ---------------------------------------------------------------------
 
 CLK_PERIOD_PS = 40534
 
 
 async def _bclk_edge(dut, want_rising, settle_ns=1):
-    """Wait for the next BCLK edge (uo[6] transition), return after settle."""
-    prev = int(dut.uo_out[6].value)
+    """Wait for the next BCLK edge (uio[6] transition), return after settle."""
+    prev = int(dut.uio_out[6].value)
     while True:
         await ClockCycles(dut.clk, 1)
         await Timer(settle_ns, unit="ns")
-        cur = int(dut.uo_out[6].value)
+        cur = int(dut.uio_out[6].value)
         if cur != prev:
             if (cur == 1) == want_rising:
                 return
@@ -89,11 +89,11 @@ async def _bclk_edge(dut, want_rising, settle_ns=1):
 async def _wait_left_start(dut):
     """Wait for the next WS falling edge (LRCLK 1->0) = start of a left
     (data) half-frame."""
-    prev = int(dut.uo_out[7].value)
+    prev = int(dut.uio_out[7].value)
     while True:
         await ClockCycles(dut.clk, 1)
         await Timer(1, unit="ns")
-        cur = int(dut.uo_out[7].value)
+        cur = int(dut.uio_out[7].value)
         if prev == 1 and cur == 0:
             return
         prev = cur
@@ -101,7 +101,7 @@ async def _wait_left_start(dut):
 
 async def i2s_send_and_capture(dut, word24):
     """Drive one left-channel frame on ui[0] (24-bit word, slots 1..24)
-    and capture the 32-slot left half of the same frame from uo[0].
+    and capture the 32-slot left half of the same frame from uio[1].
 
     Returns the 32 captured bits (index = slot). Called right after a WS
     edge (start of left half)."""
@@ -114,7 +114,7 @@ async def i2s_send_and_capture(dut, word24):
             bit = 0
         dut.ui_in[0].value = bit
         await _bclk_edge(dut, True)  # mid-slot: master samples here
-        bits.append(int(dut.uo_out[0].value))
+        bits.append(int(dut.uio_out[1].value))
         await _bclk_edge(dut, False)  # slot boundary
     return bits
 
@@ -144,12 +144,12 @@ async def test_bclk_lrclk_ratios(dut):
     # One iteration = 1/4 clk period; 1620 iterations ~ 405 clk.
     bclk_rises = 0
     lr_toggles = 0
-    prev_b = int(dut.uo_out[6].value)
-    prev_l = int(dut.uo_out[7].value)
+    prev_b = int(dut.uio_out[6].value)
+    prev_l = int(dut.uio_out[7].value)
     for _ in range(1620):
         await Timer(10134, unit="ps")
-        b = int(dut.uo_out[6].value)
-        l = int(dut.uo_out[7].value)
+        b = int(dut.uio_out[6].value)
+        l = int(dut.uio_out[7].value)
         if b == 1 and prev_b == 0:
             bclk_rises += 1
         if l != prev_l:
@@ -162,7 +162,7 @@ async def test_bclk_lrclk_ratios(dut):
 @cocotb.test()
 async def test_i2s_tx_frame(dut):
     """Sample 0x55AA driven on ui[0] in frame N must appear MSB-first on
-    uo[0] slots 1..16 in frame N+1; slot 0 low (I2S delay), slots 17..31 low."""
+    uio[1] slots 1..16 in frame N+1; slot 0 low (I2S delay), slots 17..31 low."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -210,13 +210,13 @@ async def test_stereo_halves_match(dut):
         for slot in range(32):
             dut.ui_in[0].value = (1 <= slot <= 16) and ((word16 >> (16 - slot)) & 1) or 0
             await _bclk_edge(dut, True)
-            lhalf.append(int(dut.uo_out[0].value))
+            lhalf.append(int(dut.uio_out[1].value))
             await _bclk_edge(dut, False)
         # right half: no drive needed, just capture slots 33..48
         rhalf = []
         for slot in range(32):
             await _bclk_edge(dut, True)
-            rhalf.append(int(dut.uo_out[0].value))
+            rhalf.append(int(dut.uio_out[1].value))
             await _bclk_edge(dut, False)
         return lhalf, rhalf
 
@@ -374,35 +374,6 @@ async def test_bitcrush_decimate(dut):
 
 
 @cocotb.test()
-async def test_ring_mod_square(dut):
-    """Mode 3: output = input * (+/-1) alternating with an LFO whose
-    half-period is 2^(10-k) samples (k = ui[6:4]). DC +1000 in, k=2
-    (half-period 256 frames): sign flips every 256 frames, amplitude
-    exactly +/-1000."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0b0010_011_0  # mode 3, k=2 (half-period 256)
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    outs = []
-    for _ in range(600):
-        await _wait_left_start(dut)
-        outs.append(tx_data_bits(await i2s_send_and_capture(dut, 1000 << 8)))
-
-    signed = [o - 0x10000 if o & 0x8000 else o for o in outs]
-    # outs[0] is the partial reset frame (may be 0) — same as Task 3 ruling
-    assert set(signed[1:]) <= {1000, -1000}, \
-        f"ring mod output must be +/-1000, saw {[hex(o) for o in outs[:8]]}..."
-    assert signed[31] == signed[201], "sign must be stable within one phase"
-    assert signed[31] == -signed[287], "sign must flip after one half-period (256)"
-    assert signed[31] == signed[543], "sign must return after a full period (512)"
-
-
-@cocotb.test()
 async def test_distortion_gain(dut):
     """Mode 2: out = sat16(in * G), G = 1 + ui[5:4] (1..4)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
@@ -535,66 +506,6 @@ async def test_tremolo(dut):
 
 
 @cocotb.test()
-async def test_tone(dut):
-    """Mode 7: internal square tone, half-period = 55 << k frames
-    (k = ui[6:4]), levels +/-16383, ADC input ignored. Phase after
-    mid-frame reset is deterministic within +/-1 frame, so assert one
-    exact sign change per window and exact amplitude."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0b000_111_0  # mode 7 (ui[3:1]=111), k=0
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    async def capture(n):
-        vals = []
-        for _ in range(n):
-            await _wait_left_start(dut)
-            v = tx_data_bits(await i2s_send_and_capture(dut, 0x5151 << 8))
-            vals.append(v - 0x10000 if v & 0x8000 else v)
-        return vals
-
-    # k=0: half-period 55 frames -> exactly one flip in an 80-frame window
-    vals = await capture(80)
-    assert set(vals) == {16383, -16383}, f"tone levels wrong: {set(vals)}"
-    flips = sum(1 for a, b in zip(vals, vals[1:]) if (a > 0) != (b > 0))
-    assert flips == 1, f"k=0 half-period 55: expected 1 flip in 80 frames, got {flips}"
-
-    # k=2: half-period 220 -> exactly one flip in a 250-frame window
-    dut.ui_in.value = 0b0_010_111_0  # mode 7 (ui[3:1]=111), k=2 (ui[6:4]=010)
-    vals = await capture(250)
-    assert set(vals) == {16383, -16383}, f"tone levels wrong (k=2): {set(vals)}"
-    flips = sum(1 for a, b in zip(vals, vals[1:]) if (a > 0) != (b > 0))
-    assert flips == 1, f"k=2 half-period 220: expected 1 flip in 250 frames, got {flips}"
-
-
-@cocotb.test()
-async def test_tone_slow_rates(dut):
-    """Tone k=6 must give half-period 55<<6 = 3520 frames (13-bit counter;
-    the 9-bit build wrapped at 511). Assert one flip in a 7200-frame window."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0b0_110_111_0  # mode 7, k=6 (ui[6:4]=110)
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    vals = []
-    for _ in range(6000):
-        await _wait_left_start(dut)
-        v = tx_data_bits(await i2s_send_and_capture(dut, 0))
-        vals.append(v - 0x10000 if v & 0x8000 else v)
-    assert set(vals) == {16383, -16383}, f"tone levels wrong: {set(vals)}"
-    flips = sum(1 for a, b in zip(vals, vals[1:]) if (a > 0) != (b > 0))
-    assert flips == 1, f"k=6 half-period 3520: expected 1 flip in 6000 frames, got {flips}"
-
-
-@cocotb.test()
 async def test_bitcrush_n6(dut):
     """Bitcrush N=6 (ui[5:4]=11, mask 0xFC00): deep quantize."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
@@ -614,26 +525,3 @@ async def test_bitcrush_n6(dut):
 
     assert await crush_once(0x0FFF) == 0x0C00, "N=6 mask 0xFC00"
     assert await crush_once(0xFF9C) == 0xFC00, "negative keeps sign through mask"
-
-
-@cocotb.test()
-async def test_ring_mod_fullscale_neg(dut):
-    """M-2 fix: -32768 must not pass through un-inverted on the negative
-    LFO phase — saturating negate gives +32767, so a full-scale negative
-    DC input yields exactly {-32768 (in-phase), +32767 (inverted)}."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0b0_000_011_0  # mode 3, k=0 (half-period 1024)
-    dut.uio_in.value = 0
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    vals = []
-    for _ in range(3000):
-        await _wait_left_start(dut)
-        v = tx_data_bits(await i2s_send_and_capture(dut, 0x8000 << 8))
-        vals.append(v - 0x10000 if v & 0x8000 else v)
-    assert set(vals[1:]) == {-32768, 32767}, \
-        f"ring mod at -32768 must be {{-32768, +32767}}, got {set(vals)}"
