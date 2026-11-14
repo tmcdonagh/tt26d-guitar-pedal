@@ -3,14 +3,20 @@
 # SPDX-License-Identifier: Apache-2.0
 """Audio listening pass: WAV -> hex -> simulator -> hex -> WAV, all modes.
 
-Simulator: verilator --binary (fast, default) or icarus (make SIM=icarus).
+Simulator: verilator --binary (fast, default), icarus (make SIM=icarus), or
+the gate-level netlist (SIM=gl — needs PDK_ROOT and test/gate_level_netlist.v;
+see gl_wav_tool.md; outputs go to audio_out_gl/ and must be bit-exact vs the
+RTL audio_out/ baseline, checked by `python3 wav_tool.py gl-parity`).
 Usage (from test/):
     python3 wav_tool.py run          # convert in, run all modes, convert out
     python3 wav_tool.py wav2hex
     python3 wav_tool.py hex2wav
+    python3 wav_tool.py gl-cmd       # print the GL iverilog command (dry run)
+    python3 wav_tool.py gl-parity    # bit-exact GL-vs-RTL WAV check
 """
 import array
 import os
+import shlex
 import subprocess
 import sys
 import wave
@@ -20,6 +26,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 IN_WAV = os.path.join(HERE, "audio_in.wav")
 IN_HEX = os.path.join(HERE, "audio_in.hex")
 OUT_DIR = os.path.join(HERE, "audio_out")
+OUT_DIR_GL = os.path.join(HERE, "audio_out_gl")  # netlist outputs; audio_out/ = RTL parity baseline
+GL_VVP = os.path.join(HERE, "sim_audio_gl.vvp")
 
 # name, en (ui[7:4], bit order = chain order en[0]=fuzz..en[3]=trem),
 # params (P3..P0 on uio[5:2])
@@ -51,16 +59,16 @@ def wav2hex():
     return len(a)
 
 
-def hex2wav(name):
+def hex2wav(name, out_dir=OUT_DIR):
     # sample lines are $display'ed to stdout, captured in the .log file
     vals = []
-    with open(os.path.join(OUT_DIR, f"{name}.log")) as f:
+    with open(os.path.join(out_dir, f"{name}.log")) as f:
         for line in f:
             s = line.strip()
             if len(s) == 4 and all(c in "0123456789abcdefABCDEF" for c in s):
                 vals.append(int(s, 16))
     samples = array.array("h", (v - 0x10000 if v & 0x8000 else v for v in vals))
-    path = os.path.join(OUT_DIR, f"{name}.wav")
+    path = os.path.join(out_dir, f"{name}.wav")
     w = wave.open(path, "wb")
     w.setnchannels(1)
     w.setsampwidth(2)
@@ -70,15 +78,58 @@ def hex2wav(name):
     return path, len(samples)
 
 
+def gl_cmd():
+    """iverilog command for the gate-level audio build — mirrors test/Makefile
+    GATES=yes exactly: same define set, same sky130 cell sources, same order
+    (primitives.v, sky130_fd_sc_hd.v, gate_level_netlist.v)."""
+    lib = os.path.join(os.environ.get("PDK_ROOT", ""),
+                       "sky130A", "libs.ref", "sky130_fd_sc_hd", "verilog")
+    return ["iverilog", "-g2012", "-s", "tb_audio_gl",
+            "-DGL_TEST", "-DFUNCTIONAL", "-DUSE_POWER_PINS", "-DSIM",
+            "-DUNIT_DELAY=#1", "-o", GL_VVP,
+            os.path.join(HERE, "tb_audio_gl.v"),
+            os.path.join(lib, "primitives.v"),
+            os.path.join(lib, "sky130_fd_sc_hd.v"),
+            os.path.join(HERE, "gate_level_netlist.v")]
+
+
+def gl_build():
+    netlist = os.path.join(HERE, "gate_level_netlist.v")
+    if not os.path.exists(netlist):
+        raise SystemExit(f"missing {netlist} — copy it from the GDS run artifacts (gl_wav_tool.md)")
+    if not os.environ.get("PDK_ROOT"):
+        raise SystemExit("PDK_ROOT must point at the sky130A PDK (see gl_wav_tool.md)")
+    subprocess.check_call(gl_cmd(), cwd=HERE)
+
+
+def gl_parity():
+    """Parity gate: every GL mode's .wav must be bit-exact vs the RTL .wav."""
+    bad = []
+    for name, _, _ in MODES:
+        with wave.open(os.path.join(OUT_DIR, f"{name}.wav")) as a, \
+             wave.open(os.path.join(OUT_DIR_GL, f"{name}.wav")) as b:
+            ok = ((a.getnchannels(), a.getsampwidth(), a.getframerate(), a.getnframes())
+                  == (b.getnchannels(), b.getsampwidth(), b.getframerate(), b.getnframes())
+                  and a.readframes(a.getnframes()) == b.readframes(b.getnframes()))
+        print(f"{name}: {'PASS' if ok else 'FAIL'}")
+        if not ok:
+            bad.append(name)
+    if bad:
+        raise SystemExit(f"parity FAIL: {bad} — systematic debugging before any 'close enough' conclusion")
+
+
 def run_mode(name, en, params, n, sim):
-    out = os.path.join(OUT_DIR, f"{name}.hex")
-    if sim == "verilator":
+    out = os.path.join(OUT_DIR_GL if sim == "gl" else OUT_DIR, f"{name}.hex")
+    if sim == "gl":
+        cmd = ["vvp", GL_VVP, f"+EN={en}", f"+PARAMS={params}",
+               f"+N={n}", f"+OUT={out}"]
+    elif sim == "verilator":
         exe = os.path.join(HERE, "obj_dir", "sim_audio_vl")
         cmd = [exe, f"+EN={en}", f"+PARAMS={params}", f"+N={n}", f"+OUT={out}"]
     else:
         cmd = ["vvp", "sim_audio.vvp", f"+EN={en}", f"+PARAMS={params}",
                f"+N={n}", f"+OUT={out}"]
-    log = open(os.path.join(OUT_DIR, f"{name}.log"), "w")
+    log = open(os.path.join(OUT_DIR_GL if sim == "gl" else OUT_DIR, f"{name}.log"), "w")
     return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
 
 
@@ -92,13 +143,23 @@ def main():
         for name, _, _ in MODES:
             p, n = hex2wav(name)
             print(f"{p}: {n} samples")
+    elif what == "gl-cmd":
+        print(shlex.join(gl_cmd()))
+    elif what == "gl-build":
+        gl_build()
+    elif what == "gl-parity":
+        gl_parity()
     elif what == "run":
+        out_dir = OUT_DIR_GL if sim == "gl" else OUT_DIR
+        os.makedirs(out_dir, exist_ok=True)
+        if sim == "gl":
+            gl_build()
         n = wav2hex()
         procs = [run_mode(name, en, params, n, sim) for name, en, params in MODES]
         for p in procs:
             p.wait()
         for name, _, _ in MODES:
-            path, cnt = hex2wav(name)
+            path, cnt = hex2wav(name, out_dir)
             print(f"{path}: {cnt} samples")
     else:
         raise SystemExit(__doc__)

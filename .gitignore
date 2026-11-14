@@ -15,5 +15,7 @@ GuitarSample1.m4a
 test/audio_in.wav
 test/audio_in.hex
 test/audio_out/
+test/audio_out_gl/
 test/obj_dir/
 test/sim_audio.vvp
+test/sim_audio_gl.vvp
