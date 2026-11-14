@@ -190,6 +190,51 @@ async def test_i2s_tx_frame(dut):
 
 
 @cocotb.test()
+async def test_stereo_halves_match(dut):
+    """I2S-3 fix: left and right halves of frame N must carry the SAME
+    (previous) sample — the mono contract in docs/info.md."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0  # bypass
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def send_capture_both_halves(word16):
+        """Drive one frame's left half with word16; capture BOTH halves.
+        Must be called with the sim at a left-half start (the previous
+        call's right-half loop ends exactly there)."""
+        lhalf = []
+        for slot in range(32):
+            dut.ui_in[0].value = (1 <= slot <= 16) and ((word16 >> (16 - slot)) & 1) or 0
+            await _bclk_edge(dut, True)
+            lhalf.append(int(dut.uo_out[0].value))
+            await _bclk_edge(dut, False)
+        # right half: no drive needed, just capture slots 33..48
+        rhalf = []
+        for slot in range(32):
+            await _bclk_edge(dut, True)
+            rhalf.append(int(dut.uo_out[0].value))
+            await _bclk_edge(dut, False)
+        return lhalf, rhalf
+
+    await _wait_left_start(dut)
+    await send_capture_both_halves(0x0000)   # flush the reset frame
+    await send_capture_both_halves(0x1234)   # drive frame: inject 0x1234
+    lhalf, rhalf = await send_capture_both_halves(0x0000)  # echo frame
+    def data_bits(bits):
+        v = 0
+        for k in range(16):
+            v = (v << 1) | bits[1 + k]
+        return v
+    assert data_bits(lhalf) == 0x1234, "left half must carry prior frame's input"
+    assert data_bits(rhalf) == 0x1234, \
+        f"right half must match left (mono), got {data_bits(rhalf):#06x}"
+
+
+@cocotb.test()
 async def test_bypass_loopback(dut):
     """Mode 0 echoes samples through the full pipeline, one frame later:
     +100, -100, and -32768 (saturation edge) must all round-trip."""
@@ -239,9 +284,8 @@ async def test_reset_state(dut):
 
 @cocotb.test()
 async def test_led_meter(dut):
-    """LED bar = max(|sample|>>11 clamped to 15, bar-1), updated once per
-    frame. Sequence: full-scale -> 15; decay by 1 per sample; 16 zeros
-    reach 0; small sample re-lights to its level (max rule)."""
+    """LED bar = max(|sample|>>10 (0..31, all 5 LEDs), bar-1), updated once
+    per frame. Full-scale -> 31; decay by 1 per sample; 32 zeros reach 0."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -258,13 +302,13 @@ async def test_led_meter(dut):
         await Timer(1, unit="ns")
         return (int(dut.uo_out.value) >> 1) & 0x1F
 
-    assert await send_and_read_bar(0x8000) == 15, "|-32768| saturates to bar 15"
+    assert await send_and_read_bar(0x8000) == 31, "|-32768| saturates to bar 31 (all 5 LEDs)"
     bar_decay = await send_and_read_bar(0x0000)
-    assert bar_decay == 14, f"one zero frame should decay to 14, got {bar_decay}"
-    for _ in range(16):
+    assert bar_decay == 30, f"one zero frame should decay to 30, got {bar_decay}"
+    for _ in range(32):
         bar = await send_and_read_bar(0x0000)
-    assert bar == 0, f"16 zero frames must decay to 0, got {bar}"
-    assert await send_and_read_bar(0x0FFF) == 1, "|4095|>>11 = bar 1"
+    assert bar == 0, f"32 zero frames must decay to 0, got {bar}"
+    assert await send_and_read_bar(0x0FFF) == 3, "|4095|>>10 = bar 3"
 
 
 # ui byte layout: ui[0]=I2S data (driven by helper), ui[3:1]=mode,
@@ -360,7 +404,7 @@ async def test_ring_mod_square(dut):
 
 @cocotb.test()
 async def test_distortion_gain(dut):
-    """Mode 2: out = sat16(in * G), G = 1 + ui[5:4] (1..5)."""
+    """Mode 2: out = sat16(in * G), G = 1 + ui[5:4] (1..4)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -381,7 +425,7 @@ async def test_distortion_gain(dut):
 
     # G=3 (ui[5:4]=10): 1000*3 = 3000
     assert await dist_once(0b00_10_010_0, 1000) == 3000
-    # G=5 (ui[5:4]=11): 20000*5 saturates
+    # G=4 (ui[5:4]=11): 20000*4 saturates (G max is 4)
     assert await dist_once(0b00_11_010_0, 20000) == 32767
     assert await dist_once(0b00_11_010_0, -20000) == -32768  # spec sat16: clamp to -32768
     # G=1 (ui[5:4]=00): clean pass-through
@@ -525,3 +569,71 @@ async def test_tone(dut):
     assert set(vals) == {16383, -16383}, f"tone levels wrong (k=2): {set(vals)}"
     flips = sum(1 for a, b in zip(vals, vals[1:]) if (a > 0) != (b > 0))
     assert flips == 1, f"k=2 half-period 220: expected 1 flip in 250 frames, got {flips}"
+
+
+@cocotb.test()
+async def test_tone_slow_rates(dut):
+    """Tone k=6 must give half-period 55<<6 = 3520 frames (13-bit counter;
+    the 9-bit build wrapped at 511). Assert one flip in a 7200-frame window."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b0_110_111_0  # mode 7, k=6 (ui[6:4]=110)
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    vals = []
+    for _ in range(6000):
+        await _wait_left_start(dut)
+        v = tx_data_bits(await i2s_send_and_capture(dut, 0))
+        vals.append(v - 0x10000 if v & 0x8000 else v)
+    assert set(vals) == {16383, -16383}, f"tone levels wrong: {set(vals)}"
+    flips = sum(1 for a, b in zip(vals, vals[1:]) if (a > 0) != (b > 0))
+    assert flips == 1, f"k=6 half-period 3520: expected 1 flip in 6000 frames, got {flips}"
+
+
+@cocotb.test()
+async def test_bitcrush_n6(dut):
+    """Bitcrush N=6 (ui[5:4]=11, mask 0xFC00): deep quantize."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b0_11_101_0  # mode 5, N=6, decim=0
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def crush_once(word16):
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, word16 << 8)
+        await _wait_left_start(dut)
+        return tx_data_bits(await i2s_send_and_capture(dut, 0))
+
+    assert await crush_once(0x0FFF) == 0x0C00, "N=6 mask 0xFC00"
+    assert await crush_once(0xFF9C) == 0xFC00, "negative keeps sign through mask"
+
+
+@cocotb.test()
+async def test_ring_mod_fullscale_neg(dut):
+    """M-2 fix: -32768 must not pass through un-inverted on the negative
+    LFO phase — saturating negate gives +32767, so a full-scale negative
+    DC input yields exactly {-32768 (in-phase), +32767 (inverted)}."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b0_000_011_0  # mode 3, k=0 (half-period 1024)
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    vals = []
+    for _ in range(3000):
+        await _wait_left_start(dut)
+        v = tx_data_bits(await i2s_send_and_capture(dut, 0x8000 << 8))
+        vals.append(v - 0x10000 if v & 0x8000 else v)
+    assert set(vals[1:]) == {-32768, 32767}, \
+        f"ring mod at -32768 must be {{-32768, +32767}}, got {set(vals)}"

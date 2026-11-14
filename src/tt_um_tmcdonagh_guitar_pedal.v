@@ -117,7 +117,8 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  wire [15:0] ring_neg = ~sample_in + 16'd1; // two's complement negate
+  wire [15:0] ring_neg = (sample_in == 16'h8000) ? 16'h7FFF  // sat16 negate
+                       : ~sample_in + 16'd1;
 
   // ------------------------------------------------------------------
   // Distortion (mode 2): out = sat16(in * G), G = 1 + ui[5:4] (1..4),
@@ -195,20 +196,20 @@ module tt_um_tmcdonagh_guitar_pedal (
   // frames (k = ui[6:4]); levels +/-16383; ADC input ignored.
   // ------------------------------------------------------------------
   wire [2:0] tone_k = ui_in[6:4];
-  wire [8:0] tone_half = 9'd55 << tone_k; // 55..7040 frames
+  wire [12:0] tone_half = 13'd55 << tone_k; // 55..7040 frames
 
-  reg [8:0] tone_cnt;
-  reg       tone_sign;
+  reg [12:0] tone_cnt;
+  reg        tone_sign;
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      tone_cnt  <= 9'd0;
+      tone_cnt  <= 13'd0;
       tone_sign <= 1'b0;
     end else if (sample_strobe) begin
-      if (tone_cnt == tone_half - 9'd1) begin
-        tone_cnt  <= 9'd0;
+      if (tone_cnt == tone_half - 13'd1) begin
+        tone_cnt  <= 13'd0;
         tone_sign <= ~tone_sign;
       end else begin
-        tone_cnt <= tone_cnt + 9'd1;
+        tone_cnt <= tone_cnt + 13'd1;
       end
     end
   end
@@ -240,8 +241,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   // LED level meter: bar = max(|sample| >> 11 (clamped 15), bar - 1),
   // updated once per sample on the sample_valid pulse
   // ------------------------------------------------------------------
-  wire [15:0] mag   = sample_in[15] ? (~sample_in + 16'd1) : sample_in;
-  wire [4:0]  level = (mag[15:11] > 5'd15) ? 5'd15 : mag[15:11];
+  wire [15:0] mag   = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
+                      : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
+  wire [4:0]  level = mag[15:10];  // 0..31, monotonic; uses all 5 LEDs
   wire [4:0]  decayed = (led_bar == 5'd0) ? 5'd0 : led_bar - 5'd1;
 
   reg [4:0] led_bar;
@@ -258,7 +260,10 @@ module tt_um_tmcdonagh_guitar_pedal (
   reg [15:0] tx_shift;
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) tx_shift <= 16'd0;
-    else if (slot == 6'd0 || slot == 6'd32) tx_shift <= effect_sample;
+    // load once per half (first clk only): keeps L=R=previous sample
+    // (mono contract) and immune to param bounce late in the slot
+    else if ((slot == 6'd0 || slot == 6'd32) && lr_cnt[2:0] == 3'd0)
+      tx_shift <= effect_sample;
     else if (data_window && lr_cnt[2:0] == 3'd7)
       tx_shift <= {tx_shift[14:0], 1'b0};
   end
@@ -272,7 +277,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   assign uio_oe  = 8'b0000_0001;
 
   // List all unused inputs to prevent warnings
-  wire _unused = &{ena, uio_in, ui_in[7:4], 1'b0};
+  wire _unused = &{ena, uio_in, 1'b0};
 
 endmodule
 
