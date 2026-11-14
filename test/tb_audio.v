@@ -8,7 +8,8 @@
 // v2.2 task 3 byte layout: this tb drives the DIP effect enables on
 // ui[7:4] (+EN=, 0..15: bit order = chain order, en[0]=fuzz..en[3]=trem)
 // and the params on uio[5:2] (+PARAMS=, P3..P0: P2=trem rate, P3=trem
-// depth, P0=dist knee live; P1 lands in task 5). ui[3:1] stay 0 (encoder
+// depth, P0=dist knee, P1=crush depth base — all live as of task 5).
+// ui[3:1] stay 0 (encoder
 // stomp up) so the preset stays 0 and the ROM contributes nothing —
 // en comes from the DIP byte alone; ui[0] is still the per-slot ADC
 // data bit, assigned separately below.

@@ -537,35 +537,126 @@ async def test_seg_patterns(dut):
 # panel lines {stomp, enc_b, enc_a} (kept 0 = idle/stomp-up in these
 # tests, so preset stays 0 and the ROM contributes nothing), ui[7:4]=DIP
 # effect enables en[3:0] (en[0]=fuzz .. en[3]=trem = chain order).
-# uio byte layout: uio[5:2]=params P3..P0 — task 3 wires P2=uio[4] (trem
-# rate) and P3=uio[5] (trem depth); task 4 wires P0=uio[2] (dist knee);
-# P1 lands in task 5.
+# uio byte layout: uio[5:2]=params P3..P0, all four live as of task 5 —
+# P0=uio[2] (dist knee), P1=uio[3] (crush depth base), P2=uio[4] (trem
+# rate), P3=uio[5] (trem depth).
 
 @cocotb.test()
-async def test_bitcrush_quantize(dut):
-    """Crush stage (en[2]), interim task 3: quantize-only at fixed N=8 —
-    out = in & 0xFF00 (low 8 bits masked, sign kept), latched each frame;
-    decimator deleted (auto-lofi depth arrives in task 5)."""
+async def test_autolofi_env(dut):
+    """Crush stage (en[2]), v2.2 task 5: auto-lofi — quantize depth N
+    follows the envelope of the PRE-CHAIN input (mag of sample_in; fix-
+    round ruling: on |s2| the fuzz clip + dist ceiling cap the
+    envelope below the loud threshold in stacked chains, pinning the
+    full stack coarse regardless of playing dynamics — the player's
+    dynamics live in the raw input). Base from P1 (uio[3]):
+      {P1,loud} 11 -> N=8 (mask 0xFF00), 01/10 -> N=6 (0xFC00),
+      00 -> N=4 (0xF000)
+    The distinguishing sample 0x7F73 maps to 0x7F00 / 0x7C00 / 0x7000
+    (N=6 is 0x7C00 = 0x7F73 & 0xFC00 — the plan line's 0x7FC0 is
+    unreachable through any AND mask, 0x73 bit 7 is clear).
+    Frame N's crush latch masks with the env value AFTER frame N-1's
+    update (env and crush_hold clock on the same sample_valid edge; a
+    freshly attacked env is visible only one frame later). Pinned by
+    the quiet probes: the 0x7F73 probe frame's own attack raises env to
+    ~19674 (loud), so a mask that wrongly used the post-update env
+    would give 0x7F00, not the expected quiet 0x7C00.
+    Per P1 setting, from reset (env provably 0 — the deepest silence):
+    100 loud frames of 0x7FFF re-raise env past 16384 (16383 after
+    frame 1, 24575 after frame 2, converges to 32766) — attack
+    re-raise after silence, Review Focus 4; 400 silent frames decay it
+    back below 16384 (to ~6721, crossed at ~frame 176); long silence
+    terminates at EXACTLY 0 (the release's 1-LSB floor — plain
+    env - (env>>>8) stalls anywhere below 256)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0100_0000  # en[2] crush only; panel idle
-    dut.uio_in.value = 0           # P1 unused until task 5
+    dut.ui_in.value = 0b0100_0000  # en[2] crush only; panel idle (preset 0)
+    dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def crush_once(word16):
-        await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, word16 << 8)
-        await _wait_left_start(dut)
-        bits = await i2s_send_and_capture(dut, 0)
-        return tx_data_bits(bits)
+    def env():
+        # tb.v instantiates the design top as user_project
+        return int(dut.user_project.env.value)
 
-    assert await crush_once(0x0FFF) == 0x0F00, "low 8 bits masked"
-    assert await crush_once(0xFF9C) == 0xFF00, "negative keeps sign through mask"
-    assert await crush_once(0x7FFF) == 0x7F00, "+full-scale masks to 0x7F00"
-    assert await crush_once(0x8000) == 0x8000, "-32768 masks to 0x8000"
+    for p1 in (1, 0):
+        dut.uio_in.value = 0x08 if p1 else 0x00   # P1 = uio[3]
+        dut.rst_n.value = 0
+        await ClockCycles(dut.clk, 10)
+        dut.rst_n.value = 1
+
+        await _wait_left_start(dut)
+        assert env() == 0, "env must reset to 0"
+
+        # 100 loud frames (0x7FFF). RX only listens in left halves, so
+        # each frame = one I2S drive (per-slot bits) + an exact 256-clk
+        # right-half skip; ui[0] sits at 0 between drives.
+        for _ in range(100):
+            await i2s_send_and_capture(dut, 0x7FFF << 8)
+            await ClockCycles(dut.clk, 256)
+        assert env() >= 16384, "100 loud frames must attack env past 16384"
+
+        # loud probe: 0x7F73 in frame N, captured in frame N+1 (the
+        # one-frame I2S pipeline); the latch masked with env after the
+        # last 0x7FFF frame (32766 — loud)
+        await i2s_send_and_capture(dut, 0x7F73 << 8)
+        await ClockCycles(dut.clk, 256)
+        bits = await i2s_send_and_capture(dut, 0)
+        exp, got = (0x7F00 if p1 else 0x7C00), tx_data_bits(bits)
+        assert got == exp, f"P1={p1} loud: {got:#06x} != {exp:#06x}"
+
+        # 400 silent frames (the loud capture frame above drove the
+        # first): env releases below 16384 — the quiet probe's latch
+        # masks with env ~6721
+        await ClockCycles(dut.clk, 256)              # rest of capture frame
+        await ClockCycles(dut.clk, 512 * 399)        # 399 more silent frames
+        assert env() < 16384, "400 silent frames must decay env below 16384"
+
+        # quiet probe: env_501 ~6721 masks the latch; env crosses back
+        # up only at the NEXT frame (the pinned one-frame lag)
+        await i2s_send_and_capture(dut, 0x7F73 << 8)
+        await ClockCycles(dut.clk, 256)
+        bits = await i2s_send_and_capture(dut, 0)
+        exp, got = (0x7C00 if p1 else 0x7000), tx_data_bits(bits)
+        assert got == exp, f"P1={p1} quiet: {got:#06x} != {exp:#06x}"
+
+    # termination, once after the loop — env's update logic is
+    # P1-independent (P1 only reads env through the mask mux), and both
+    # iterations leave env attacked to ~19674 by their final probe
+    # frame: release reaches exact 0 in 1258 frames; 1400 covers it
+    # with margin. The 1-LSB floor is what terminates it (plain
+    # env - (env>>>8) stalls anywhere below 256).
+    await ClockCycles(dut.clk, 256)              # rest of capture frame
+    await ClockCycles(dut.clk, 512 * 1400)
+    assert env() == 0, "long silence must decay env to exactly 0"
+
+    # fix-round ruling pin (env source = pre-chain input): with
+    # fuzz+dist+crush stacked (en=0x7), the chain caps |s2| at 12288
+    # (fuzz clip 16384 -> dist ceiling 8192+4096), forever below the
+    # 16384 loud threshold — an s2-tracked envelope could never go
+    # loud in the full stack. 20 raw 0x7FFF frames drive env to 32766
+    # (an s2-tracked env would converge to 12288, quiet). The probe
+    # word 12000 stays under the fuzz clip so its chain output is
+    # off-grid: s2 = dist(12000) = 8192 + 3808/2 = 10096 = 0x2770;
+    # P1=0 loud -> N=6: 0x2770 & 0xFC00 = 0x2400 (an s2-tracked quiet
+    # N=4 would give 0x2000).
+    dut.ui_in.value = 0b0111_0000            # en[2:0] fuzz+dist+crush
+    dut.uio_in.value = 0x00                  # P1=0 (loud -> N=6)
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+    await _wait_left_start(dut)
+    for _ in range(20):
+        await i2s_send_and_capture(dut, 0x7FFF << 8)
+        await ClockCycles(dut.clk, 256)
+    assert env() >= 16384, \
+        "raw-tracked env must go loud under the fuzz+dist ceiling"
+    await i2s_send_and_capture(dut, 12000 << 8)
+    await ClockCycles(dut.clk, 256)
+    bits = await i2s_send_and_capture(dut, 0)
+    got = tx_data_bits(bits)
+    assert got == 0x2400, f"stacked fuzz+dist+crush loud: {got:#06x} != 0x2400"
 
 
 @cocotb.test()
@@ -772,9 +863,18 @@ async def test_chain_enables(dut):
     assert await stage_once(0x2, 1234) == 1234
     assert await stage_once(0x2, 20000) == 14096
 
-    # crush ON: & 0xFF00 (0x0FFF is corruption-sensitive through the
-    # off fuzz/dist stages; -32768 keeps its sign)
-    assert await stage_once(0x4, 0x0FFF) == 0x0F00
+    # crush ON: auto-lofi depth (task 5) — the mask now follows env,
+    # so the vectors pin the state, not just the masking: the raw
+    # -32768 words driven in the fuzz/dist sections above attacked env
+    # (pre-chain tracked, fix-round ruling) to ~30.7k (>> 16384) and it
+    # decays only ~0.4%/frame, so the stage sits LOUD for these probes;
+    # P1=0 (uio_in=0 throughout this test) -> N=6 mask 0xFC00: 0x0FFF
+    # -> 0x0C00, and -32768 keeps its sign through the mask (0x8000).
+    # Depth transitions are pinned by test_autolofi_env; this stays
+    # the enable-matrix check.
+    assert int(dut.user_project.env.value) >= 16384, \
+        "crush vectors require env loud (>= 16384; the -32768 attacks above)"
+    assert await stage_once(0x4, 0x0FFF) == 0x0C00
     assert await stage_once(0x4, -32768) == -32768
 
     # fuzz + dist stacked: rectify + clip 16384, then shape at the

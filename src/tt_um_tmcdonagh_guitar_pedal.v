@@ -143,12 +143,59 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s2 = en[1] ? dist_out : s1;
 
   // ------------------------------------------------------------------
-  // Stage 3 — bitcrusher (interim, task 3): quantize-only, N=8 fixed
-  // (mask 0xFF00), latched per audio frame (the v1 sample-hold
-  // decimator is deleted). Task 5 replaces the constant mask with the
-  // envelope-driven auto-lofi depth (P1 on uio[3]).
+  // Stage 3 — auto-lofi bitcrusher (v2.2 task 5): quantize depth N
+  // follows the envelope — quiet passages get crunchier. Peak-ish
+  // envelope follower, one update per audio frame on sample_valid —
+  // the same enable pattern as crush_hold, so env is always warm the
+  // moment the stage switches on. env tracks the PRE-CHAIN input
+  // magnitude (mag, stage 1's saturating |sample_in|; fix-round
+  // ruling): on |s2| the fuzz clip (16384) + dist ceiling cap the
+  // envelope below the loud threshold in stacked chains, pinning the
+  // full stack coarse regardless of playing dynamics — the player's
+  // dynamics live in the raw input. Standalone crush is unchanged
+  // (s2 == sample_in with fuzz/dist off):
+  //   attack (mag > env): env <= (env + mag) >>> 1   — 17-bit add,
+  //     >> 1 back to 16; halves the gap, ~12 frames to converge;
+  //   release: env <= env - (env>>>8) - (env != 0)   — tau ~256 frames
+  //     ~5.3 ms; the 1-LSB floor makes the decay terminate at exactly
+  //     0 (the plain subtract-shift stalls anywhere below 256).
+  // loud = |env[15:14]| (env >= 16384). env tops out at 32766 — env[15]
+  // never sets, so a reduction-& here would pin the stage quiet
+  // forever; | is the threshold the pinned test values require.
+  // Depth {P1 = uio[3], loud}: 11 -> N=8 (mask FF00, 8 bits kept),
+  // 01/10 -> N=6 (FC00, 6 bits), 00 -> N=4 (F000, 4 bits).
+  // Frame timing: env and crush_hold clock on the SAME sample_valid
+  // edge, so frame N's latch masks with the env value after frame
+  // N-1's update — a sample's own magnitude never sets its own depth
+  // (one-frame env lag, pinned by test_autolofi_env's quiet probes).
   // ------------------------------------------------------------------
-  wire [15:0] crushed = s2 & 16'hFF00;
+  reg  [15:0] env;
+  wire [16:0] env_atk = {1'b0, env} + {1'b0, mag};       // 17-bit env+mag
+  wire        env_nz  = (env != 16'd0);                   // release floor
+
+  // release decrement (env>>>8) + (env != 0) in one 8-bit sum: the
+  // carry-out cannot occur (env <= 32766, so env[15:8] <= 127) — keeps
+  // the release a single 16-bit subtractor against a zero-extended
+  // byte instead of two cascaded full-width subtractors
+  wire [7:0]  env_dec8 = env[15:8] + {7'b0, env_nz};
+  wire [15:0] env_dec  = {8'h00, env_dec8};
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)             env <= 16'd0;
+    else if (sample_valid)  begin
+      if (mag > env)        env <= env_atk[16:1];         // (env+mag) >>> 1
+      else                  env <= env - env_dec;
+    end
+  end
+
+  wire loud = |env[15:14];                            // env >= 16384
+
+  wire [1:0]  crush_sel  = {uio_in[3], loud};
+  wire [15:0] crush_mask = crush_sel == 2'b11 ? 16'hFF00 :  // {11}: N=8
+                           crush_sel != 2'b00 ? 16'hFC00 :  // {01,10}: N=6
+                                               16'hF000;    // {00}: N=4
+
+  wire [15:0] crushed = s2 & crush_mask;
 
   reg [15:0] crush_hold;
   always @(posedge clk or negedge rst_n) begin
@@ -227,9 +274,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P3..P0)
 
   // List all unused inputs to prevent warnings
-  // (uio[3] = P1 lands in task 5; uio[7:6]/[1:0] are clock/data
-  // outputs, their input side is unused)
-  wire _unused = &{ena, uio_in[7:6], uio_in[3], uio_in[1:0], 1'b0};
+  // (uio[5:2] = params P3..P0, all live after task 5; uio[7:6]/[1:0] are
+  // clock/data outputs, their input side is unused)
+  wire _unused = &{ena, uio_in[7:6], uio_in[1:0], 1'b0};
 
 endmodule
 

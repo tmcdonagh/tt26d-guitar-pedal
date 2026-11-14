@@ -28,8 +28,8 @@ MODES = [
     ("fuzz",     0x1, 0x0),   # fixed clip 16384
     ("dist",     0x2, 0x0),   # soft-knee PWL, P0=0 (T=8192)
     ("distX",    0x2, 0x1),   # soft-knee PWL, P0=1 (T=4096)
-    ("crush",    0x4, 0x0),   # interim: N=8 fixed
-    ("crushQ",   0x4, 0x2),   # P1 — no-op until task 5 (auto-lofi)
+    ("crush",    0x4, 0x0),   # auto-lofi, P1=0 base: N=6 loud / N=4 quiet
+    ("crushQ",   0x4, 0x2),   # auto-lofi, P1=1 base: N=8 loud / N=6 quiet
     ("trem",     0x8, 0x0),   # k=0 (~23.4 Hz), span 255 (4 steps)
     ("tremS",    0x8, 0xC),   # k=1 (~46.9 Hz), span 127 (2 steps)
     ("fuzzdist", 0x3, 0x0),   # rectify + clip 16384, then soft knee
