@@ -114,16 +114,31 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s1 = en[0] ? fuzz_out : s0;
 
   // ------------------------------------------------------------------
-  // Stage 2 — distortion (interim, task 3): v1 hard clip, drive fixed
-  // x3 (shift-add). Task 4 replaces this with the soft-knee PWL
-  // shaper (P0 on uio[2]).
+  // Stage 2 — distortion (v2.2 task 4): soft-knee piecewise-linear
+  // shaper on the stage input's magnitude — unity below the knee, slope
+  // 1/2 above it (a soft ceiling in place of the interim hard clip).
+  // Knee from the P0 character bit (uio[2]): 0 -> 8192 (soft ceiling
+  // 20479), 1 -> 4096 (ceiling 18431); both below the 16384 fuzz clip,
+  // so a stacked fuzz always feeds the shaped region. No multipliers —
+  // subtract + shift only.
   // ------------------------------------------------------------------
-  wire signed [16:0] dist_in = $signed(s1);
-  wire signed [17:0] dist_prod = (dist_in <<< 1) + dist_in;  // x3
-  // overflow iff the result's top bits stop looking sign-extended
-  wire dist_ovf = (dist_prod[17] != dist_prod[16]) || (dist_prod[16] != dist_prod[15]);
-  wire [15:0] dist_out = dist_ovf ? (dist_prod[17] ? 16'h8000 : 16'h7FFF)
-                                  : dist_prod[15:0];
+  wire [15:0] dist_mag = (s1 == 16'h8000) ? 16'h7FFF   // saturating |s1|
+                        : s1[15] ? (~s1 + 16'd1) : s1;
+
+  wire [15:0] dist_t = uio_in[2] ? 16'd4096 : 16'd8192;
+
+  // a <= T: out = a (slope 1);  a > T: out = T + ((a - T) >> 1)
+  // (a - T >= 1 in the shaped branch, so the shift is exact)
+  wire [15:0] dist_over = dist_mag - dist_t;
+  wire [15:0] dist_pw = (dist_mag > dist_t) ? (dist_t + (dist_over >> 1))
+                                            : dist_mag;
+
+  // sign reapplied through a sat16 clamp (unreachable: out <= 20479,
+  // kept per the saturating-arithmetic convention)
+  wire [16:0] dist_neg = 17'd0 - {1'b0, dist_pw};
+  wire dist_neg_ovf = (dist_neg[16] != dist_neg[15]);
+  wire [15:0] dist_out = s1[15] ? (dist_neg_ovf ? 16'h8000 : dist_neg[15:0])
+                                : dist_pw;
 
   wire [15:0] s2 = en[1] ? dist_out : s1;
 
@@ -212,9 +227,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P3..P0)
 
   // List all unused inputs to prevent warnings
-  // (uio[3:2] = P0/P1 land in tasks 4-5; uio[7:6]/[1:0] are clock/data
+  // (uio[3] = P1 lands in task 5; uio[7:6]/[1:0] are clock/data
   // outputs, their input side is unused)
-  wire _unused = &{ena, uio_in[7:6], uio_in[3:0], 1'b0};
+  wire _unused = &{ena, uio_in[7:6], uio_in[3], uio_in[1:0], 1'b0};
 
 endmodule
 

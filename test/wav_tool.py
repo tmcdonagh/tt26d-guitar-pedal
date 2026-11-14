@@ -26,13 +26,13 @@ OUT_DIR = os.path.join(HERE, "audio_out")
 MODES = [
     ("bypass",   0x0, 0x0),
     ("fuzz",     0x1, 0x0),   # fixed clip 16384
-    ("dist",     0x2, 0x0),   # interim: hard clip, x3
-    ("distX",    0x2, 0x1),   # P0 — no-op until task 4 (soft knee)
+    ("dist",     0x2, 0x0),   # soft-knee PWL, P0=0 (T=8192)
+    ("distX",    0x2, 0x1),   # soft-knee PWL, P0=1 (T=4096)
     ("crush",    0x4, 0x0),   # interim: N=8 fixed
     ("crushQ",   0x4, 0x2),   # P1 — no-op until task 5 (auto-lofi)
     ("trem",     0x8, 0x0),   # k=0 (~23.4 Hz), span 255 (4 steps)
     ("tremS",    0x8, 0xC),   # k=1 (~46.9 Hz), span 127 (2 steps)
-    ("fuzzdist", 0x3, 0x0),   # = the v1 mode-6 chain
+    ("fuzzdist", 0x3, 0x0),   # rectify + clip 16384, then soft knee
     ("all4",     0xF, 0x0),   # full stack
 ]
 

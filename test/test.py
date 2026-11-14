@@ -137,9 +137,13 @@ async def _trem_probe(dut, cur, count, x=16384):
     have been driven), advance/drive/capture so the returned value is
     frame `count`'s output — the effect of frame count-1's input x,
     produced with post-strobe LFO count == count (frame F's strobe
-    leaves count F+1; probe counts here stay in the falling direction
-    unless they cross a wrap). Consecutive counts reuse the previous
-    capture round's drive (it drove the same x). Returns (new cur, out).
+    leaves count F+1). Caveat: that count == count correspondence holds
+    only before the first LFO wrap — once the counter wraps at 2^exp-1,
+    the post-strobe count is count mod 2^exp and the direction has
+    flipped (the k=1 CONFIG's count-512 probe samples post-wrap count
+    0, rising). Probe counts here stay in the falling direction unless
+    they cross a wrap. Consecutive counts reuse the previous capture
+    round's drive (it drove the same x). Returns (new cur, out).
 
     Requires: count >= cur (increasing probes) and, when count == cur,
     the previous round must have driven x on frame count-1."""
@@ -534,7 +538,8 @@ async def test_seg_patterns(dut):
 # tests, so preset stays 0 and the ROM contributes nothing), ui[7:4]=DIP
 # effect enables en[3:0] (en[0]=fuzz .. en[3]=trem = chain order).
 # uio byte layout: uio[5:2]=params P3..P0 — task 3 wires P2=uio[4] (trem
-# rate) and P3=uio[5] (trem depth); P0/P1 land in tasks 4-5.
+# rate) and P3=uio[5] (trem depth); task 4 wires P0=uio[2] (dist knee);
+# P1 lands in task 5.
 
 @cocotb.test()
 async def test_bitcrush_quantize(dut):
@@ -564,36 +569,44 @@ async def test_bitcrush_quantize(dut):
 
 
 @cocotb.test()
-async def test_distortion_gain(dut):
-    """Dist stage (en[1]), interim task 3: v1 hard clip with the drive
-    fixed at x3 — out = sat16(in * 3) on the stage input (no rectify;
-    fuzz is off). Task 4 replaces this with the soft-knee shaper."""
+async def test_dist_softknee(dut):
+    """Dist stage (en[1]), v2.2 task 4: soft-knee piecewise-linear
+    shaper on the stage input's magnitude — unity below the knee, slope
+    1/2 above it (a soft ceiling in place of the interim hard clip).
+    Knee T from the P0 character bit (uio[2]): 0 -> 8192 (soft ceiling
+    20479), 1 -> 4096 (ceiling 18431); both below the 16384 fuzz clip,
+    so a stacked fuzz always feeds the shaped region. Fuzz is off here,
+    so the shaper input is the raw sample — sign kept, no rectify.
+    Pinned exact points on both knees, both signs, plus -32768 (mag
+    saturates to 32767, then shapes and keeps its sign)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
     dut.ui_in.value = 0b0010_0000  # en[1] dist only; panel idle
-    dut.uio_in.value = 0           # P0 unused until task 4
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def dist_once(word16):
+    async def dist_once(p0, word16):
+        dut.uio_in.value = 0x04 if p0 else 0x00  # P0 = uio[2]
         await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, word16 << 8)
+        await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
         await _wait_left_start(dut)
         bits = await i2s_send_and_capture(dut, 0)
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
-    # clean x3 (positive and negative)
-    assert await dist_once(1000) == 3000
-    assert await dist_once(1234) == 3702
-    assert await dist_once(-1234) == -3702
-    # saturation both ways (spec sat16: +32767 / -32768)
-    assert await dist_once(20000) == 32767
-    assert await dist_once(-20000) == -32768
-    # -32768 * 3 = -98304 saturates to -32768
-    assert await dist_once(-32768) == -32768
+    # P0=0 (T=8192): sub-knee unity; above it T + (a-T)>>1
+    assert await dist_once(0, 4096) == 4096, "sub-knee must pass at unity"
+    assert await dist_once(0, 16384) == 12288    # 8192 + 8192/2
+    assert await dist_once(0, 32767) == 20479    # 8192 + 24575/2 = soft ceiling
+    assert await dist_once(0, -16384) == -12288  # sign reapplied
+    assert await dist_once(0, -32768) == -20479  # mag sat 32767 -> shape -> negate
+
+    # P0=1 (T=4096): same shape, lower knee (soft ceiling 18431)
+    assert await dist_once(1, 8192) == 6144      # 4096 + 4096/2
+    assert await dist_once(1, 16384) == 10240    # 4096 + 12288/2
+    assert await dist_once(1, 32767) == 18431    # 4096 + 28671/2 = soft ceiling
 
 
 @cocotb.test()
@@ -628,8 +641,10 @@ async def test_fuzz_rectify(dut):
 
 @cocotb.test()
 async def test_fuzz_dist_chain(dut):
-    """Fuzz + dist stacked (en = 0x3): rectify, clip at 16384, then
-    saturating x3 — bit-equal to the v1 mode-6 chain."""
+    """Fuzz + dist stacked (en = 0x3, P0=0): rectify, clip at 16384,
+    then the soft-knee shaper (T=8192, below the fuzz clip — the
+    shaper always sees the clipped magnitude and shapes it). 10000
+    pins the shaped branch reached without the fuzz clip."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -647,9 +662,10 @@ async def test_fuzz_dist_chain(dut):
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
-    assert await chain_once(-20000) == 32767   # 20000->clip 16384->x3->sat
-    assert await chain_once(5000) == 15000     # 5000->5000->x3
-    assert await chain_once(20000) == 32767    # clip then x3
+    assert await chain_once(-20000) == 12288   # -20000 -> clip 16384 -> 8192+4096
+    assert await chain_once(5000) == 5000      # below both clip and knee
+    assert await chain_once(10000) == 9096     # 10000 -> 8192 + 1808/2
+    assert await chain_once(20000) == 12288    # clip 16384, then shape
 
 
 @cocotb.test()
@@ -716,7 +732,8 @@ async def test_chain_enables(dut):
     also proves every DOWNSTREAM stage passes bit-exact when disabled);
     with all en=0 the chain is bit-exact identity and +-32768 round-trip
     (Review Focus 3: no disabled stage may corrupt the sample). Fuzz +
-    dist stacked must equal the v1 mode-6 chain output."""
+    dist stacked feeds the shaper the clipped magnitude (both knees sit
+    below the fuzz clip; dist is the task-4 soft knee, P0=0)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -749,20 +766,22 @@ async def test_chain_enables(dut):
     assert await stage_once(0x1, -32768) == 16384
     assert await stage_once(0x1, 5000) == 5000
 
-    # dist ON: sat16(x*3); 1234 pins the fuzz-off pass-through exact
-    assert await stage_once(0x2, -32768) == -32768
-    assert await stage_once(0x2, 1234) == 3702
-    assert await stage_once(0x2, 20000) == 32767
+    # dist ON: soft-knee PWL (P0=0, T=8192); 1234 pins the fuzz-off
+    # pass-through exact (sub-knee unity), 20000 the shaped branch
+    assert await stage_once(0x2, -32768) == -20479
+    assert await stage_once(0x2, 1234) == 1234
+    assert await stage_once(0x2, 20000) == 14096
 
     # crush ON: & 0xFF00 (0x0FFF is corruption-sensitive through the
     # off fuzz/dist stages; -32768 keeps its sign)
     assert await stage_once(0x4, 0x0FFF) == 0x0F00
     assert await stage_once(0x4, -32768) == -32768
 
-    # fuzz + dist stacked = the v1 mode-6 chain
-    assert await stage_once(0x3, -20000) == 32767
-    assert await stage_once(0x3, 5000) == 15000
-    assert await stage_once(0x3, 20000) == 32767
+    # fuzz + dist stacked: rectify + clip 16384, then shape at the
+    # 8192 knee (soft-knee dist replaces the v1 x3 tail)
+    assert await stage_once(0x3, -20000) == 12288
+    assert await stage_once(0x3, 5000) == 5000
+    assert await stage_once(0x3, 20000) == 12288
 
     # all stages OFF: bit-exact identity, +-full-scale through
     assert await stage_once(0x0, 32767) == 32767

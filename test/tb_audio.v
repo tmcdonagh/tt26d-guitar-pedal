@@ -8,7 +8,7 @@
 // v2.2 task 3 byte layout: this tb drives the DIP effect enables on
 // ui[7:4] (+EN=, 0..15: bit order = chain order, en[0]=fuzz..en[3]=trem)
 // and the params on uio[5:2] (+PARAMS=, P3..P0: P2=trem rate, P3=trem
-// depth live; P0/P1 land in tasks 4-5). ui[3:1] stay 0 (encoder idle,
+// depth, P0=dist knee live; P1 lands in task 5). ui[3:1] stay 0 (encoder
 // stomp up) so the preset stays 0 and the ROM contributes nothing —
 // en comes from the DIP byte alone; ui[0] is still the per-slot ADC
 // data bit, assigned separately below.
@@ -17,9 +17,9 @@
 // picked up):
 //   $ iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/*.v
 // Listening-sim build (Verilator; the binary wav_tool.py runs). The
-// -Wno waivers cover pre-existing WIDTH warnings in the dist/trem
-// arithmetic (tasks 4-5 rewrite it) and the template placeholder
-// src/project.v; --top-module pins the tb as the sim top:
+// -Wno waivers cover WIDTH warnings in the trem arithmetic and the
+// template placeholder src/project.v (the task-4 dist rewrite is
+// warning-clean); --top-module pins the tb as the sim top:
 //   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
 //       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-MULTITOP tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
