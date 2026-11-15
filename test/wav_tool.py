@@ -39,8 +39,8 @@ MODES = [
     ("fuzz",     0x02, 0x0),  # fixed clip 16384
     ("fuzzoct",  0x02, 0x1),  # fuzz + P0=1 octave blend (no-op until task 4)
     ("dist",     0x04, 0x0),  # soft-knee PWL, P0=0 (T=8192)
-    ("trem",     0x10, 0x0),  # k=0 (~23.4 Hz interim), fixed span (4 steps)
-    ("tremF",    0x10, 0x6),  # k=3 fast rate (~187.5 Hz interim) — by-ear chop comparison
+    ("trem",     0x10, 0x0),  # k=0 (~2.93 Hz), fixed span (4 steps)
+    ("tremF",    0x10, 0x6),  # k=3 fast rate (~23.44 Hz) — by-ear chop comparison
     ("fuzzdist", 0x06, 0x0),  # rectify + clip 16384, then soft knee
     ("all4",     0x17, 0x0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
 ]

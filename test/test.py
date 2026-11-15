@@ -143,7 +143,7 @@ async def _trem_probe(dut, cur, count, x=16384):
     leaves count F+1). Caveat: that count == count correspondence holds
     only before the first LFO wrap — once the counter wraps at 2^exp-1,
     the post-strobe count is count mod 2^exp and the direction has
-    flipped (the k=1 CONFIG's count-512 probe samples post-wrap count
+    flipped (the k=1 CONFIG's count-4096 probe samples post-wrap count
     0, rising). Probe counts here stay in the falling direction unless
     they cross a wrap. Consecutive counts reuse the previous capture
     round's drive (it drove the same x). Returns (new cur, out).
@@ -427,18 +427,20 @@ async def test_fuzz_dist_chain(dut):
 @cocotb.test()
 async def test_tremolo(dut):
     """Trem stage (en[4]): stepped-gain triangle LFO as built (v1) —
-    out = in >>> s, s = LFO gap >> 6 (gains 1, 1/2, 1/4, 1/8). v3 task 1
-    params: rate = 2-bit k = {uio[4], uio[3]} = {P2, P1} with the OLD
-    exp base 10 - k (k=0..3 -> half-period 2^(10-k) frames ->
-    ~23.4/46.9/93.75/187.5 Hz; task 2 re-bases the ladder to the
-    musical 2.9-23.4 Hz range). Depth span FIXED 255 (4 gain steps):
-    the v2.2 depth bit lived on uio[5], which is the Rev B PSRAM MISO
-    pin in the v3 map — span/rshift are constants now. The LFO counter
-    value sampled by each output is the post-increment one; frame F's
-    input is output in frame F+1 with count F+1 (validated against the
-    v1 k=7 sequence). 23 exact values across all four k rates, probed
-    at the gain-step boundary counts, plus a sign probe
-    and a wrap/direction probe (v1 parity)."""
+    out = in >>> s, s = LFO gap >> 6 (gains 1, 1/2, 1/4, 1/8). v3 task 2
+    rate ladder: rate = 2-bit k = {uio[4], uio[3]} = {P2, P1} with exp
+    base 13 - k (k=0..3 -> half-period 2^(13-k) frames -> LFO
+    full-cycle rates 2.93/5.86/11.72/23.44 Hz at 48 kHz — the musical
+    2.9-23.4 Hz range from the listening session; the interim
+    23.4-187.5 Hz v2.2-base ladder read as jitter). Depth span FIXED
+    255 (4 gain steps): the v2.2 depth bit lived on uio[5], which is
+    the Rev B PSRAM MISO pin in the v3 map — span/rshift are constants
+    now. The LFO counter value sampled by each output is the
+    post-increment one; frame F's input is output in frame F+1 with
+    count F+1 (validated against the v1 k=7 sequence). 31 exact values
+    across all four k rates, probed as boundary PAIRS at the gain-step
+    band edges, plus a sign probe on the three fast rates and a
+    wrap/direction probe on every rate (v1 parity)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -449,34 +451,44 @@ async def test_tremolo(dut):
     dut.rst_n.value = 1
 
     # (uio byte, probes) per rate k — v3: k = {uio[4], uio[3]}, so the
-    # uio byte is k << 3. Span fixed 255 (rs 8), OLD exp base 10 - k.
+    # uio byte is k << 3. Span fixed 255 (rs 8), exp base 13 - k.
     # Each probe is (post-strobe LFO count, input x, expected output):
     # out = x >>> (gap >> 6) with gap = ((cnt << 8) - cnt) >> exp
-    # (falling) — counts chosen at the gain-step boundaries so the ramp
-    # arithmetic is pinned exactly (gap 63/64, 127/128, 191/192; k=3's
-    # 255*cnt >> 7 skips the even gaps, so its pairs pin the step
-    # edges). Wrap probes sample post-wrap count 0, rising (max gap
-    # 255 -> s=3).
+    # (falling) — counts chosen as boundary PAIRS: the last count of
+    # one gain band and the first of the next (gap 63/64, 127/128,
+    # 191/192; s = gap>>6 = 0/1/2/3), so the ramp arithmetic is pinned
+    # exactly at every band edge (v2.2 lesson: boundary pairs, not end
+    # states). Sign probe mid-band at gap 149 (s=2) on the fast rates;
+    # wrap probes sample post-wrap count 0, rising (max gap 255 -> s=3).
     CONFIGS = [
-        # k=0 (exp 10): boundary counts 257/258/515/772
-        (0x00, [(257, 16384, 16384), (258, 16384, 8192),
-                (515, 16384, 4096), (772, 16384, 2048)]),
-        # k=1 (exp 9): boundaries 128/129/258/386, sign probe at 302,
-        # wrap probe at 512 (rising starts at max gap 255)
-        (0x08, [(128, 16384, 16384), (129, 16384, 8192),
-                (258, 16384, 4096), (302, -16384, -4096),
-                (386, 16384, 2048), (512, 16384, 2048)]),
-        # k=2 (exp 8): boundaries 64/65/129/193, sign probe at 160,
-        # wrap probe at 256 (post-wrap count 0, rising, gap 255)
-        (0x10, [(64, 16384, 16384), (65, 16384, 8192),
-                (129, 16384, 4096), (160, -16384, -4096),
-                (193, 16384, 2048), (256, 16384, 2048)]),
-        # k=3 (exp 7): boundaries 32/33 (gap 63->65), 64/65 (127->129),
-        # 96/97 (191->193), wrap probe at 128 (count 0, rising, gap 255)
-        (0x18, [(32, 16384, 16384), (33, 16384, 8192),
-                (64, 16384, 8192), (65, 16384, 4096),
-                (96, 16384, 4096), (97, 16384, 2048),
-                (128, 16384, 2048)]),
+        # k=0 (exp 13): boundaries 2056/2057, 4112/4113, 6168/6169,
+        # wrap at 8192 (2.93 Hz full cycle)
+        (0x00, [(2056, 16384, 16384), (2057, 16384, 8192),
+                (4112, 16384, 8192), (4113, 16384, 4096),
+                (6168, 16384, 4096), (6169, 16384, 2048),
+                (8192, 16384, 2048)]),
+        # k=1 (exp 12): boundaries 1028/1029, 2056/2057, 3084/3085,
+        # sign probe at 2400, wrap at 4096 (5.86 Hz)
+        (0x08, [(1028, 16384, 16384), (1029, 16384, 8192),
+                (2056, 16384, 8192), (2057, 16384, 4096),
+                (2400, -16384, -4096),
+                (3084, 16384, 4096), (3085, 16384, 2048),
+                (4096, 16384, 2048)]),
+        # k=2 (exp 11): boundaries 514/515, 1028/1029, 1542/1543,
+        # sign probe at 1200, wrap at 2048 (11.72 Hz)
+        (0x10, [(514, 16384, 16384), (515, 16384, 8192),
+                (1028, 16384, 8192), (1029, 16384, 4096),
+                (1200, -16384, -4096),
+                (1542, 16384, 4096), (1543, 16384, 2048),
+                (2048, 16384, 2048)]),
+        # k=3 (exp 10): boundaries 257/258, 514/515, 771/772 — the
+        # same math as the task-1 interim k=0 (exp base 10), now the
+        # ladder top; sign probe at 600, wrap at 1024 (23.44 Hz)
+        (0x18, [(257, 16384, 16384), (258, 16384, 8192),
+                (514, 16384, 8192), (515, 16384, 4096),
+                (600, -16384, -4096),
+                (771, 16384, 4096), (772, 16384, 2048),
+                (1024, 16384, 2048)]),
     ]
 
     for uio_byte, probes in CONFIGS:
@@ -525,13 +537,14 @@ async def test_chain_enables(dut):
         return out - 0x10000 if out & 0x8000 else out
 
     # trem first (needs the LFO advanced from reset: gap >> 6 = 2 at
-    # post-strobe counts 600/603 on the k=0 / fixed-span-255 params)
+    # post-strobe counts 5000/5003 on the k=0 / fixed-span-255 params —
+    # mid-band of the task-2 ladder's slowest rate, exp base 13)
     dut.ui_in.value = 0b0010_0000             # en[4] trem only
     await _wait_left_start(dut)
     cur = 1
-    cur, out = await _trem_probe(dut, cur, 600, 16384)
+    cur, out = await _trem_probe(dut, cur, 5000, 16384)
     assert out == 4096, f"trem ON: 16384 >>> 2, got {out}"
-    cur, out = await _trem_probe(dut, cur, 603, -32768)
+    cur, out = await _trem_probe(dut, cur, 5003, -32768)
     assert out == -8192, f"trem ON: -32768 >>> 2, got {out}"
 
     # fuzz ON: rectify + clip 16384 (-32768 folds and clips; 5000 below)

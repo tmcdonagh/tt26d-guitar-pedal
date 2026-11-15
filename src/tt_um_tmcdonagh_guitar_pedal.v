@@ -193,39 +193,52 @@ module tt_um_tmcdonagh_guitar_pedal (
   // ------------------------------------------------------------------
   // Stage 5 — tremolo: stepped-gain tremolo as built (v1): out =
   // in >>> s with gain steps 1, 1/2, 1/4, 1/8, s = LFO gap >> 6
-  // (gap = distance from full gain), triangle LFO. v3 rate bits:
-  // k = {uio[4], uio[3]} = {P2, P1} (0..3) with the OLD v2.2 exp base
-  // 10 - k (k=0..3 -> 2^(10-k)-frame half-periods ~
-  // 23.4/46.9/93.75/187.5 Hz; task 2 re-bases to 13 and widens the
-  // counter for the musical 2.9-23.4 Hz ladder). Depth span FIXED
-  // 255 = 4 gain steps: the v2.2 depth bit lived on uio[5], which is
-  // the Rev B PSRAM MISO pin in the v3 map — leaving it wired would
-  // let the reserved pin control trem depth, so span/rshift are
-  // constants now.
+  // (gap = distance from full gain), triangle LFO. v3 task 2 rate
+  // ladder: k = {uio[4], uio[3]} = {P2, P1} (0..3) with exp base
+  // 13 - k (k=0..3 -> 2^(13-k)-frame half-periods -> LFO full-cycle
+  // rates 2.93/5.86/11.72/23.44 Hz at 48 kHz — the musical 2.9-23.4
+  // Hz range from the listening session; the interim 23.4-187.5 Hz
+  // v2.2-base ladder read as jitter). Depth span FIXED 255 = 4 gain
+  // steps: the v2.2 depth bit lived on uio[5], which is the Rev B
+  // PSRAM MISO pin in the v3 map — leaving it wired would let the
+  // reserved pin control trem depth, so span/rshift are constants
+  // now.
   // ------------------------------------------------------------------
   wire [1:0] trem_k   = {uio_in[4], uio_in[3]};
-  wire [3:0] trem_exp = 4'd10 - {2'b00, trem_k};
+  wire [3:0] trem_exp = 4'd13 - {2'b0, trem_k};
 
   wire [7:0] trem_span   = 8'd255;  // constant (see above)
   wire [3:0] trem_rshift = 4'd8;    // span = 2^rshift - 1
 
-  reg  [10:0] trem_cnt;
+  reg  [13:0] trem_cnt;
   reg         trem_dir;   // 0 = falling (gain down), 1 = rising
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      trem_cnt <= 11'd0;
+      trem_cnt <= 14'd0;
       trem_dir <= 1'b0;
     end else if (sample_strobe) begin
-      if (trem_cnt == ((11'd1 << trem_exp) - 11'd1)) begin
-        trem_cnt <= 11'd0;
+      if (trem_cnt == ((14'd1 << trem_exp) - 14'd1)) begin
+        trem_cnt <= 14'd0;
         trem_dir <= ~trem_dir;
       end else begin
-        trem_cnt <= trem_cnt + 11'd1;
+        trem_cnt <= trem_cnt + 14'd1;
       end
     end
   end
 
-  wire [18:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {11'd0, trem_cnt};
+  // Ramp width derivation (the v2.2 x5-drive lesson: the ramp
+  // arithmetic is exactly where a width bug hides): ramp = (cnt<<8)
+  // - cnt = cnt*255 with cnt <= 2^13-1 (k=0, the widest half-period
+  // — larger k only shrinks the terminal count, never these widths).
+  // Then cnt<<8 <= (2^13-1)*256 = 2,096,896 < 2^22 and ramp <=
+  // (2^13-1)*255 = 2,087,205 < 2^22: a 22-bit concat/shift/subtract
+  // chain cannot truncate at ANY k (k=3's small counter with the
+  // large gap shift only ever divides the 22-bit ramp down — falling
+  // gap <= 254, rising gap = 255 - that, both 8-bit-safe). The two
+  // subtract operands are the same 22-bit zero-extension of cnt, so
+  // the whole expression runs at 22 bits with no underflow
+  // (256*cnt >= cnt) and no assignment truncation.
+  wire [21:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {8'd0, trem_cnt};
   wire [7:0]  trem_gap = trem_dir ? (trem_span - (trem_ramp >> trem_exp))
                                   : (trem_ramp >> trem_exp);
   wire [15:0] trem_out = $signed(s4) >>> (trem_gap >> 6);
