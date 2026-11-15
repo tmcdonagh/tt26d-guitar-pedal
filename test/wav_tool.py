@@ -30,19 +30,19 @@ OUT_DIR = os.path.join(HERE, "audio_out")
 OUT_DIR_GL = os.path.join(HERE, "audio_out_gl")  # netlist outputs; audio_out/ = RTL parity baseline
 GL_VVP = os.path.join(HERE, "sim_audio_gl.vvp")
 
-# name, en (ui[7:4], bit order = chain order en[0]=fuzz..en[3]=trem),
-# params (P3..P0 on uio[5:2])
+# name, en (ui[6:1], bit order = chain order en[0]=comp..en[5]=delay;
+# +EN range 0..63), params (P0..P2 on uio[4:2]: P0=bit0=uio[2],
+# P1=bit1=uio[3], P2=bit2=uio[4]; +PARAMS range 0..7)
 MODES = [
-    ("bypass",   0x0, 0x0),
-    ("fuzz",     0x1, 0x0),   # fixed clip 16384
-    ("dist",     0x2, 0x0),   # soft-knee PWL, P0=0 (T=8192)
-    ("distX",    0x2, 0x1),   # soft-knee PWL, P0=1 (T=4096)
-    ("crush",    0x4, 0x0),   # auto-lofi, P1=0 base: N=6 loud / N=4 quiet
-    ("crushQ",   0x4, 0x2),   # auto-lofi, P1=1 base: N=8 loud / N=6 quiet
-    ("trem",     0x8, 0x0),   # k=0 (~23.4 Hz), span 255 (4 steps)
-    ("tremS",    0x8, 0xC),   # k=1 (~46.9 Hz), span 127 (2 steps)
-    ("fuzzdist", 0x3, 0x0),   # rectify + clip 16384, then soft knee
-    ("all4",     0xF, 0x0),   # full stack
+    ("bypass",   0x0,  0x0),  # all stages off — digital clean identity
+    ("comp",     0x01, 0x0),  # comp slot (identity stub until task 3)
+    ("fuzz",     0x02, 0x0),  # fixed clip 16384
+    ("fuzzoct",  0x02, 0x1),  # fuzz + P0=1 octave blend (no-op until task 4)
+    ("dist",     0x04, 0x0),  # soft-knee PWL, P0=0 (T=8192)
+    ("trem",     0x10, 0x0),  # k=0 (~23.4 Hz interim), fixed span (4 steps)
+    ("tremF",    0x10, 0x6),  # k=3 fast rate (~187.5 Hz interim) — by-ear chop comparison
+    ("fuzzdist", 0x06, 0x0),  # rectify + clip 16384, then soft knee
+    ("all4",     0x17, 0x0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
 ]
 
 

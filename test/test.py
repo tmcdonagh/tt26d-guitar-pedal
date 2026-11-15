@@ -56,10 +56,10 @@ async def test_skeleton_baseline(dut):
             break
     assert toggled, "LRCLK never toggled — frame counter not running"
 
-    # DIP enables all on (en = 0xF), zero input: every stage maps 0 to 0,
-    # so DAC data stays low (v2.2: no mode mux — ui[7:4] are the effect
-    # enables; ui[3:1] reserved for v3, driven 0 here).
-    dut.ui_in.value = 0b1111_0000  # en[3:0] = 1111, ui[3:1] = 0 (reserved)
+    # DIP enables all on (en = 0x3F), zero input: every stage maps 0 to 0
+    # (the stub slots are identity), so DAC data stays low (v3: ui[6:1]
+    # are the effect enables; ui[7] reserved Rev B, driven 0 here).
+    dut.ui_in.value = 0b0111_1110  # en[5:0] = 111111, ui[7] = 0 (reserved)
     await ClockCycles(dut.clk, 1)
     assert dut.uio_out[1].value == 0, "unexpected DAC output with zero input"
 
@@ -317,158 +317,39 @@ async def test_reset_state(dut):
 
 
 
-# ui byte layout (v2.2 amendment): ui[0]=I2S data (driven by the helper),
-# ui[3:1] reserved for v3 (driven 0 in these tests), ui[7:4]=DIP effect
-# enables en[3:0] (en[0]=fuzz .. en[3]=trem = chain order) — en comes from
-# the DIP nibble alone.
-# uio byte layout: uio[5:2]=params P3..P0, all four live as of task 5 —
-# P0=uio[2] (dist knee), P1=uio[3] (crush depth base), P2=uio[4] (trem
-# rate), P3=uio[5] (trem depth).
+# ui byte layout (v3 task 1): ui[0]=I2S data (driven by the helper),
+# ui[6:1]=DIP effect enables en[5:0] (en[0]=comp .. en[5]=delay, bit
+# order = chain order), ui[7] reserved (Rev B delay character) — driven 0.
+# uio byte layout: params P0..P2 on uio[4:2] — P0=uio[2] (v3 fuzz octave
+# blend, unused until task 4 — the v2.2 dist-knee role is retired and the
+# pin is trapped in _unused), P1=uio[3] + P2=uio[4] = trem rate bits
+# k={uio[4],uio[3]}.
+# uio[5] is reserved (Rev B PSRAM MISO): the v2.2 trem depth bit is gone —
+# the trem span is a fixed constant now.
 
 @cocotb.test()
-async def test_autolofi_env(dut):
-    """Crush stage (en[2]), v2.2 task 5: auto-lofi — quantize depth N
-    follows the envelope of the PRE-CHAIN input (mag of sample_in; fix-
-    round ruling: on |s2| the fuzz clip + dist ceiling cap the
-    envelope below the loud threshold in stacked chains, pinning the
-    full stack coarse regardless of playing dynamics — the player's
-    dynamics live in the raw input). Base from P1 (uio[3]):
-      {P1,loud} 11 -> N=8 (mask 0xFF00), 01/10 -> N=6 (0xFC00),
-      00 -> N=4 (0xF000)
-    The distinguishing sample 0x7F73 maps to 0x7F00 / 0x7C00 / 0x7000
-    (N=6 is 0x7C00 = 0x7F73 & 0xFC00 — the plan line's 0x7FC0 is
-    unreachable through any AND mask, 0x73 bit 7 is clear).
-    Frame N's crush latch masks with the env value AFTER frame N-1's
-    update (env and crush_hold clock on the same sample_valid edge; a
-    freshly attacked env is visible only one frame later). Pinned by
-    the quiet probes: the 0x7F73 probe frame's own attack raises env to
-    ~19674 (loud), so a mask that wrongly used the post-update env
-    would give 0x7F00, not the expected quiet 0x7C00.
-    Per P1 setting, from reset (env provably 0 — the deepest silence):
-    100 loud frames of 0x7FFF re-raise env past 16384 (16383 after
-    frame 1, 24575 after frame 2, converges to 32766) — attack
-    re-raise after silence, Review Focus 4; 400 silent frames decay it
-    back below 16384 (to ~6721, crossed at ~frame 176); long silence
-    terminates at EXACTLY 0 (the release's 1-LSB floor — plain
-    env - (env>>>8) stalls anywhere below 256)."""
+async def test_dist_softknee(dut):
+    """Dist stage (en[2]), v2.2 task 4 (kept until v3 task 5's diode knee):
+    soft-knee piecewise-linear shaper on the stage input's magnitude —
+    unity below the knee, slope 1/2 above it (a soft ceiling in place of
+    the interim hard clip). Knee FIXED at T=8192 (soft ceiling 20479),
+    below the 16384 fuzz clip, so a stacked fuzz always feeds the shaped
+    region — param-free: the v2.2 P0 character bit (uio[2]) is retired
+    (P0 becomes the fuzz octave blend in task 4; uio[2] is trapped in
+    _unused). Fuzz is off here, so the shaper input is the raw sample —
+    sign kept, no rectify. Pinned exact points on the 8192 knee, both
+    signs, plus -32768 (mag saturates to 32767, then shapes and keeps
+    its sign)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0100_0000  # en[2] crush only; ui[3:1] = 0 (reserved)
+    dut.ui_in.value = 0b0000_1000  # en[2] dist only (ui[3]); ui[7] = 0 (reserved)
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    def env():
-        # internal envelope reg — RTL-only probe if the flat GL netlist
-        # drops the name (top-level names usually survive flattening; when
-        # present the asserts below stay active even in GL). None voids
-        # the env asserts; the depth-mask expectations asserted from the
-        # uio[1] DAC port below are the GL-visible coverage
-        e = getattr(dut.user_project, "env", None)
-        return None if e is None else int(e.value)
-
-    for p1 in (1, 0):
-        dut.uio_in.value = 0x08 if p1 else 0x00   # P1 = uio[3]
-        dut.rst_n.value = 0
-        await ClockCycles(dut.clk, 10)
-        dut.rst_n.value = 1
-
-        await _wait_left_start(dut)
-        assert env() in (None, 0), "env must reset to 0"
-
-        # 100 loud frames (0x7FFF). RX only listens in left halves, so
-        # each frame = one I2S drive (per-slot bits) + an exact 256-clk
-        # right-half skip; ui[0] sits at 0 between drives.
-        for _ in range(100):
-            await i2s_send_and_capture(dut, 0x7FFF << 8)
-            await ClockCycles(dut.clk, 256)
-        assert env() is None or env() >= 16384, "100 loud frames must attack env past 16384"
-
-        # loud probe: 0x7F73 in frame N, captured in frame N+1 (the
-        # one-frame I2S pipeline); the latch masked with env after the
-        # last 0x7FFF frame (32766 — loud)
-        await i2s_send_and_capture(dut, 0x7F73 << 8)
-        await ClockCycles(dut.clk, 256)
-        bits = await i2s_send_and_capture(dut, 0)
-        exp, got = (0x7F00 if p1 else 0x7C00), tx_data_bits(bits)
-        assert got == exp, f"P1={p1} loud: {got:#06x} != {exp:#06x}"
-
-        # 400 silent frames (the loud capture frame above drove the
-        # first): env releases below 16384 — the quiet probe's latch
-        # masks with env ~6721
-        await ClockCycles(dut.clk, 256)              # rest of capture frame
-        await ClockCycles(dut.clk, 512 * 399)        # 399 more silent frames
-        assert env() is None or env() < 16384, "400 silent frames must decay env below 16384"
-
-        # quiet probe: env_501 ~6721 masks the latch; env crosses back
-        # up only at the NEXT frame (the pinned one-frame lag)
-        await i2s_send_and_capture(dut, 0x7F73 << 8)
-        await ClockCycles(dut.clk, 256)
-        bits = await i2s_send_and_capture(dut, 0)
-        exp, got = (0x7C00 if p1 else 0x7000), tx_data_bits(bits)
-        assert got == exp, f"P1={p1} quiet: {got:#06x} != {exp:#06x}"
-
-    # termination, once after the loop — env's update logic is
-    # P1-independent (P1 only reads env through the mask mux), and both
-    # iterations leave env attacked to ~19674 by their final probe
-    # frame: release reaches exact 0 in 1258 frames; 1400 covers it
-    # with margin. The 1-LSB floor is what terminates it (plain
-    # env - (env>>>8) stalls anywhere below 256).
-    await ClockCycles(dut.clk, 256)              # rest of capture frame
-    await ClockCycles(dut.clk, 512 * 1400)
-    assert env() in (None, 0), "long silence must decay env to exactly 0"
-
-    # fix-round ruling pin (env source = pre-chain input): with
-    # fuzz+dist+crush stacked (en=0x7), the chain caps |s2| at 12288
-    # (fuzz clip 16384 -> dist ceiling 8192+4096), forever below the
-    # 16384 loud threshold — an s2-tracked envelope could never go
-    # loud in the full stack. 20 raw 0x7FFF frames drive env to 32766
-    # (an s2-tracked env would converge to 12288, quiet). The probe
-    # word 12000 stays under the fuzz clip so its chain output is
-    # off-grid: s2 = dist(12000) = 8192 + 3808/2 = 10096 = 0x2770;
-    # P1=0 loud -> N=6: 0x2770 & 0xFC00 = 0x2400 (an s2-tracked quiet
-    # N=4 would give 0x2000).
-    dut.ui_in.value = 0b0111_0000            # en[2:0] fuzz+dist+crush
-    dut.uio_in.value = 0x00                  # P1=0 (loud -> N=6)
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-    await _wait_left_start(dut)
-    for _ in range(20):
-        await i2s_send_and_capture(dut, 0x7FFF << 8)
-        await ClockCycles(dut.clk, 256)
-    assert env() is None or env() >= 16384, \
-        "raw-tracked env must go loud under the fuzz+dist ceiling"
-    await i2s_send_and_capture(dut, 12000 << 8)
-    await ClockCycles(dut.clk, 256)
-    bits = await i2s_send_and_capture(dut, 0)
-    got = tx_data_bits(bits)
-    assert got == 0x2400, f"stacked fuzz+dist+crush loud: {got:#06x} != 0x2400"
-
-
-@cocotb.test()
-async def test_dist_softknee(dut):
-    """Dist stage (en[1]), v2.2 task 4: soft-knee piecewise-linear
-    shaper on the stage input's magnitude — unity below the knee, slope
-    1/2 above it (a soft ceiling in place of the interim hard clip).
-    Knee T from the P0 character bit (uio[2]): 0 -> 8192 (soft ceiling
-    20479), 1 -> 4096 (ceiling 18431); both below the 16384 fuzz clip,
-    so a stacked fuzz always feeds the shaped region. Fuzz is off here,
-    so the shaper input is the raw sample — sign kept, no rectify.
-    Pinned exact points on both knees, both signs, plus -32768 (mag
-    saturates to 32767, then shapes and keeps its sign)."""
-    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
-    cocotb.start_soon(clock.start())
-    dut.ena.value = 1
-    dut.ui_in.value = 0b0010_0000  # en[1] dist only; ui[3:1] = 0 (reserved)
-    dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 10)
-    dut.rst_n.value = 1
-
-    async def dist_once(p0, word16):
-        dut.uio_in.value = 0x04 if p0 else 0x00  # P0 = uio[2]
+    async def dist_once(word16):
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
         await _wait_left_start(dut)
@@ -476,27 +357,22 @@ async def test_dist_softknee(dut):
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
-    # P0=0 (T=8192): sub-knee unity; above it T + (a-T)>>1
-    assert await dist_once(0, 4096) == 4096, "sub-knee must pass at unity"
-    assert await dist_once(0, 16384) == 12288    # 8192 + 8192/2
-    assert await dist_once(0, 32767) == 20479    # 8192 + 24575/2 = soft ceiling
-    assert await dist_once(0, -16384) == -12288  # sign reapplied
-    assert await dist_once(0, -32768) == -20479  # mag sat 32767 -> shape -> negate
-
-    # P0=1 (T=4096): same shape, lower knee (soft ceiling 18431)
-    assert await dist_once(1, 8192) == 6144      # 4096 + 4096/2
-    assert await dist_once(1, 16384) == 10240    # 4096 + 12288/2
-    assert await dist_once(1, 32767) == 18431    # 4096 + 28671/2 = soft ceiling
+    # T=8192: sub-knee unity; above it T + (a-T)>>1
+    assert await dist_once(4096) == 4096, "sub-knee must pass at unity"
+    assert await dist_once(16384) == 12288    # 8192 + 8192/2
+    assert await dist_once(32767) == 20479    # 8192 + 24575/2 = soft ceiling
+    assert await dist_once(-16384) == -12288  # sign reapplied
+    assert await dist_once(-32768) == -20479  # mag sat 32767 -> shape -> negate
 
 
 @cocotb.test()
 async def test_fuzz_rectify(dut):
-    """Fuzz stage (en[0]): full-wave rectifier + fixed clip at 16384 —
+    """Fuzz stage (en[1]): full-wave rectifier + fixed clip at 16384 —
     the v1 chain value (v2.2: fuzz gets no param bit)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0001_0000  # en[0] fuzz only; ui[3:1] = 0 (reserved)
+    dut.ui_in.value = 0b0000_0100  # en[1] fuzz only (ui[2]); ui[7] = 0 (reserved)
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -521,14 +397,14 @@ async def test_fuzz_rectify(dut):
 
 @cocotb.test()
 async def test_fuzz_dist_chain(dut):
-    """Fuzz + dist stacked (en = 0x3, P0=0): rectify, clip at 16384,
+    """Fuzz + dist stacked (en = 0x6, P0=0): rectify, clip at 16384,
     then the soft-knee shaper (T=8192, below the fuzz clip — the
     shaper always sees the clipped magnitude and shapes it). 10000
     pins the shaped branch reached without the fuzz clip."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b0011_0000  # en[1:0] fuzz + dist
+    dut.ui_in.value = 0b0000_1100  # en[2:1] fuzz + dist
     dut.uio_in.value = 0
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
@@ -550,45 +426,57 @@ async def test_fuzz_dist_chain(dut):
 
 @cocotb.test()
 async def test_tremolo(dut):
-    """Trem stage (en[3]): stepped-gain triangle LFO as built (v1) —
-    out = in >>> s, s = LFO gap >> 6 (gains 1, 1/2, 1/4, 1/8). v2.2
-    params on uio: P2=uio[4] rate, P3=uio[5] depth. The LFO counter
+    """Trem stage (en[4]): stepped-gain triangle LFO as built (v1) —
+    out = in >>> s, s = LFO gap >> 6 (gains 1, 1/2, 1/4, 1/8). v3 task 1
+    params: rate = 2-bit k = {uio[4], uio[3]} = {P2, P1} with the OLD
+    exp base 10 - k (k=0..3 -> half-period 2^(10-k) frames ->
+    ~23.4/46.9/93.75/187.5 Hz; task 2 re-bases the ladder to the
+    musical 2.9-23.4 Hz range). Depth span FIXED 255 (4 gain steps):
+    the v2.2 depth bit lived on uio[5], which is the Rev B PSRAM MISO
+    pin in the v3 map — span/rshift are constants now. The LFO counter
     value sampled by each output is the post-increment one; frame F's
     input is output in frame F+1 with count F+1 (validated against the
-    v1 k=7 sequence). 16 exact values across both P2 rates x both P3
-    depths, probed at the gain-step boundary counts, plus a sign probe
+    v1 k=7 sequence). 23 exact values across all four k rates, probed
+    at the gain-step boundary counts, plus a sign probe
     and a wrap/direction probe (v1 parity)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
-    dut.ui_in.value = 0b1000_0000  # en[3] trem only; ui[3:1] = 0 (reserved)
-    dut.uio_in.value = 0           # P2=0, P3=0 (k=0, span 255) — set per config below
+    dut.ui_in.value = 0b0010_0000  # en[4] trem only (ui[5]); ui[7] = 0 (reserved)
+    dut.uio_in.value = 0           # k=0 (uio[4:3] = 0) — set per config below
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    # (uio byte, probes) per P2 x P3 setting: uio[4]=P2 rate (k=0 ->
-    # 2^10-frame ramp/dir ~23.4 Hz, k=1 -> 2^9 ~46.9 Hz), uio[5]=P3
-    # depth (0 -> span 255 = 4 gain steps, 1 -> span 127 = 2 steps).
+    # (uio byte, probes) per rate k — v3: k = {uio[4], uio[3]}, so the
+    # uio byte is k << 3. Span fixed 255 (rs 8), OLD exp base 10 - k.
     # Each probe is (post-strobe LFO count, input x, expected output):
-    # out = x >>> (gap >> 6) with gap = ((cnt << rs) - cnt) >> exp
+    # out = x >>> (gap >> 6) with gap = ((cnt << 8) - cnt) >> exp
     # (falling) — counts chosen at the gain-step boundaries so the ramp
-    # arithmetic is pinned exactly (gap 63/64, 127/128, 191/192).
+    # arithmetic is pinned exactly (gap 63/64, 127/128, 191/192; k=3's
+    # 255*cnt >> 7 skips the even gaps, so its pairs pin the step
+    # edges). Wrap probes sample post-wrap count 0, rising (max gap
+    # 255 -> s=3).
     CONFIGS = [
-        # k=0, span 255 (rs 8, exp 10): boundary counts 257/258/515/772
+        # k=0 (exp 10): boundary counts 257/258/515/772
         (0x00, [(257, 16384, 16384), (258, 16384, 8192),
                 (515, 16384, 4096), (772, 16384, 2048)]),
-        # k=1, span 255 (rs 8, exp 9): boundaries 128/129/258/386, sign
-        # probe at 302, wrap probe at 512 (rising starts at max gap 255)
-        (0x10, [(128, 16384, 16384), (129, 16384, 8192),
+        # k=1 (exp 9): boundaries 128/129/258/386, sign probe at 302,
+        # wrap probe at 512 (rising starts at max gap 255)
+        (0x08, [(128, 16384, 16384), (129, 16384, 8192),
                 (258, 16384, 4096), (302, -16384, -4096),
                 (386, 16384, 2048), (512, 16384, 2048)]),
-        # k=0, span 127 (rs 7, exp 10): s=1 boundary at 516/517
-        (0x20, [(256, 16384, 16384), (516, 16384, 16384),
-                (517, 16384, 8192), (900, 16384, 8192)]),
-        # k=1, span 127 (rs 7, exp 9): s=1 boundary at 258/259
-        (0x30, [(128, 16384, 16384), (258, 16384, 16384),
-                (259, 16384, 8192), (450, 16384, 8192)]),
+        # k=2 (exp 8): boundaries 64/65/129/193, sign probe at 160,
+        # wrap probe at 256 (post-wrap count 0, rising, gap 255)
+        (0x10, [(64, 16384, 16384), (65, 16384, 8192),
+                (129, 16384, 4096), (160, -16384, -4096),
+                (193, 16384, 2048), (256, 16384, 2048)]),
+        # k=3 (exp 7): boundaries 32/33 (gap 63->65), 64/65 (127->129),
+        # 96/97 (191->193), wrap probe at 128 (count 0, rising, gap 255)
+        (0x18, [(32, 16384, 16384), (33, 16384, 8192),
+                (64, 16384, 8192), (65, 16384, 4096),
+                (96, 16384, 4096), (97, 16384, 2048),
+                (128, 16384, 2048)]),
     ]
 
     for uio_byte, probes in CONFIGS:
@@ -606,14 +494,18 @@ async def test_tremolo(dut):
 
 @cocotb.test()
 async def test_chain_enables(dut):
-    """Serial chain enable matrix (v2.2 task 3): ui[7:4] alone sets en
-    (amendment: DIP-direct, no preset ROM). For each stage:
+    """Serial chain enable matrix (v3 task 1): ui[6:1] alone sets en
+    (DIP-direct, no preset ROM). For each stage:
     ON applies its effect to known vectors (incl. -32768 — the output
     also proves every DOWNSTREAM stage passes bit-exact when disabled);
     with all en=0 the chain is bit-exact identity and +-32768 round-trip
-    (Review Focus 3: no disabled stage may corrupt the sample). Fuzz +
-    dist stacked feeds the shaper the clipped magnitude (both knees sit
-    below the fuzz clip; dist is the task-4 soft knee, P0=0)."""
+    (Review Focus 3: no disabled stage may corrupt the sample). The Rev A
+    identity-stub slots (comp en[0], phaser en[3], delay en[5]) must pass
+    +-full-scale bit-exact when enabled — the enable itself corrupts
+    nothing (comp gets its gain ladder in task 3; phaser/delay are Rev
+    B). Fuzz + dist stacked feeds the shaper the clipped magnitude (both
+    knees sit below the fuzz clip; dist is the v2.2 soft knee — v3 task
+    5 replaces it — P0=0)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -623,8 +515,8 @@ async def test_chain_enables(dut):
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def stage_once(en_nibble, word16):
-        dut.ui_in.value = en_nibble << 4      # ui[7:4] = en; ui[3:1] = 0 (reserved)
+    async def stage_once(en_val, word16):
+        dut.ui_in.value = en_val << 1        # ui[6:1] = en; ui[7] = 0 (reserved)
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
         await _wait_left_start(dut)
@@ -633,8 +525,8 @@ async def test_chain_enables(dut):
         return out - 0x10000 if out & 0x8000 else out
 
     # trem first (needs the LFO advanced from reset: gap >> 6 = 2 at
-    # post-strobe counts 600/603 on the k=0 / span-255 default params)
-    dut.ui_in.value = 0b1000_0000             # en[3] trem only
+    # post-strobe counts 600/603 on the k=0 / fixed-span-255 params)
+    dut.ui_in.value = 0b0010_0000             # en[4] trem only
     await _wait_left_start(dut)
     cur = 1
     cur, out = await _trem_probe(dut, cur, 600, 16384)
@@ -643,39 +535,34 @@ async def test_chain_enables(dut):
     assert out == -8192, f"trem ON: -32768 >>> 2, got {out}"
 
     # fuzz ON: rectify + clip 16384 (-32768 folds and clips; 5000 below)
-    assert await stage_once(0x1, -32768) == 16384
-    assert await stage_once(0x1, 5000) == 5000
+    assert await stage_once(0x2, -32768) == 16384
+    assert await stage_once(0x2, 5000) == 5000
 
     # dist ON: soft-knee PWL (P0=0, T=8192); 1234 pins the fuzz-off
     # pass-through exact (sub-knee unity), 20000 the shaped branch
-    assert await stage_once(0x2, -32768) == -20479
-    assert await stage_once(0x2, 1234) == 1234
-    assert await stage_once(0x2, 20000) == 14096
+    assert await stage_once(0x4, -32768) == -20479
+    assert await stage_once(0x4, 1234) == 1234
+    assert await stage_once(0x4, 20000) == 14096
 
-    # crush ON: auto-lofi depth (task 5) — the mask now follows env,
-    # so the vectors pin the state, not just the masking: the raw
-    # -32768 words driven in the fuzz/dist sections above attacked env
-    # (pre-chain tracked, fix-round ruling) to ~30.7k (>> 16384) and it
-    # decays only ~0.4%/frame, so the stage sits LOUD for these probes;
-    # P1=0 (uio_in=0 throughout this test) -> N=6 mask 0xFC00: 0x0FFF
-    # -> 0x0C00, and -32768 keeps its sign through the mask (0x8000).
-    # Depth transitions are pinned by test_autolofi_env; this stays
-    # the enable-matrix check.
-    # precondition for the crush vectors below: env must sit loud from the
-    # earlier -32768 attacks. Internal probe — RTL-only if the flat GL
-    # netlist drops the name (GL parity makes it moot: same inputs give
-    # the same env by construction)
-    _env = getattr(dut.user_project, "env", None)
-    assert _env is None or int(_env.value) >= 16384, \
-        "crush vectors require env loud (>= 16384; the -32768 attacks above)"
-    assert await stage_once(0x4, 0x0FFF) == 0x0C00
-    assert await stage_once(0x4, -32768) == -32768
+    # stub slots ON (comp en[0], phaser en[3], delay en[5] — Rev A
+    # identity stubs): each must pass its input bit-exact when enabled,
+    # through the stub slot AND every disabled stage (the old crush
+    # vectors' role in the matrix; the crush slot itself is gone). All
+    # three stubs stacked is identity too.
+    assert await stage_once(0x1, -32768) == -32768    # comp stub
+    assert await stage_once(0x1, 32767) == 32767
+    assert await stage_once(0x8, -32768) == -32768    # phaser stub
+    assert await stage_once(0x8, 32767) == 32767
+    assert await stage_once(0x20, -32768) == -32768   # delay stub
+    assert await stage_once(0x20, 32767) == 32767
+    assert await stage_once(0x29, -32768) == -32768   # comp+phaser+delay
+    assert await stage_once(0x29, 32767) == 32767
 
     # fuzz + dist stacked: rectify + clip 16384, then shape at the
     # 8192 knee (soft-knee dist replaces the v1 x3 tail)
-    assert await stage_once(0x3, -20000) == 12288
-    assert await stage_once(0x3, 5000) == 5000
-    assert await stage_once(0x3, 20000) == 12288
+    assert await stage_once(0x6, -20000) == 12288
+    assert await stage_once(0x6, 5000) == 5000
+    assert await stage_once(0x6, 20000) == 12288
 
     # all stages OFF: bit-exact identity, +-full-scale through
     assert await stage_once(0x0, 32767) == 32767
@@ -688,7 +575,7 @@ async def test_clip_dp(dut):
     hit = (effect_sample == 0x7FFF) || (effect_sample == 0x8000)
     (0x7FFF = 0_111111111111111, 0x8000 = 1_000000000000000 — bitwise
     complements, so no single equality covers both), evaluated once per
-    output frame on sample_valid — the same edge env/crush_hold clock
+    output frame on sample_valid — the same edge env clocks
     on, one clk after the strobe latched the frame's input, so the
     compare sees exactly the value the TX shift sends for the frame
     (en=0 here: effect_sample IS sample_in). Hold: a hit lights dp_q

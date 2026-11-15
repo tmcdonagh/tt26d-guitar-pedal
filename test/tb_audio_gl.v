@@ -32,14 +32,15 @@
 //       $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v \
 //       gate_level_netlist.v
 // Run (per mode, same plusargs as the RTL build):
-//   vvp sim_audio_gl.vvp +EN=2 +PARAMS=1 +N=2818048 +OUT=audio_out_gl/distX.hex
+//   vvp sim_audio_gl.vvp +EN=2 +PARAMS=1 +N=2818048 +OUT=audio_out_gl/fuzzoct.hex
 // Input:  audio_in.hex (one 16-bit sample per line)
 // Output: one 16-bit sample per frame on stdout (captured per-mode by the
 //         .log file in audio_out_gl/), converted to .wav by wav_tool.py
 //
 // +EN/+PARAMS/+N interface and ui/uio byte layout: identical to tb_audio.v
-// (ui[7:4]=enables en[0]=fuzz..en[3]=trem, ui[3:1]=reserved driven 0,
-// ui[0]=ADC data; P3..P0 on uio[5:2]).
+// (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=reserved driven 0,
+// ui[0]=ADC data; P0..P2 on uio[4:2] — P0=bit0=uio[2], P1=uio[3], P2=uio[4]
+// — and uio[5]=reserved Rev B MISO, driven 0).
 
 `timescale 1ps/1ps
 
@@ -94,8 +95,8 @@ module tb_audio_gl;
     dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("PARAMS=%d", params);
     dummy = $value$plusargs("N=%d", n_in);
-    ui_in[7:1] = {en_dip[3:0], 3'b000};       // ui[7:4]=enables, ui[3:1]=reserved (driven 0)
-    uio_in     = {2'b00, params[3:0], 2'b00}; // P3..P0 on uio[5:2]
+    ui_in[7:1] = {1'b0, en_dip[5:0]};           // ui[6:1]=enables en[5:0], ui[7]=reserved (driven 0)
+    uio_in     = {3'b000, params[2:0], 2'b00};  // P0..P2 on uio[4:2] (P0=bit0=uio[2])
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus

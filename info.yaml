@@ -3,12 +3,12 @@ project:
   title:        "Silicon Guitar Pedal"        # Project title
   author:       "Thomas McDonagh"      # Your name
   discord:      "dedicatedhippo"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "I2S serial-effect guitar pedal (fuzz, distortion, bitcrush, tremolo) with DIP-switch enables; true bypass is wired externally via a 3PDT switch" # One line description of what your project does
+  description:  "I2S serial-effect guitar pedal — 6-slot chain comp, fuzz, distortion, phaser, trem, delay (Rev A: comp/phaser/delay are identity stubs) with DIP-switch enables on ui[6:1]; true bypass is wired externally via a 3PDT switch" # One line description of what your project does
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     24576000       # Clock frequency in Hz (or 0 if not applicable)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
-  tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
+  tiles: "2x2"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
   top_module:  "tt_um_tmcdonagh_guitar_pedal"
@@ -24,31 +24,31 @@ project:
 pinout:
   # Inputs
   ui[0]: "I2S ADC data in"
-  ui[1]: "Reserved (v3)"
-  ui[2]: "Reserved (v3)"
-  ui[3]: "Reserved (v3)"
-  ui[4]: "Enable: fuzz"
-  ui[5]: "Enable: distortion"
-  ui[6]: "Enable: crush"
-  ui[7]: "Enable: tremolo"
+  ui[1]: "Enable: comp"
+  ui[2]: "Enable: fuzz"
+  ui[3]: "Enable: dist"
+  ui[4]: "Enable: phaser"
+  ui[5]: "Enable: trem"
+  ui[6]: "Enable: delay"
+  ui[7]: "Reserved (Rev B: delay character)"
 
   # Outputs
-  uo[0]: "Reserved (v3)"
-  uo[1]: "Reserved (v3)"
-  uo[2]: "Reserved (v3)"
-  uo[3]: "Reserved (v3)"
-  uo[4]: "Reserved (v3)"
-  uo[5]: "Reserved (v3)"
-  uo[6]: "Reserved (v3)"
+  uo[0]: "Reserved (Rev B SPI)"
+  uo[1]: "Reserved (Rev B SPI)"
+  uo[2]: "Reserved (Rev B SPI)"
+  uo[3]: "Reserved (Rev B)"
+  uo[4]: "Reserved (Rev B)"
+  uo[5]: "Reserved (Rev B)"
+  uo[6]: "Reserved (Rev B)"
   uo[7]: "dp = clip LED (peak hold ~43 ms)"
 
   # Bidirectional pins
   uio[0]: "MCLK (24.576 MHz output)"
   uio[1]: "I2S DAC data out"
-  uio[2]: "Param P0: distortion character"
-  uio[3]: "Param P1: crush base depth"
-  uio[4]: "Param P2: tremolo rate"
-  uio[5]: "Param P3: tremolo depth"
+  uio[2]: "Param P0"
+  uio[3]: "Param P1"
+  uio[4]: "Param P2"
+  uio[5]: "Reserved (Rev B: PSRAM MISO)"
   uio[6]: "I2S BCLK (master, 3.072 MHz)"
   uio[7]: "I2S LRCLK/WS (master, 48 kHz)"
 

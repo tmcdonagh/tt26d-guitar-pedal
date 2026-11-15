@@ -2,15 +2,18 @@
  * Copyright (c) 2026 Thomas McDonagh
  * SPDX-License-Identifier: Apache-2.0
  *
- * Silicon Guitar Pedal — multi-effect DSP core.
- * I2S master in/out (codec-agnostic), serial effect chain fuzz ->
- * distortion -> bitcrusher -> tremolo with per-stage enable bypass
- * (v2.2: ring mod, test tone, and the v1 8-way mode mux retired).
- * Enables: DIP switches direct on ui[7:4] (v2.2 amendment: the EC11
- * encoder/preset ROM, 7-seg digit, and stomp bypass are dropped;
- * ui[3:1] and uo[6:0] are reserved for the 2x2 v3 project, and true
- * bypass is wired externally with a 3PDT switch). Params P3..P0 on
- * uio[5:2]; uo[7] = dp clip LED.
+ * Silicon Guitar Pedal — multi-effect DSP core (v3: 2x2 silicon
+ * pedalboard, Rev A). I2S master in/out (codec-agnostic), serial
+ * effect chain comp -> fuzz -> distortion -> phaser -> trem -> delay
+ * with per-stage enable bypass (task 1: comp, phaser, and delay are
+ * identity stubs; the v2.2 crush slot is removed, its envelope
+ * follower retained as the shared dynamics source).
+ * Enables: DIP switches direct on ui[6:1] (en[0]=comp .. en[5]=delay,
+ * bit order = chain order); ui[7] reserved (Rev B delay character).
+ * Params on uio[4:2]: P0=uio[2] (fuzz octave blend, task 4 — trapped
+ * in _unused until then), P1/P2 =
+ * trem rate bits {uio[4], uio[3]}; uio[5] reserved (Rev B PSRAM MISO).
+ * uo[7] = dp clip LED; uo[6:0] driven 0 (uo[2:0] reserved Rev B SPI).
  * See docs/info.md and the spec in the ai-dev-archive.
  */
 
@@ -74,23 +77,31 @@ module tt_um_tmcdonagh_guitar_pedal (
   end
 
   // ------------------------------------------------------------------
-  // Effect chain + enables (v2.2 amendment): serial fuzz -> dist ->
-  // crush -> trem, enable-bypass per stage, en bit order = chain order
-  // (en[0]=fuzz, en[1]=dist, en[2]=crush, en[3]=trem) — now DIP
-  // switches direct on ui[7:4]. The panel control plane (EC11 encoder,
-  // preset ROM, 7-seg digit, latching stomp bypass) was dropped;
-  // ui[3:1] are unused inputs (reserved for the v3 project) and bypass
-  // is true bypass, wired externally with a 3PDT switch around the
-  // pedal (all-off DIP = "digital clean": audio still runs through
-  // the ADC -> identity chain -> DAC, a distinct mode from true bypass).
+  // Effect chain + enables (v3 task 1, 2x2 Rev A): serial comp ->
+  // fuzz -> dist -> phaser -> trem -> delay, enable-bypass per stage,
+  // en bit order = chain order (en[0]=comp .. en[5]=delay) — DIP
+  // switches direct on ui[6:1] (ui[7] reserved, Rev B delay char).
+  // Bypass stays true bypass, wired externally with a 3PDT switch
+  // around the pedal (all-off DIP = "digital clean": audio still runs
+  // through the ADC -> identity chain -> DAC, a distinct mode from
+  // true bypass). Comp, phaser, and delay are identity stubs this
+  // task (comp: task 3 gain ladder; phaser/delay: Rev B).
   // ------------------------------------------------------------------
-  wire [3:0] en = ui_in[7:4];
+  wire [5:0] en = ui_in[6:1];
 
   wire [15:0] s0 = sample_in;
 
   // ------------------------------------------------------------------
-  // Stage 1 — octave fuzz: full-wave rectifier + fixed clip at 16384
-  // (the v1 chain value; v2.2 gives fuzz no param bit).
+  // Stage 1 — compressor: identity stub (task 3 fills this slot with
+  // the env-driven gain ladder; the enable is a no-op until then).
+  // ------------------------------------------------------------------
+  wire [15:0] comp_out = s0;   // v3 task 3
+
+  wire [15:0] s1 = en[0] ? comp_out : s0;
+
+  // ------------------------------------------------------------------
+  // Stage 2 — octave fuzz: full-wave rectifier + fixed clip at 16384
+  // (the v1 chain value; the v3 octave blend bit P0 arrives in task 4).
   // ------------------------------------------------------------------
   wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
                     : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
@@ -98,26 +109,29 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] fuzz_t   = 16'd16384;
   wire [15:0] fuzz_out = (mag > fuzz_t) ? fuzz_t : mag;
 
-  wire [15:0] s1 = en[0] ? fuzz_out : s0;
+  wire [15:0] s2 = en[1] ? fuzz_out : s1;
 
   // ------------------------------------------------------------------
-  // Stage 2 — distortion (v2.2 task 4): soft-knee piecewise-linear
+  // Stage 3 — distortion (v2.2 task 4, kept until v3 task 5's diode
+  // knee): soft-knee piecewise-linear
   // shaper on the stage input's magnitude — unity below the knee, slope
   // 1/2 above it (a soft ceiling in place of the interim hard clip).
-  // Knee from the P0 character bit (uio[2]): 0 -> 8192 (soft ceiling
-  // 20479), 1 -> 4096 (ceiling 18431); both below the 16384 fuzz clip,
-  // so a stacked fuzz always feeds the shaped region. No multipliers —
-  // subtract + shift only.
+  // Knee FIXED at T = 8192 (soft ceiling 20479), below the 16384 fuzz
+  // clip, so a stacked fuzz always feeds the shaped region. No
+  // multipliers — subtract + shift only. Param note: the v2.2 P0
+  // character bit (uio[2], knee 4096/8192) is retired — uio[2] is P0 =
+  // fuzz octave blend from task 4 (trapped in _unused), and task 5
+  // replaces this block with the param-free diode PWL.
   // ------------------------------------------------------------------
   // Shaper input magnitude, shared from the chain (area trim (b)):
-  // s1 = fuzz_out when fuzz is on — already a non-negative magnitude
+  // s2 = fuzz_out when fuzz is on — already a non-negative magnitude
   // clamped to [0, 16384], so never the 0x8000 saturation edge — and
-  // sample_in otherwise, whose saturating |x| IS the stage-1 mag wire.
-  // Value-equal to saturating |s1| in every reachable state; sharing
+  // sample_in otherwise, whose saturating |x| IS the stage-2 mag wire.
+  // Value-equal to saturating |s2| in every reachable state; sharing
   // drops a second |x| block (comparator + negater + muxes).
-  wire [15:0] dist_mag = en[0] ? fuzz_out : mag;
+  wire [15:0] dist_mag = en[1] ? fuzz_out : mag;
 
-  wire [15:0] dist_t = uio_in[2] ? 16'd4096 : 16'd8192;
+  wire [15:0] dist_t = 16'd8192;
 
   // a <= T: out = a (slope 1);  a > T: out = T + ((a - T) >> 1)
   // (a - T >= 1 in the shaped branch, so the shift is exact)
@@ -129,37 +143,33 @@ module tt_um_tmcdonagh_guitar_pedal (
   // kept per the saturating-arithmetic convention)
   wire [16:0] dist_neg = 17'd0 - {1'b0, dist_pw};
   wire dist_neg_ovf = (dist_neg[16] != dist_neg[15]);
-  wire [15:0] dist_out = s1[15] ? (dist_neg_ovf ? 16'h8000 : dist_neg[15:0])
+  wire [15:0] dist_out = s2[15] ? (dist_neg_ovf ? 16'h8000 : dist_neg[15:0])
                                 : dist_pw;
 
-  wire [15:0] s2 = en[1] ? dist_out : s1;
+  wire [15:0] s3 = en[2] ? dist_out : s2;
 
   // ------------------------------------------------------------------
-  // Stage 3 — auto-lofi bitcrusher (v2.2 task 5): quantize depth N
-  // follows the envelope — quiet passages get crunchier. Peak-ish
-  // envelope follower, one update per audio frame on sample_valid —
-  // the same enable pattern as crush_hold, so env is always warm the
-  // moment the stage switches on. env tracks the PRE-CHAIN input
-  // magnitude (mag, stage 1's saturating |sample_in|; fix-round
-  // ruling): on |s2| the fuzz clip (16384) + dist ceiling cap the
-  // envelope below the loud threshold in stacked chains, pinning the
-  // full stack coarse regardless of playing dynamics — the player's
-  // dynamics live in the raw input. Standalone crush is unchanged
-  // (s2 == sample_in with fuzz/dist off):
+  // Stage 4 — phaser: identity stub (Rev B allpass stack; the enable
+  // is a no-op in Rev A).
+  // ------------------------------------------------------------------
+  wire [15:0] phaser_out = s3;   // Rev B
+
+  wire [15:0] s4 = en[3] ? phaser_out : s3;
+
+  // ------------------------------------------------------------------
+  // Shared dynamics source (v3): the v2.2 auto-lofi envelope follower,
+  // retained after the crush slot's removal — the comp gain ladder
+  // (task 3) and the fuzz bias (task 4) read it. 16-bit envelope of
+  // the PRE-CHAIN input magnitude (mag, stage 2's saturating
+  // |sample_in|; fix-round ruling — the player's dynamics live in the
+  // raw input):
   //   attack (mag > env): env <= (env + mag) >>> 1   — 17-bit add,
   //     >> 1 back to 16; halves the gap, ~12 frames to converge;
   //   release: env <= env - (env>>>8) - (env != 0)   — tau ~256 frames
   //     ~5.3 ms; the 1-LSB floor makes the decay terminate at exactly
   //     0 (the plain subtract-shift stalls anywhere below 256).
-  // loud = |env[15:14]| (env >= 16384). env tops out at 32766 — env[15]
-  // never sets, so a reduction-& here would pin the stage quiet
-  // forever; | is the threshold the pinned test values require.
-  // Depth {P1 = uio[3], loud}: 11 -> N=8 (mask FF00, 8 bits kept),
-  // 01/10 -> N=6 (FC00, 6 bits), 00 -> N=4 (F000, 4 bits).
-  // Frame timing: env and crush_hold clock on the SAME sample_valid
-  // edge, so frame N's latch masks with the env value after frame
-  // N-1's update — a sample's own magnitude never sets its own depth
-  // (one-frame env lag, pinned by test_autolofi_env's quiet probes).
+  // env tops out at 32766 — env[15] never sets. One update per audio
+  // frame on sample_valid. Feeds nothing yet (trapped in _unused).
   // ------------------------------------------------------------------
   reg  [15:0] env;
   wire [16:0] env_atk = {1'b0, env} + {1'b0, mag};       // 17-bit env+mag
@@ -180,36 +190,24 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  wire loud = |env[15:14];                            // env >= 16384
-
-  wire [1:0]  crush_sel  = {uio_in[3], loud};
-  wire [15:0] crush_mask = crush_sel == 2'b11 ? 16'hFF00 :  // {11}: N=8
-                           crush_sel != 2'b00 ? 16'hFC00 :  // {01,10}: N=6
-                                               16'hF000;    // {00}: N=4
-
-  wire [15:0] crushed = s2 & crush_mask;
-
-  reg [15:0] crush_hold;
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)            crush_hold <= 16'd0;
-    else if (sample_valid) crush_hold <= crushed;
-  end
-
-  wire [15:0] s3 = en[2] ? crush_hold : s2;
-
   // ------------------------------------------------------------------
-  // Stage 4 — tremolo: stepped-gain tremolo as built (v1): out =
+  // Stage 5 — tremolo: stepped-gain tremolo as built (v1): out =
   // in >>> s with gain steps 1, 1/2, 1/4, 1/8, s = LFO gap >> 6
-  // (gap = distance from full gain), triangle LFO. v2.2 params: rate
-  // P2 = uio[4] (k=0 -> ramp 2^10 frames per direction ~23.4 Hz,
-  // k=1 -> 2^9 ~46.9 Hz); depth P3 = uio[5] (0 -> span 255 = 4 steps,
-  // 1 -> span 127 = 2 steps).
+  // (gap = distance from full gain), triangle LFO. v3 rate bits:
+  // k = {uio[4], uio[3]} = {P2, P1} (0..3) with the OLD v2.2 exp base
+  // 10 - k (k=0..3 -> 2^(10-k)-frame half-periods ~
+  // 23.4/46.9/93.75/187.5 Hz; task 2 re-bases to 13 and widens the
+  // counter for the musical 2.9-23.4 Hz ladder). Depth span FIXED
+  // 255 = 4 gain steps: the v2.2 depth bit lived on uio[5], which is
+  // the Rev B PSRAM MISO pin in the v3 map — leaving it wired would
+  // let the reserved pin control trem depth, so span/rshift are
+  // constants now.
   // ------------------------------------------------------------------
-  wire [2:0] trem_k   = uio_in[4] ? 3'd1 : 3'd0;
-  wire [3:0] trem_exp = 4'd10 - {1'b0, trem_k};
+  wire [1:0] trem_k   = {uio_in[4], uio_in[3]};
+  wire [3:0] trem_exp = 4'd10 - {2'b00, trem_k};
 
-  wire [7:0] trem_span = uio_in[5] ? 8'd127 : 8'd255;
-  wire [3:0] trem_rshift = uio_in[5] ? 4'd7 : 4'd8;  // span = 2^rshift - 1
+  wire [7:0] trem_span   = 8'd255;  // constant (see above)
+  wire [3:0] trem_rshift = 4'd8;    // span = 2^rshift - 1
 
   reg  [10:0] trem_cnt;
   reg         trem_dir;   // 0 = falling (gain down), 1 = rising
@@ -230,16 +228,24 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [18:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {11'd0, trem_cnt};
   wire [7:0]  trem_gap = trem_dir ? (trem_span - (trem_ramp >> trem_exp))
                                   : (trem_ramp >> trem_exp);
-  wire [15:0] trem_out = $signed(s3) >>> (trem_gap >> 6);
+  wire [15:0] trem_out = $signed(s4) >>> (trem_gap >> 6);
 
-  wire [15:0] s4 = en[3] ? trem_out : s3;
+  wire [15:0] s5 = en[4] ? trem_out : s4;
+
+  // ------------------------------------------------------------------
+  // Stage 6 — delay/chorus: identity stub (Rev B QSPI-PSRAM block;
+  // the enable is a no-op in Rev A).
+  // ------------------------------------------------------------------
+  wire [15:0] delay_out = s5;   // Rev B
+
+  wire [15:0] s6 = en[5] ? delay_out : s5;
 
   // ------------------------------------------------------------------
   // Chain output (name kept from v1: the audio tooling probes
   // dut.effect_sample).
   // ------------------------------------------------------------------
   reg [15:0] effect_sample;
-  always @* effect_sample = s4;
+  always @* effect_sample = s6;
 
   // ------------------------------------------------------------------
   // I2S transmit: uio_out[1], MSB first. Loaded at slot 0 and slot 32
@@ -272,12 +278,10 @@ module tt_um_tmcdonagh_guitar_pedal (
   //   x[15]=0 -> &x[14:0]  (x == 0x7FFF)
   //   x[15]=1 -> ~|x[14:0] (x == 0x8000)
   // The compare is evaluated once per output frame on sample_valid —
-  // the same edge env and crush_hold clock on, one clk after the
-  // strobe latched the frame's input — so the detect sees each
-  // transmitted sample exactly once (bypass and the comb stages: the
-  // very value the TX shift sends next frame; crush's hold register
-  // contributes its usual one-frame lag when enabled — the same phase
-  // the env mask already pins). Hold: a hit lights dp_q and reloads
+  // the same edge env clocks on, one clk after the strobe latched the
+  // frame's input — so the detect sees each transmitted sample exactly
+  // once (bypass and the comb stages: the very value the TX shift
+  // sends next frame). Hold: a hit lights dp_q and reloads
   // the 11-bit counter to 0; otherwise, while lit, the counter runs up
   // to 2047 and clears dp_q on the edge it wraps (2047 + 1 = 0 in 11
   // bits, so the terminal state needs no separate reset path). A hit
@@ -304,16 +308,21 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  assign uo_out  = {dp_q, 7'b000_0000}; // uo[7] = dp clip LED (peak-hold); uo[6:0] reserved for v3, driven 0
+  assign uo_out  = {dp_q, 7'b000_0000}; // uo[7] = dp clip LED (peak-hold); uo[6:3] reserved Rev B, uo[2:0] Rev B SPI — all driven 0
 
   assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
-  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P3..P0)
+  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P2..P0 + reserved Rev B MISO on uio[5])
 
   // List all unused inputs to prevent warnings
-  // (uio[5:2] = params P3..P0, all live after task 5; uio[7:6]/[1:0] are
-  // clock/data outputs, their input side is unused; ui[3:1] reserved
-  // for v3, unconnected after the panel was dropped)
-  wire _unused = &{ena, ui_in[3:1], uio_in[7:6], uio_in[1:0], 1'b0};
+  // (uio[4:3] = trem rate bits are live, as are ui[6:1] = enables and
+  // ui[0] = ADC data; uio[7:6]/[1:0] are clock/data outputs, their
+  // input side is unused; ui[7] = Rev B delay char, uio[5] = Rev B
+  // PSRAM MISO, and uio[2] = P0 (fuzz octave blend, task 4) are
+  // reserved/param inputs with no reader yet. env is the retained
+  // shared dynamics source — no reader until tasks 3/4, so it is
+  // trapped here too)
+  wire _unused = &{ena, ui_in[7], uio_in[5], uio_in[2], uio_in[7:6],
+                   uio_in[1:0], env, 1'b0};
 
 endmodule
 

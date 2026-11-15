@@ -21,7 +21,7 @@ input-edge-determined, so no tolerance is expected.
 ## Modes (SIM env var)
 
 - `SIM=glvl` — **Verilator GL: the default for parity work** (minutes per
-  full 10-mode pass). Compiles the same FUNCTIONAL cell models to C++.
+  full 9-mode pass). Compiles the same FUNCTIONAL cell models to C++.
   Requires two build-time pieces created for this (see `glvl_stub.v` and
   `wav_tool.py glvl_make_lib()`): behavioral models for the primitives.v
   UDPs (Verilator cannot compile UDPs; all 17 transcribed from their
@@ -49,7 +49,7 @@ iverilog -g2012 -s tb_audio_gl -DGL_TEST -DFUNCTIONAL -DUSE_POWER_PINS -DSIM \
 
 Print it without running anything (dry run): `python3 wav_tool.py gl-cmd`.
 
-## 2. Run all 10 modes
+## 2. Run all 9 modes
 
 Everything below is wrapped in `wav_tool.py`:
 
@@ -60,12 +60,12 @@ SIM=gl python3 wav_tool.py run       # builds sim_audio_gl.vvp, runs all modes,
                                      # writes audio_out_gl/{mode}.{log,wav}
 ```
 
-Modes run in parallel (10 `vvp` processes), same as the RTL pass. Manual
+Modes run in parallel (9 `vvp` processes), same as the RTL pass. Manual
 equivalent for one mode:
 
 ```sh
-vvp sim_audio_gl.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out_gl/distX.hex \
-  > audio_out_gl/distX.log
+vvp sim_audio_gl.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out_gl/fuzzoct.hex \
+  > audio_out_gl/fuzzoct.log
 ```
 
 (see `wav_tool.py` `MODES` for every mode's `en`/`params` pair).
@@ -83,7 +83,7 @@ PASS/FAIL per mode. Manual equivalent (wave-payload diff):
 ```sh
 python3 - <<'EOF'
 import wave
-for m in "bypass fuzz dist distX crush crushQ trem tremS fuzzdist all4".split():
+for m in "bypass comp fuzz fuzzoct dist trem tremF fuzzdist all4".split():
     a = wave.open(f"audio_out/{m}.wav"); b = wave.open(f"audio_out_gl/{m}.wav")
     print(m, a.readframes(a.getnframes()) == b.readframes(b.getnframes()))
 EOF

@@ -5,13 +5,12 @@
 // 16-bit samples through the real I2S input pins and writes one output
 // sample per frame. Runs entirely inside Icarus — ~30 s per mode.
 //
-// v2.2 task 3 byte layout: this tb drives the DIP effect enables on
-// ui[7:4] (+EN=, 0..15: bit order = chain order, en[0]=fuzz..en[3]=trem)
-// and the params on uio[5:2] (+PARAMS=, P3..P0: P2=trem rate, P3=trem
-// depth, P0=dist knee, P1=crush depth base — all live as of task 5).
-// ui[3:1] are reserved (v3) and stay 0 — en comes from the DIP byte
-// alone; ui[0] is still the per-slot ADC data bit, assigned separately
-// below.
+// v3 task 1 byte layout: this tb drives the effect enables on ui[6:1]
+// (+EN=, 0..63: bit order = chain order, en[0]=comp..en[5]=delay; ui[7]
+// is reserved, Rev B delay char — driven 0) and the params on uio[4:2]
+// (+PARAMS=, 0..7: P0=bit0 on uio[2], P1=bit1 on uio[3], P2=bit2 on
+// uio[4]; uio[5] is reserved, Rev B PSRAM MISO — driven 0).
+// ui[0] is still the per-slot ADC data bit, assigned separately below.
 //
 // Compile (icarus; ../src/*.v picks up the top module and its sources):
 //   $ iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/*.v
@@ -22,7 +21,7 @@
 //   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
 //       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-MULTITOP tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
-//   vvp sim_audio.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out/distX.hex
+//   vvp sim_audio.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out/fuzzoct.hex
 // Input:  audio_in.hex (one 16-bit sample per line, from audio_in.wav)
 // Output: $OUT, one 16-bit sample per frame
 
@@ -63,8 +62,8 @@ module tb_audio;
     dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("PARAMS=%d", params);
     dummy = $value$plusargs("N=%d", n_in);
-    ui_in[7:1] = {en_dip[3:0], 3'b000};       // ui[7:4]=enables, ui[3:1]=reserved (driven 0)
-    uio_in     = {2'b00, params[3:0], 2'b00}; // P3..P0 on uio[5:2]
+    ui_in[7:1] = {1'b0, en_dip[5:0]};           // ui[6:1]=enables en[5:0], ui[7]=reserved (driven 0)
+    uio_in     = {3'b000, params[2:0], 2'b00};  // P0..P2 on uio[4:2] (P0=bit0=uio[2])
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus

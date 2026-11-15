@@ -19,38 +19,40 @@ contract). All arithmetic is 16-bit saturating.
 Each received sample is latched once per frame (48 kHz) and runs through a
 serial effect chain — a disabled stage passes its input through bit-exactly:
 
-**fuzz → distortion → crush → tremolo**
+**comp → fuzz → distortion → phaser → trem → delay**
 
-- **Octave fuzz** (`en[0]`): full-wave rectifier (octave doubler) with
+- **Comp** (`en[0]`): compressor slot — Rev A identity stub for now (the
+  envelope-driven gain ladder lands with Rev A); enable is a no-op.
+- **Octave fuzz** (`en[1]`): full-wave rectifier (octave doubler) with
   saturating |x| (−32768 folds to +32767) and a fixed clip at 16384. The
-  output is always non-negative; fuzz has no param bit.
-- **Distortion** (`en[1]`): soft-knee piecewise-linear shaper on the stage
+  output is always non-negative; fuzz has no param bit yet (P0 octave
+  blend is a Rev A addition).
+- **Distortion** (`en[2]`): soft-knee piecewise-linear shaper on the stage
   input's magnitude — unity below the knee T, slope 1/2 above it
-  (out = T + (a−T)/2), original sign reapplied. P0 picks the knee:
-  T = 8192 (soft ceiling 20479) or T = 4096 (ceiling 18431). Both knees sit
-  below the fuzz clip ceiling (16384), so a stacked fuzz works the shaper
+  (out = T + (a−T)/2), original sign reapplied. Knee fixed at
+  T = 8192 (soft ceiling 20479) — the v2.2 character bit is retired
+  (P0 becomes the fuzz octave blend later in Rev A). The knee sits below
+  the fuzz clip ceiling (16384), so a stacked fuzz works the shaper
   across its knee.
-- **Crush** (`en[2]`): auto-lofi bitcrusher — the quantize depth follows the
-  input envelope, so quiet passages get crunchier. The envelope tracks the
-  pre-chain input magnitude: attack env ← (env+mag)/2, release
-  env ← env − env/256 − 1 (~256-frame ≈ 5.3 ms release, decaying to exactly
-  0); loud = env ≥ 16384. The depth pair {P1, loud} picks how many bits are
-  kept: 11 → 8 bits (mask 0xFF00), 01/10 → 6 bits (0xFC00), 00 → 4 bits
-  (0xF000) — the sign bit survives the mask. The depth lags the envelope by
-  exactly one frame (a sample's own magnitude never sets its own depth).
-- **Tremolo** (`en[3]`): stepped-gain tremolo — out = in >> s with the gain
-  step s driven by a triangle LFO (s = LFO gap >> 6). P2 sets the rate
-  (~23.4 Hz / ~46.9 Hz), P3 the depth span (gains 1, 1/2, 1/4, 1/8 =
-  0/−6/−12/−18 dB, or 1, 1/2 = 0/−6 dB).
+- **Phaser** (`en[3]`): Rev B stub — enable is a no-op (identity).
+- **Tremolo** (`en[4]`): stepped-gain tremolo — out = in >> s with the gain
+  step s driven by a triangle LFO (s = LFO gap >> 6). The P1..P2 bits on
+  `uio[4:3]` set the rate (four steps); the depth span is fixed (gains
+  1, 1/2, 1/4, 1/8 = 0/−6/−12/−18 dB).
+- **Delay** (`en[5]`): Rev B stub (QSPI PSRAM) — enable is a no-op
+  (identity).
 
-Fuzz and distortion are pure functions of the latched sample; the crush
-depth and tremolo gain follow per-frame state (envelope / LFO).
+Fuzz and distortion are pure functions of the latched sample; the tremolo
+gain follows per-frame LFO state. (The v2.2 crush envelope follower is
+retained internally as the shared dynamics source for the Rev A
+compressor.)
 
 **Controls.** The effect enables are DIP switches wired **directly** to
-`ui[7:4]` — bit order = chain order (`ui[4]`=fuzz, `ui[5]`=distortion,
-`ui[6]`=crush, `ui[7]`=tremolo), no internal preset logic:
+`ui[6:1]` — bit order = chain order (`ui[1]`=comp, `ui[2]`=fuzz,
+`ui[3]`=distortion, `ui[4]`=phaser, `ui[5]`=tremolo, `ui[6]`=delay), no
+internal preset logic:
 
-`en = ui[7:4]`
+`en = ui[6:1]`
 
 With every DIP switch off the pedal is in its **digital clean** mode: audio
 still runs through the ADC, the (all-disabled, bit-exact identity) chain,
@@ -70,13 +72,14 @@ needs no power and adds no conversion.
 the output sample hits full scale (0x7FFF or −32768) and holds ~43 ms
 (2048 frames), so short clips are visible.
 
-**Reserved pins.** `ui[3:1]` and `uo[6:0]` are unused by this design and
-reserved for the 2×2-tile v3 project; the reserved outputs are driven 0.
+**Reserved pins.** `ui[7]` (Rev B delay character), `uio[5]` (Rev B PSRAM
+MISO), and `uo[6:0]` are unused by this design (`uo[2:0]` are the Rev B
+SPI pins); the reserved outputs are driven 0.
 
-**Params** — one character bit per effect, P3..P0 on `uio[5:2]` (tables
-below).
+**Params** — P0..P2 on `uio[4:2]` (tables below); `uio[5]` is reserved for
+the Rev B PSRAM MISO line.
 
-Distortion knee constants, crush envelope shifts, and tremolo rates are
+Distortion knee constants and tremolo rates are
 provisional — tuned by listening session.
 
 ## Signal table
@@ -84,63 +87,66 @@ provisional — tuned by listening session.
 | Pin | Dir | Function |
 |-----|-----|----------|
 | ui[0] | in | I2S ADC data in |
-| ui[1] | in | Reserved (v3) |
-| ui[2] | in | Reserved (v3) |
-| ui[3] | in | Reserved (v3) |
-| ui[4] | in | Enable: fuzz |
-| ui[5] | in | Enable: distortion |
-| ui[6] | in | Enable: crush |
-| ui[7] | in | Enable: tremolo |
-| uo[0] | out | Reserved (v3) |
-| uo[1] | out | Reserved (v3) |
-| uo[2] | out | Reserved (v3) |
-| uo[3] | out | Reserved (v3) |
-| uo[4] | out | Reserved (v3) |
-| uo[5] | out | Reserved (v3) |
-| uo[6] | out | Reserved (v3) |
+| ui[1] | in | Enable: comp |
+| ui[2] | in | Enable: fuzz |
+| ui[3] | in | Enable: dist |
+| ui[4] | in | Enable: phaser |
+| ui[5] | in | Enable: trem |
+| ui[6] | in | Enable: delay |
+| ui[7] | in | Reserved (Rev B: delay character) |
+| uo[0] | out | Reserved (Rev B SPI) |
+| uo[1] | out | Reserved (Rev B SPI) |
+| uo[2] | out | Reserved (Rev B SPI) |
+| uo[3] | out | Reserved (Rev B) |
+| uo[4] | out | Reserved (Rev B) |
+| uo[5] | out | Reserved (Rev B) |
+| uo[6] | out | Reserved (Rev B) |
 | uo[7] | out | dp = clip LED (peak hold ~43 ms) |
 | uio[0] | out | MCLK (24.576 MHz output) |
 | uio[1] | out | I2S DAC data out |
-| uio[2] | in | Param P0: distortion character |
-| uio[3] | in | Param P1: crush base depth |
-| uio[4] | in | Param P2: tremolo rate |
-| uio[5] | in | Param P3: tremolo depth |
+| uio[2] | in | Param P0 |
+| uio[3] | in | Param P1 |
+| uio[4] | in | Param P2 |
+| uio[5] | in | Reserved (Rev B: PSRAM MISO) |
 | uio[6] | out | I2S BCLK (master, 3.072 MHz) |
 | uio[7] | out | I2S LRCLK/WS (master, 48 kHz) |
 
 uio pin directions: `uio_oe = 8'b1100_0011` — uio[7:6] and uio[1:0] are
-outputs (LRCLK/BCLK, MCLK/DAC data), uio[5:2] are inputs (params).
+outputs (LRCLK/BCLK, MCLK/DAC data), uio[5:2] are inputs (params P2..P0 on
+uio[4:2]; uio[5] reserved for the Rev B PSRAM MISO).
 
-### Param bits (P3..P0 on uio[5:2])
+### Param bits (P0..P2 on uio[4:2])
 
 | Param | Pin | Effect | 0 | 1 |
 |---|---|---|---|---|
-| P0 | uio[2] | Distortion knee T | 8192 (ceiling 20479) | 4096 (ceiling 18431) |
-| P1 | uio[3] | Crush base depth | quiet 4 / loud 6 bits | quiet 6 / loud 8 bits |
-| P2 | uio[4] | Tremolo rate | ~23.4 Hz | ~46.9 Hz |
-| P3 | uio[5] | Tremolo depth | span 255: gains 1, 1/2, 1/4, 1/8 | span 127: gains 1, 1/2 |
+| P0 | uio[2] | Fuzz octave blend (Rev A, task 4 — no function yet, pin trapped) | — | — |
+| P1 | uio[3] | Tremolo rate bit 0 (LSB, with P2) | — | — |
+| P2 | uio[4] | Tremolo rate bit 1 (MSB, with P1) | — | — |
 
-### DIP enables (ui[7:4])
+The trem rate is the 2-bit value k = {P2, P1} on `uio[4:3]`, picking one of
+four LFO rates (provisional — retune pending).
 
-ui[4]=fuzz, ui[5]=distortion, ui[6]=crush, ui[7]=tremolo — each switch is
-its stage's enable directly (bit order = chain order); all four off =
-digital clean.
+### DIP enables (ui[6:1])
+
+ui[1]=comp, ui[2]=fuzz, ui[3]=distortion, ui[4]=phaser, ui[5]=tremolo,
+ui[6]=delay — each switch is its stage's enable directly (bit order =
+chain order); all off = digital clean.
 
 ## How to test
 
 Hook up an I2S codec slave with all four I2S lines on uio: MCLK `uio[0]`,
 BCLK `uio[6]`, LRCLK `uio[7]`, DAC data `uio[1]`, and ADC data on `ui[0]`
 — e.g. a PCM1808 + PCM5102, or a Pico programmed as an I2S slave to inject
-and capture audio. Play some music and flip the `ui[7:4]` DIP switches:
+and capture audio. Play some music and flip the `ui[6:1]` DIP switches:
 each bit turns its stage on/off live, and any combination stacks in chain
 order. All-off is the digital-clean reference; stomping the external 3PDT
 switch compares it against true bypass. Drive a full-scale sample (easiest
-through crush, which keeps the sign bit, or in digital clean) and the dp
+in digital clean) and the dp
 clip LED on `uo[7]` lights with its ~43 ms hold.
 
 Without hardware, the cocotb suite covers the I2S framing, every chain
-stage and the enable matrix, the auto-lofi envelope, and the clip LED:
-`cd test && make -B`.
+stage and the enable matrix (including the identity stubs), and the clip
+LED: `cd test && make -B`.
 
 ## External hardware
 
@@ -154,5 +160,5 @@ stage and the enable matrix, the auto-lofi envelope, and the clip LED:
   usual bypass-LED/ground convention.
 - **Guitar front end**: a high-impedance JFET-input preamp (TL072) with
   mid-rail bias ahead of the ADC input.
-- **Controls**: DIP switches (or a Pico) drive the enables `ui[7:4]` and
-  the params `uio[5:2]`.
+- **Controls**: DIP switches (or a Pico) drive the enables `ui[6:1]` and
+  the params `uio[4:2]`.
