@@ -320,10 +320,9 @@ async def test_reset_state(dut):
 # ui byte layout (v3 task 1): ui[0]=I2S data (driven by the helper),
 # ui[6:1]=DIP effect enables en[5:0] (en[0]=comp .. en[5]=delay, bit
 # order = chain order), ui[7] reserved (Rev B delay character) — driven 0.
-# uio byte layout: params P0..P2 on uio[4:2] — P0=uio[2] (v3 fuzz octave
-# blend, unused until task 4 — the v2.2 dist-knee role is retired and the
-# pin is trapped in _unused), P1=uio[3] + P2=uio[4] = trem rate bits
-# k={uio[4],uio[3]}.
+# uio byte layout: params P0..P2 on uio[4:2] — P0=uio[2] (fuzz octave
+# blend, live from v3 task 4 — the v2.2 dist-knee role is retired),
+# P1=uio[3] + P2=uio[4] = trem rate bits k={uio[4],uio[3]}.
 # uio[5] is reserved (Rev B PSRAM MISO): the v2.2 trem depth bit is gone —
 # the trem span is a fixed constant now.
 
@@ -492,13 +491,13 @@ async def test_dist_softknee(dut):
     soft-knee piecewise-linear shaper on the stage input's magnitude —
     unity below the knee, slope 1/2 above it (a soft ceiling in place of
     the interim hard clip). Knee FIXED at T=8192 (soft ceiling 20479),
-    below the 16384 fuzz clip, so a stacked fuzz always feeds the shaped
-    region — param-free: the v2.2 P0 character bit (uio[2]) is retired
-    (P0 becomes the fuzz octave blend in task 4; uio[2] is trapped in
-    _unused). Fuzz is off here, so the shaper input is the raw sample —
-    sign kept, no rectify. Pinned exact points on the 8192 knee, both
-    signs, plus -32768 (mag saturates to 32767, then shapes and keeps
-    its sign)."""
+    below both task-4 fuzz clip points, so a stacked fuzz that clips
+    always feeds the shaped region — param-free: the v2.2 P0 character
+    bit (uio[2]) is retired (P0 is the fuzz octave blend from task 4 —
+    uio[2] live). Fuzz is off here, so the shaper input is the raw
+    sample — sign kept, no rectify. Pinned exact points on the 8192
+    knee, both signs, plus -32768 (mag saturates to 32767, then shapes
+    and keeps its sign)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -525,41 +524,214 @@ async def test_dist_softknee(dut):
 
 
 @cocotb.test()
-async def test_fuzz_rectify(dut):
-    """Fuzz stage (en[1]): full-wave rectifier + fixed clip at 16384 —
-    the v1 chain value (v2.2: fuzz gets no param bit)."""
+async def test_fuzz_asym(dut):
+    """Fuzz stage (en[1]), v3 task 4: asymmetric clip + env bias on the
+    stage's CHAIN input s1 — the mandatory task-3 routed re-coupling
+    (v2.2's cell-saving trim read the PRE-CHAIN sample_in here, masking
+    comp in every fuzz-on stack; fuzz now consumes comp's output, and
+    dist below consumes fuzz's). Input x = s1, signed; provisional
+    constants:
+      a = sat_mag(x); t = x[15] ? sat16(13107 + (env >>> 2)) : 19660
+      (the negative clip point relaxes with the input envelope —
+      bias-starve dynamics; env is the shared PRE-CHAIN envelope, read
+      post-update: the output captured in frame N+1 is fuzz(x_N, env_N),
+      the same combinational-into-TX timing comp pins);
+      shaped = a > t ? t : a; fuzz_core = x[15] ? -shaped : shaped.
+    P0 = 0 throughout (the plain asym fuzz; the octave blend is
+    test_fuzz_octave). Env-dependence is Review Focus 4: the SAME
+    negative input under loud vs quiet env gives two distinct pinned
+    values (t_neg moves with env). Phases (frames from the first
+    _wait_left_start; env values model-derived from the task-3 env
+    recursion — the model reproduces task-3's pinned 32766/32638/6721/
+    6694 trajectory exactly):
+      - 100 loud frames 0x7FFF (0..99): env 32766, sticky from frame 15;
+      - corner -32768 (frame 100): env_100 = 32766 (attack from the
+        sticky point with sat-mag 32767: (32766+32767)>>1 = 32766) ->
+        t_neg = 13107 + 8191 = 21298, the MAX negative clip point ->
+        -21298. sat-mag 32767 -> clip -> negate; shaped <= 21298, so
+        the sat16 negate can never wrap: no +32768 anomaly;
+      - loud -24576 (frame 102): env_102 = 32510 (releases 32766 ->
+        32638 over the corner's capture frame, -> 32510 at the probe)
+        -> t_neg = 13107 + 8127 = 21234 -> -21234;
+      - +24576 (frame 104): +19660 — the positive clip point, env-free;
+      - +1000 / -1000 (frames 106/108): sub-clip unity BOTH signs —
+        the negative passes through NEGATIVE (the v2.2 rectifier this
+        test replaces mapped -1000 -> +1000);
+      - 401 silent frames (109..509): env releases to 6510;
+      - quiet -24576 (frame 510, driven directly after the bulk advance
+        — a _wait_left_start called exactly at a WS fall races its
+        first lrclk read): env_510 = attack (6510+24576)>>1 = 15543
+        -> t_neg = 13107 + 3885 = 16992 -> -16992 (vs -21234 loud on
+        the same input — Review Focus 4's two distinct pins);
+      - re-coupling probes on 0x1000 with env in the x4 quadrant:
+        en=0x03 (frame 512, env 15421): comp x4 -> s1 = 0x4000 ->
+        shaped = 16384 (sub-t_pos) -> +16384 — the fuzz stage receives
+        the COMPED amplitude. PRE-FIX value: 4096 (fuzz read
+        mag(sample_in); comp masked) — this assert fails there;
+        en=0x05 (frame 514, env 15299): dist's fallback branch is
+        mag(s1) now -> comp x4 -> 16384 -> shaper knee 8192 + 4096 ->
+        +12288 (pre-fix: the pre-chain 4096 passed below the knee ->
+        4096)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
     dut.ui_in.value = 0b0000_0100  # en[1] fuzz only (ui[2]); ui[7] = 0 (reserved)
-    dut.uio_in.value = 0
+    dut.uio_in.value = 0           # P0 = 0: the plain asym fuzz
     dut.rst_n.value = 0
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
-    async def fuzz_once(word16):
+    await _wait_left_start(dut)                # start of frame 0
+
+    # 100 loud frames (0x7FFF): env attacks to 32766, sticky from frame 15
+    for _ in range(100):
+        await i2s_send_and_capture(dut, 0x7FFF << 8)
+        await ClockCycles(dut.clk, 256)
+
+    # corner probe (inline — the sim is at frame 100's start): -32768
+    # with env 32766 -> t_neg 21298 (max) -> -21298
+    await i2s_send_and_capture(dut, 0x8000 << 8)   # frame 100
+    await _wait_left_start(dut)                    # frame 101
+    bits = await i2s_send_and_capture(dut, 0)      # capture frame 101
+    out = tx_data_bits(bits)
+    got = out - 0x10000 if out & 0x8000 else out
+    assert got == -21298, f"corner -32768: {got} != -21298 (env 32766)"
+
+    async def fuzz_once(word16, en_val=0x02):
+        # drive word16 in the next frame, capture the frame after
+        # (stage_once pattern: en_val lets the re-coupling probes
+        # switch the stack below)
+        dut.ui_in.value = en_val << 1        # ui[6:1] = en; ui[7] = 0
         await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, word16 << 8)
+        await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
         await _wait_left_start(dut)
         bits = await i2s_send_and_capture(dut, 0)
-        return tx_data_bits(bits)
+        out = tx_data_bits(bits)
+        return out - 0x10000 if out & 0x8000 else out
 
-    # negative folds positive; small signal stays below the clip
-    assert await fuzz_once(-1000) == 1000
-    assert await fuzz_once(3000) == 3000
-    # |x| > 16384 clips, both input polarities (v1 chain vectors)
-    assert await fuzz_once(-20000) == 16384
-    assert await fuzz_once(20000) == 16384
-    # -32768: |x| saturates to 32767, then clips
-    assert await fuzz_once(-32768) == 16384
+    # loud -24576 (frame 102): env 32510 -> t_neg 21234 -> -21234
+    got = await fuzz_once(-24576)
+    assert got == -21234, f"loud -24576: {got} != -21234 (env 32510)"
+
+    # +24576 (frame 104): positive clip point 19660 (env-free path)
+    got = await fuzz_once(24576)
+    assert got == 19660, f"+24576: {got} != 19660 (t_pos)"
+
+    # sub-clip unity, both signs — the negative KEEPS its sign (the
+    # v2.2 rectifier mapped -1000 -> +1000)
+    got = await fuzz_once(1000)
+    assert got == 1000, f"+1000: {got} != 1000 (sub-clip unity)"
+    got = await fuzz_once(-1000)
+    assert got == -1000, f"-1000: {got} != -1000 (sign kept, no rectify)"
+
+    # 401 silent frames (capture frame 109 + 400 bulk frames 110..509):
+    # env releases to 6510. The quiet probe drives DIRECTLY after the
+    # bulk advance (task-3's pattern) — fuzz_once's leading
+    # _wait_left_start, called exactly at a WS fall, races its first
+    # lrclk read and can return a clk later, shifting the word a frame
+    # (observed: -16992 via frame 510 either way, but only the direct
+    # drive is deterministic).
+    await ClockCycles(dut.clk, 256)             # rest of frame 109
+    await ClockCycles(dut.clk, 512 * 400)       # frames 110..509
+
+    # quiet -24576 (frame 510): env_510 = attack (6510 + 24576)>>1 =
+    # 15543 -> t_neg = 13107 + 3885 = 16992 -> -16992. Same input as
+    # the loud probe, distinct pin (Review Focus 4)
+    await i2s_send_and_capture(dut, 0xA000 << 8)    # frame 510 (-24576)
+    await _wait_left_start(dut)                     # frame 511
+    bits = await i2s_send_and_capture(dut, 0)       # capture frame 511
+    out = tx_data_bits(bits)
+    got = out - 0x10000 if out & 0x8000 else out
+    assert got == -16992, f"quiet -24576: {got} != -16992 (env 15543)"
+
+    # re-coupling probe 1 (the mandatory fix): comp+fuzz, env 15421
+    # (x4 quadrant) -> s1 = 0x4000 -> shaped = 16384 -> +16384.
+    # PRE-FIX: 4096 (fuzz read the pre-chain mag) — this assert fails
+    # on the v2.2-trim RTL: the probe's purpose
+    got = await fuzz_once(0x1000, en_val=0x03)
+    assert got == 16384, \
+        f"comp->fuzz re-coupling: {got} != 16384 (pre-fix value 4096)"
+
+    # re-coupling probe 2: comp+dist (fuzz off) — dist's fallback is
+    # mag(s1): comp x4 -> 16384 -> knee branch 8192 + 4096 -> +12288
+    # (pre-fix: the pre-chain 4096 passed below the knee -> 4096)
+    got = await fuzz_once(0x1000, en_val=0x05)
+    assert got == 12288, \
+        f"comp->dist re-coupling: {got} != 12288 (pre-fix value 4096)"
+
+
+@cocotb.test()
+async def test_fuzz_octave(dut):
+    """Fuzz octave blend (en[1], v3 task 4): P0 = uio[2] is LIVE —
+    fuzz_out = P0 ? sat16(shaped + mag(s1)) : fuzz_core, the 50/50
+    blend with the full-wave-rectified copy. sat16 clamps UPPER only
+    (shaped >= 0 and mag(s1) >= 0, so the blend is >= 0 under P0=1 in
+    every reachable state — the property dist's magnitude sharing
+    relies on). Every pinned value here is env-free by construction:
+    sub-clip inputs shape to a (< both clip points for any env — the
+    negative t_neg >= 13107), and the saturating pins saturate for any
+    env (shaped >= 13107 -> shaped + 32767 > 32767). P0 = 1:
+      +10000 -> sat16(10000 + 10000) = 20000;
+      -10000 -> 20000 — the octave signature: the blend erases the
+        sign (the plain core in test_fuzz_asym keeps it: -10000 ->
+        -10000 under P0=0);
+      +24576 -> sat16(19660 + 24576) = 32767 (upper rail);
+      -32768 -> 32767 (shaped = t_neg(env) >= 13107, sat-mag 32767 ->
+        saturated for any env).
+    P0 = 0 contrast on the same words: -10000 -> -10000 (core),
+    +24576 -> 19660."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b0000_0100  # en[1] fuzz only (ui[2]); ui[7] = 0 (reserved)
+    dut.uio_in.value = 0b0000_0100  # P0 = 1 (uio[2]); trem rate bits 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    async def oct_once(word16):
+        await _wait_left_start(dut)
+        await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
+        await _wait_left_start(dut)
+        bits = await i2s_send_and_capture(dut, 0)
+        out = tx_data_bits(bits)
+        return out - 0x10000 if out & 0x8000 else out
+
+    # P0 = 1 (uio[2] set): the octave blend
+    got = await oct_once(10000)
+    assert got == 20000, f"P0=1 +10000: {got} != 20000 (blend 2a)"
+    got = await oct_once(-10000)
+    assert got == 20000, f"P0=1 -10000: {got} != 20000 (blend erases sign)"
+    got = await oct_once(24576)
+    assert got == 32767, f"P0=1 +24576: {got} != 32767 (sat16 upper rail)"
+    got = await oct_once(-32768)
+    assert got == 32767, f"P0=1 -32768: {got} != 32767 (sat for any env)"
+
+    # P0 = 0 contrast on the same words: the core values
+    dut.uio_in.value = 0
+    got = await oct_once(-10000)
+    assert got == -10000, f"P0=0 -10000: {got} != -10000 (core keeps sign)"
+    got = await oct_once(24576)
+    assert got == 19660, f"P0=0 +24576: {got} != 19660 (core clip)"
 
 
 @cocotb.test()
 async def test_fuzz_dist_chain(dut):
-    """Fuzz + dist stacked (en = 0x6, P0=0): rectify, clip at 16384,
-    then the soft-knee shaper (T=8192, below the fuzz clip — the
-    shaper always sees the clipped magnitude and shapes it). 10000
-    pins the shaped branch reached without the fuzz clip."""
+    """Fuzz + dist stacked (en = 0x6, P0=0): the task-4 asym fuzz feeds
+    the v2.2 soft-knee shaper (T=8192) on the CHAIN value — dist
+    consumes mag(s2) with s2 = fuzz_out (signed under P0=0; the shaper
+    magnitude sharing handles the sign, see the RTL comment). Env
+    values are the probe frames' post-update env, model-derived from
+    reset 0 (the first probe attacks to half its mag, then the capture
+    frames release): -20000 frames the env-biased negative clip
+    (env_0 = 10000 -> t_neg = 15607 -> fuzz -15607 -> 8192 + 3707 ->
+    -11899); 5000 below both the clip and the knee; 10000 pins the
+    shaped branch reached WITHOUT the fuzz clip (fuzz passes it at
+    sub-t_pos unity); 20000 clips at t_pos 19660 -> 8192 + 5734 ->
+    13926; and a P0=1 stacking probe (task-4 fix round) pins the
+    octave-into-dist path on the direct |s2| shaper input: +10000 ->
+    blend sat16(10000+10000) = 20000 (non-negative, so dist's sign
+    input s2[15] reads 0) -> 8192 + 5904 -> +14096."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -577,10 +749,19 @@ async def test_fuzz_dist_chain(dut):
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
-    assert await chain_once(-20000) == 12288   # -20000 -> clip 16384 -> 8192+4096
+    assert await chain_once(-20000) == -11899  # env 10000, t_neg 15607
     assert await chain_once(5000) == 5000      # below both clip and knee
     assert await chain_once(10000) == 9096     # 10000 -> 8192 + 1808/2
-    assert await chain_once(20000) == 12288    # clip 16384, then shape
+    assert await chain_once(20000) == 13926    # clip 19660 -> 8192+5734
+
+    # P0=1 stacking probe (fix round): the octave blend INTO dist —
+    # +10000 -> fuzz blend sat16(10000+10000) = 20000 (>= 0, so the
+    # shaper's sign input s2[15] = 0) -> 8192 + (20000-8192)/2 =
+    # +14096. A shaper magnitude reading fuzz_shaped (10000) instead
+    # of the blended output would emit 9096 — pins the octave-into-dist
+    # path on the direct saturating |s2| (en[1]=1, P0=1 case).
+    dut.uio_in.value = 0b0000_0100  # P0 = 1 (uio[2]); trem rate bits 0
+    assert await chain_once(10000) == 14096
 
 
 @cocotb.test()
@@ -671,12 +852,12 @@ async def test_chain_enables(dut):
     also proves every DOWNSTREAM stage passes bit-exact when disabled);
     with all en=0 the chain is bit-exact identity and +-32768 round-trip
     (Review Focus 3: no disabled stage may corrupt the sample). The Rev A
-    identity-stub slots (comp en[0], phaser en[3], delay en[5]) must pass
+    identity-stub slots (phaser en[3], delay en[5]) must pass
     +-full-scale bit-exact when enabled — the enable itself corrupts
-    nothing (comp gets its gain ladder in task 3; phaser/delay are Rev
-    B). Fuzz + dist stacked feeds the shaper the clipped magnitude (both
-    knees sit below the fuzz clip; dist is the v2.2 soft knee — v3 task
-    5 replaces it — P0=0)."""
+    nothing (comp is live from task 3; phaser/delay are Rev B). Fuzz +
+    dist stacked: the task-4 asym fuzz feeds the shaper mag(s2) (both
+    fuzz clip points sit above the 8192 knee; dist is the v2.2 soft
+    knee — v3 task 5 replaces it — P0=0)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -706,8 +887,12 @@ async def test_chain_enables(dut):
     cur, out = await _trem_probe(dut, cur, 5003, -32768)
     assert out == -8192, f"trem ON: -32768 >>> 2, got {out}"
 
-    # fuzz ON: rectify + clip 16384 (-32768 folds and clips; 5000 below)
-    assert await stage_once(0x2, -32768) == 16384
+    # fuzz ON: the task-4 asym clip — -32768 sat-mags to 32767 and
+    # clips at the env-biased negative point: env 30147 at the probe
+    # (inherited from the trem phase's LFO drives above) -> t_neg =
+    # 13107 + 7536 = 20643 -> -20643; 5000 passes below both clip
+    # points at unity
+    assert await stage_once(0x2, -32768) == -20643
     assert await stage_once(0x2, 5000) == 5000
 
     # dist ON: soft-knee PWL (P0=0, T=8192); 1234 pins the fuzz-off
@@ -730,11 +915,13 @@ async def test_chain_enables(dut):
     assert await stage_once(0x29, -32768) == -32768   # comp+phaser+delay
     assert await stage_once(0x29, 32767) == 32767
 
-    # fuzz + dist stacked: rectify + clip 16384, then shape at the
-    # 8192 knee (soft-knee dist replaces the v1 x3 tail)
-    assert await stage_once(0x6, -20000) == 12288
+    # fuzz + dist stacked: the task-4 asym fuzz feeds the shaper
+    # mag(s2) — -20000 passes the negative clip point UNCLIPPED at this
+    # env (32376 -> t_neg = 21201 > 20000) and the knee halves it;
+    # 20000 clips at t_pos 19660 then shapes
+    assert await stage_once(0x6, -20000) == -14096
     assert await stage_once(0x6, 5000) == 5000
-    assert await stage_once(0x6, 20000) == 12288
+    assert await stage_once(0x6, 20000) == 13926
 
     # all stages OFF: bit-exact identity, +-full-scale through
     assert await stage_once(0x0, 32767) == 32767
@@ -755,8 +942,9 @@ async def test_clip_dp(dut):
     to 2047 (~2048 frames ~ 43 ms at 48 kHz) and clears dp_q on the
     wrap edge; a new hit mid-hold restarts it (peak-hold).
     Full-scale is driven with en=0 (DIP all-off — digital clean): dist never
-    emits full-scale (soft ceiling 20479) and fuzz clips at 16384, but the
-    identity chain passes sample_in = 0x7FFF exactly. Phases, DIP all-off
+    emits full-scale (soft ceiling 20479) and the plain fuzz clips below
+    the rails (only the octave blend saturates, and fuzz is off here
+    anyway), but the identity chain passes sample_in = 0x7FFF exactly. Phases, DIP all-off
     throughout:
       - 100 mid-level (0x1000) frames: dp stays dark (the LED is
         sticky for ~2048 frames, so one end-of-phase probe covers all

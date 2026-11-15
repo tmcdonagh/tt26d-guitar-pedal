@@ -6,14 +6,15 @@
  * pedalboard, Rev A). I2S master in/out (codec-agnostic), serial
  * effect chain comp -> fuzz -> distortion -> phaser -> trem -> delay
  * with per-stage enable bypass (comp: env-driven shift-ladder gain,
- * task 3; phaser and delay are identity stubs, Rev B; the v2.2 crush
+ * task 3; fuzz: asymmetric clip + octave blend on its chain input,
+ * task 4; phaser and delay are identity stubs, Rev B; the v2.2 crush
  * slot is removed, its envelope follower retained as the shared
  * dynamics source).
  * Enables: DIP switches direct on ui[6:1] (en[0]=comp .. en[5]=delay,
  * bit order = chain order); ui[7] reserved (Rev B delay character).
- * Params on uio[4:2]: P0=uio[2] (fuzz octave blend, task 4 — trapped
- * in _unused until then), P1/P2 =
- * trem rate bits {uio[4], uio[3]}; uio[5] reserved (Rev B PSRAM MISO).
+ * Params on uio[4:2]: P0=uio[2] (fuzz octave blend, live from task 4),
+ * P1/P2 = trem rate bits {uio[4], uio[3]}; uio[5] reserved (Rev B
+ * PSRAM MISO).
  * uo[7] = dp clip LED; uo[6:0] driven 0 (uo[2:0] reserved Rev B SPI).
  * See docs/info.md and the spec in the ai-dev-archive.
  */
@@ -131,46 +132,93 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s1 = en[0] ? comp_out : s0;
 
   // ------------------------------------------------------------------
-  // Stage 2 — octave fuzz: full-wave rectifier + fixed clip at 16384
-  // (the v1 chain value; the v3 octave blend bit P0 arrives in task 4).
+  // Stage 2 — fuzz (v3 task 4): Fuzz Face-inspired asymmetric clip +
+  // octave blend on the stage's CHAIN input s1 — the task-3 routed
+  // re-coupling (v2.2's cell-saving trim read the PRE-CHAIN sample_in
+  // here, masking comp in every fuzz-on stack, probe-verified en=0x03
+  // == en=0x02; fuzz now consumes comp's output, and dist below
+  // consumes fuzz's). Input x = s1, signed; constants provisional:
+  //   a      = sat_mag(x)  — the saturating-|x| idiom on s1
+  //   t_pos  = 19660       (~ +0.6 FS)
+  //   t_neg  = sat16(13107 + (env >>> 2))  (~ -0.4 FS at env 0,
+  //             relaxing to -21298 at env 32766 — bias-starve
+  //             dynamics: the negative clip point eases up with the
+  //             input level. env is read POST-update — the same
+  //             combinational-into-TX timing as comp, so frame N+1's
+  //             output is fuzz(x_N, env_N). env <= 32766 -> env>>>2
+  //             <= 8191 -> the sum <= 21298 < 32767: the sat16 clamp
+  //             below is unreachable, kept per the saturating-
+  //             arithmetic convention (dist_neg pattern))
+  //   shaped = a > t ? t : a              (asym clip on the magnitude)
+  //   fuzz_core = x[15] ? (-shaped) : shaped (sat16 negate; shaped <=
+  //             21298 -> -shaped >= -21298 > -32768: that clamp is
+  //             unreachable too, kept per the convention)
+  // P0 = uio[2] blends the full-wave-rectified copy (the octave):
+  //   fuzz_out = P0 ? sat16(shaped + a) : fuzz_core
+  // shaped + a >= 0 always (both non-negative), so the blend's sat16
+  // clamps UPPER only (max 21298 + 32767 -> 0x7FFF): under P0=1
+  // fuzz_out is non-negative in every reachable state; under P0=0 it
+  // is signed (the plain asym fuzz) — dist's magnitude sharing below
+  // handles both cases.
   // ------------------------------------------------------------------
-  wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
-                    : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
+  wire [15:0] fuzz_mag = (s1 == 16'h8000) ? 16'h7FFF   // saturating |s1|
+                       : s1[15] ? (~s1 + 16'd1) : s1;
 
-  wire [15:0] fuzz_t   = 16'd16384;
-  wire [15:0] fuzz_out = (mag > fuzz_t) ? fuzz_t : mag;
+  wire fuzz_oct = uio_in[2];   // P0: octave blend (live from task 4)
+
+  // negative clip point sat16(13107 + (env >>> 2))
+  wire [16:0] fuzz_tn_sum = 17'd13107 + {3'b000, env[15:2]};
+  wire [15:0] fuzz_tneg = fuzz_tn_sum[16] ? 16'h7FFF : fuzz_tn_sum[15:0];
+  wire [15:0] fuzz_t = s1[15] ? fuzz_tneg : 16'd19660;
+
+  wire [15:0] fuzz_shaped = (fuzz_mag > fuzz_t) ? fuzz_t : fuzz_mag;
+
+  // sat16 negate (dist_neg pattern; clamp unreachable, kept per convention)
+  wire [16:0] fuzz_neg = 17'd0 - {1'b0, fuzz_shaped};
+  wire        fuzz_neg_ovf = (fuzz_neg[16] != fuzz_neg[15]);
+  wire [15:0] fuzz_core = s1[15] ? (fuzz_neg_ovf ? 16'h8000 : fuzz_neg[15:0])
+                                 : fuzz_shaped;
+
+  // octave blend: sat16(shaped + a), upper clamp only — both terms are
+  // non-negative so the sum cannot underflow, and it fits a positive
+  // 16-bit magnitude iff <= 0x7FFF, i.e. iff bits [16:15] are both
+  // clear (their OR is exactly "sum > 0x7FFF" for any 17-bit sum; the
+  // plain [16] carry test would MISS sums in [0x8000, 0xFFFF] — the
+  // max here is 21298 + 32767 = 54065, so [16] never sets on its own)
+  wire [16:0] fuzz_blend_w = {1'b0, fuzz_shaped} + {1'b0, fuzz_mag};
+  wire [15:0] fuzz_blend = |fuzz_blend_w[16:15] ? 16'h7FFF : fuzz_blend_w[15:0];
+
+  wire [15:0] fuzz_out = fuzz_oct ? fuzz_blend : fuzz_core;
 
   wire [15:0] s2 = en[1] ? fuzz_out : s1;
 
   // ------------------------------------------------------------------
   // Stage 3 — distortion (v2.2 task 4, kept until v3 task 5's diode
-  // knee): soft-knee piecewise-linear
-  // shaper on the stage input's magnitude — unity below the knee, slope
-  // 1/2 above it (a soft ceiling in place of the interim hard clip).
-  // Knee FIXED at T = 8192 (soft ceiling 20479), below the 16384 fuzz
-  // clip, so a stacked fuzz always feeds the shaped region. No
-  // multipliers — subtract + shift only. Param note: the v2.2 P0
-  // character bit (uio[2], knee 4096/8192) is retired — uio[2] is P0 =
-  // fuzz octave blend from task 4 (trapped in _unused), and task 5
-  // replaces this block with the param-free diode PWL.
+  // knee): soft-knee piecewise-linear shaper on the stage input's
+  // magnitude — unity below the knee, slope 1/2 above it (a soft
+  // ceiling in place of the interim hard clip). Knee FIXED at T = 8192
+  // (soft ceiling 20479), below BOTH task-4 fuzz clip points (19660
+  // positive, 13107..21298 negative), so a stacked fuzz that clips
+  // always feeds the shaped region. No multipliers — subtract + shift
+  // only. Param note: the v2.2 P0 character bit (uio[2], knee
+  // 4096/8192) is retired — uio[2] is the fuzz octave blend (live from
+  // task 4), and task 5 replaces this block with the param-free diode
+  // PWL.
   // ------------------------------------------------------------------
-  // Shaper input magnitude, shared from the chain (area trim (b)):
-  // s2 = fuzz_out when fuzz is on — already a non-negative magnitude
-  // clamped to [0, 16384], so never the 0x8000 saturation edge — and
-  // the PRE-CHAIN sample_in otherwise, whose saturating |x| IS the
-  // stage-2 mag wire. Task-1 derivation: value-equal to saturating
-  // |s2| in every then-reachable state (comp was an identity stub).
-  // Since task 3 the comp ladder is live: with en[0] on, the chain
-  // value is s2 = comp_out, so this wire equals |s2| only while the
-  // ladder sits at x1 — otherwise the shaper sees the RAW input
-  // magnitude (comp masked in the comp+dist stack; likewise fuzz_out
-  // rectifies sample_in, masking comp whenever fuzz is on — probe-
-  // verified: en=0x03 == en=0x02, en=0x05 == en=0x04, and all4 =
-  // en=0x17 is bit-identical to the task-2 baseline). Tasks 4/5
-  // rewrite fuzz/dist on their CHAIN inputs, re-coupling comp into
-  // the stacked modes. Sharing still drops a second |x| block
-  // (comparator + negater + muxes).
-  wire [15:0] dist_mag = en[1] ? fuzz_out : mag;
+  // Shaper input magnitude: a DIRECT saturating |x| on the actual
+  // stage input s2 (the output sign stays s2[15] below). The v2.2 area
+  // trim — sharing this magnitude with the fuzz/pre-chain wires via a
+  // conditional — is DELETED (controller ruling, task-4 fix round):
+  // every conditional form is wrong in some case (the plan's literal
+  // `en[1] ? fuzz_out : mag(s1)` feeds fuzz's SIGNED core output onto
+  // this unsigned magnitude path under P0=0, shaping 65536-|fuzz_out|;
+  // per-case "value-equal to |s2|" patches survive only with a case
+  // proof to maintain). v3 has the headroom for the direct block,
+  // which is obviously correct for every enable/P0 combination. Costs
+  // a third |x| (env's mag below and fuzz's fuzz_mag are the other
+  // two) — comparator + negater + 2 muxes.
+  wire [15:0] dist_mag = (s2 == 16'h8000) ? 16'h7FFF   // saturating |s2|
+                       : s2[15] ? (~s2 + 16'd1) : s2;
 
   wire [15:0] dist_t = 16'd8192;
 
@@ -200,20 +248,23 @@ module tt_um_tmcdonagh_guitar_pedal (
   // ------------------------------------------------------------------
   // Shared dynamics source (v3): the v2.2 auto-lofi envelope follower,
   // retained after the crush slot's removal — the comp gain ladder
-  // (task 3) and the fuzz bias (task 4) read it. 16-bit envelope of
-  // the PRE-CHAIN input magnitude (mag, stage 2's saturating
-  // |sample_in|; fix-round ruling — the player's dynamics live in the
-  // raw input):
+  // (task 3) and the fuzz negative clip point (task 4) read it.
+  // 16-bit envelope of the PRE-CHAIN input magnitude (mag below, the
+  // saturating |sample_in| idiom — env's own source since task 4 moved
+  // stage 2 onto its chain input; fix-round ruling — the player's
+  // dynamics live in the raw input):
   //   attack (mag > env): env <= (env + mag) >>> 1   — 17-bit add,
   //     >> 1 back to 16; halves the gap, ~12 frames to converge;
   //   release: env <= env - (env>>>8) - (env != 0)   — tau ~256 frames
   //     ~5.3 ms; the 1-LSB floor makes the decay terminate at exactly
   //     0 (the plain subtract-shift stalls anywhere below 256).
   // env tops out at 32766 — env[15] never sets. One update per audio
-  // frame on sample_valid. Feeds the comp gain ladder above (task 3);
-  // the fuzz bias (task 4) reads it next.
+  // frame on sample_valid. Feeds the comp gain ladder (task 3) and the
+  // fuzz negative clip point (task 4) above.
   // ------------------------------------------------------------------
   reg  [15:0] env;
+  wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
+                    : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
   wire [16:0] env_atk = {1'b0, env} + {1'b0, mag};       // 17-bit env+mag
   wire        env_nz  = (env != 16'd0);                   // release floor
 
@@ -369,13 +420,12 @@ module tt_um_tmcdonagh_guitar_pedal (
   assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P2..P0 + reserved Rev B MISO on uio[5])
 
   // List all unused inputs to prevent warnings
-  // (uio[4:3] = trem rate bits are live, as are ui[6:1] = enables and
-  // ui[0] = ADC data; uio[7:6]/[1:0] are clock/data outputs, their
-  // input side is unused; ui[7] = Rev B delay char, uio[5] = Rev B
-  // PSRAM MISO, and uio[2] = P0 (fuzz octave blend, task 4) are
-  // reserved/param inputs with no reader yet. env feeds the comp
-  // gain ladder now — task 4's fuzz bias is its next reader)
-  wire _unused = &{ena, ui_in[7], uio_in[5], uio_in[2], uio_in[7:6],
+  // (uio[4:3] = trem rate bits, uio[2] = P0 fuzz octave blend, ui[6:1]
+  // = enables and ui[0] = ADC data are live; uio[7:6]/[1:0] are
+  // clock/data outputs, their input side is unused; ui[7] = Rev B
+  // delay char and uio[5] = Rev B PSRAM MISO are reserved with no
+  // reader yet. env feeds the comp ladder and the fuzz clip point)
+  wire _unused = &{ena, ui_in[7], uio_in[5], uio_in[7:6],
                    uio_in[1:0], 1'b0};
 
 endmodule
