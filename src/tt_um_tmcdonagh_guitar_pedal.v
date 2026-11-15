@@ -5,9 +5,10 @@
  * Silicon Guitar Pedal — multi-effect DSP core (v3: 2x2 silicon
  * pedalboard, Rev A). I2S master in/out (codec-agnostic), serial
  * effect chain comp -> fuzz -> distortion -> phaser -> trem -> delay
- * with per-stage enable bypass (task 1: comp, phaser, and delay are
- * identity stubs; the v2.2 crush slot is removed, its envelope
- * follower retained as the shared dynamics source).
+ * with per-stage enable bypass (comp: env-driven shift-ladder gain,
+ * task 3; phaser and delay are identity stubs, Rev B; the v2.2 crush
+ * slot is removed, its envelope follower retained as the shared
+ * dynamics source).
  * Enables: DIP switches direct on ui[6:1] (en[0]=comp .. en[5]=delay,
  * bit order = chain order); ui[7] reserved (Rev B delay character).
  * Params on uio[4:2]: P0=uio[2] (fuzz octave blend, task 4 — trapped
@@ -84,18 +85,48 @@ module tt_um_tmcdonagh_guitar_pedal (
   // Bypass stays true bypass, wired externally with a 3PDT switch
   // around the pedal (all-off DIP = "digital clean": audio still runs
   // through the ADC -> identity chain -> DAC, a distinct mode from
-  // true bypass). Comp, phaser, and delay are identity stubs this
-  // task (comp: task 3 gain ladder; phaser/delay: Rev B).
+  // true bypass). Comp carries the env-driven gain ladder (task 3);
+  // phaser and delay are identity stubs in Rev A.
   // ------------------------------------------------------------------
   wire [5:0] en = ui_in[6:1];
 
   wire [15:0] s0 = sample_in;
 
   // ------------------------------------------------------------------
-  // Stage 1 — compressor: identity stub (task 3 fills this slot with
-  // the env-driven gain ladder; the enable is a no-op until then).
+  // Stage 1 — compressor (v3 task 3): env-driven shift-ladder makeup
+  // gain toward the fixed reference TH = 16384 — no division, no
+  // multiplier, gain in {x1, x2, x4} via arithmetic left shifts on
+  // the sign-extended sample; fixed character, no param bit. Reads
+  // the shared env block below (the retained v2.2 envelope follower
+  // on the PRE-CHAIN input magnitude, one update per audio frame):
+  //   env >= 24576 -> x1   (loud: at/above 1.5*TH)
+  //   16384..24575 -> x2   (mid: TH .. 1.5*TH)
+  //   env  < 16384 -> x4   (quiet: below TH)
+  // Decoded on env[14:13] — the top two bits of env's REACHABLE
+  // range: env tops out at 32766 (the (env+mag)>>>1 attack rounds
+  // down from 32767), so env[15] NEVER sets, the live range is the
+  // 15 bits [14:0], and the quadrant size is 8192 — 2'b11 -> env >=
+  // 3*8192 = 24576 -> x1, 2'b10 -> [16384, 24576) -> x2, 2'b0x ->
+  // env < 16384 -> x4. (The plan line wrote env[15:14] — dead code:
+  // 2'b11/2'b10 are unreachable there, gain would pin at x4 forever
+  // and the pinned loud probe could never pass; [14:13] is that
+  // predicate on the reachable range, giving the ruled x4 boundary
+  // at exactly env < 16384.) TH = 16384 provisional (by-ear retune
+  // sanctioned). Saturation: s0 <<< gain_sh is exact in an 18-bit
+  // sign-extended container (|s0| <= 32768 -> |s0 <<< 2| <= 131072
+  // = 2^17, inside the 18-bit signed range with one spare MSB); the
+  // shifted value fits 16 bits iff the two bits above [15] replicate
+  // the sign (comp_sh[17:16] == {2{comp_sh[15]}}), else clamp to the
+  // rails 0x7FFF / 0x8000.
   // ------------------------------------------------------------------
-  wire [15:0] comp_out = s0;   // v3 task 3
+  wire [1:0] gain_sh = (env[14:13] == 2'b11) ? 2'd0
+                     : (env[14:13] == 2'b10) ? 2'd1
+                                             : 2'd2;
+
+  wire [17:0] comp_sh  = {{2{s0[15]}}, s0} <<< gain_sh;
+  wire        comp_ovf = (comp_sh[17:16] != {2{comp_sh[15]}});
+  wire [15:0] comp_out = comp_ovf ? (comp_sh[17] ? 16'h8000 : 16'h7FFF)
+                                  : comp_sh[15:0];
 
   wire [15:0] s1 = en[0] ? comp_out : s0;
 
@@ -126,9 +157,19 @@ module tt_um_tmcdonagh_guitar_pedal (
   // Shaper input magnitude, shared from the chain (area trim (b)):
   // s2 = fuzz_out when fuzz is on — already a non-negative magnitude
   // clamped to [0, 16384], so never the 0x8000 saturation edge — and
-  // sample_in otherwise, whose saturating |x| IS the stage-2 mag wire.
-  // Value-equal to saturating |s2| in every reachable state; sharing
-  // drops a second |x| block (comparator + negater + muxes).
+  // the PRE-CHAIN sample_in otherwise, whose saturating |x| IS the
+  // stage-2 mag wire. Task-1 derivation: value-equal to saturating
+  // |s2| in every then-reachable state (comp was an identity stub).
+  // Since task 3 the comp ladder is live: with en[0] on, the chain
+  // value is s2 = comp_out, so this wire equals |s2| only while the
+  // ladder sits at x1 — otherwise the shaper sees the RAW input
+  // magnitude (comp masked in the comp+dist stack; likewise fuzz_out
+  // rectifies sample_in, masking comp whenever fuzz is on — probe-
+  // verified: en=0x03 == en=0x02, en=0x05 == en=0x04, and all4 =
+  // en=0x17 is bit-identical to the task-2 baseline). Tasks 4/5
+  // rewrite fuzz/dist on their CHAIN inputs, re-coupling comp into
+  // the stacked modes. Sharing still drops a second |x| block
+  // (comparator + negater + muxes).
   wire [15:0] dist_mag = en[1] ? fuzz_out : mag;
 
   wire [15:0] dist_t = 16'd8192;
@@ -169,7 +210,8 @@ module tt_um_tmcdonagh_guitar_pedal (
   //     ~5.3 ms; the 1-LSB floor makes the decay terminate at exactly
   //     0 (the plain subtract-shift stalls anywhere below 256).
   // env tops out at 32766 — env[15] never sets. One update per audio
-  // frame on sample_valid. Feeds nothing yet (trapped in _unused).
+  // frame on sample_valid. Feeds the comp gain ladder above (task 3);
+  // the fuzz bias (task 4) reads it next.
   // ------------------------------------------------------------------
   reg  [15:0] env;
   wire [16:0] env_atk = {1'b0, env} + {1'b0, mag};       // 17-bit env+mag
@@ -331,11 +373,10 @@ module tt_um_tmcdonagh_guitar_pedal (
   // ui[0] = ADC data; uio[7:6]/[1:0] are clock/data outputs, their
   // input side is unused; ui[7] = Rev B delay char, uio[5] = Rev B
   // PSRAM MISO, and uio[2] = P0 (fuzz octave blend, task 4) are
-  // reserved/param inputs with no reader yet. env is the retained
-  // shared dynamics source — no reader until tasks 3/4, so it is
-  // trapped here too)
+  // reserved/param inputs with no reader yet. env feeds the comp
+  // gain ladder now — task 4's fuzz bias is its next reader)
   wire _unused = &{ena, ui_in[7], uio_in[5], uio_in[2], uio_in[7:6],
-                   uio_in[1:0], env, 1'b0};
+                   uio_in[1:0], 1'b0};
 
 endmodule
 

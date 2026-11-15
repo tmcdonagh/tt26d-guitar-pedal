@@ -328,6 +328,165 @@ async def test_reset_state(dut):
 # the trem span is a fixed constant now.
 
 @cocotb.test()
+async def test_comp(dut):
+    """Comp stage (en[0]), v3 task 3: env-driven shift-ladder gain —
+    comp_out = sat16(s0 <<< gain_sh), the ladder reading the shared env
+    block (the retained v2.2 envelope follower on the PRE-CHAIN input
+    magnitude; update semantics unchanged — attack (env+mag)>>>1,
+    release env-(env>>>8)-(env!=0), one update per frame on
+    sample_valid):
+      env >= 24576  -> gain_sh 0 (x1, loud)
+      16384..24575  -> gain_sh 1 (x2, mid)
+      env  < 16384  -> gain_sh 2 (x4, quiet)
+    decoded on env[14:13] — the top two bits of env's REACHABLE range
+    (env tops out at 32766, env[15] never sets, so the quadrant size
+    is 8192 and thresholds land at 16384 / 3*8192 = 24576; a literal
+    env[15:14] slice would leave x1/x2 unreachable, pinning x4
+    forever). TH = 16384 provisional (by-ear retune sanctioned). No
+    param bit (fixed character).
+
+    Frame timing (pinned, differs from the v2.2 crush latch): the
+    output transmitted in frame N+1 is comp(x_N, env_N) — env AFTER
+    frame N's own valid-edge update. comp is combinational into the
+    TX load (frame N+1's first left-half clk, ~255 clk after frame
+    N's valid edge), whereas the v2.2 crush latch registered on the
+    same valid edge and read env one frame older. The probe word
+    0x1000 (mag 4096) only ever RELEASES env at both probes (env
+    32766 / 6721 both > 4096), so the pinned values are insensitive
+    to that one-frame distinction.
+
+    Phases (frames numbered from the first _wait_left_start):
+      - 100 loud frames 0x7FFF (frames 0..99): env attacks 16383 ->
+        ... -> 32766, sticky from frame 15 ((32766+32767)>>1 = 32766);
+      - loud probe 0x1000 (frame 100), captured frame 101:
+        comp(0x1000, env_100 = 32638) — release 32766-127-1, still in
+        the x1 quadrant -> 0x1000;
+      - 400 silent frames (frames 101..500; the capture frame above
+        drove the first, ui[0] idling low): env releases to 6721
+        (below 16384 from silent frame 176);
+      - quiet probe 0x1000 (frame 501), captured frame 502:
+        comp(0x1000, env_501 = 6694) — release 6721-26-1, below 16384
+        -> x4 -> 0x4000. This is the port-level proof that env < 16384
+        (no hierarchical probe — GL-visible);
+      - stability (Review Focus 3): 50 identical mid frames 0x6000
+        (frames 503..552), capturing each frame's output mid_outs[i]
+        = output of frame 503+i = comp(x_502+i, env_502+i). env
+        attacks 6667 -> 24575 by frame 517 and STICKS: mag 24576 >
+        env 24575 keeps the attack branch and (24575+24576)>>1 =
+        24575 — a sticky fixed point ONE LSB below the 24576 x1
+        threshold, the maximally hunting-prone steady state. The last
+        10 captures (frames 544..553, env = 24575 throughout) must be
+        identical to each other (no per-frame rung hunting) and equal
+        sat16(0x6000 <<< 1) = 0x7FFF — the x2 rung (a hunting x1 rung
+        would emit 0x6000)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b0000_0010  # en[0] comp only (ui[1]); ui[7] = 0 (reserved)
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    await _wait_left_start(dut)                # start of frame 0
+
+    # 100 loud frames (0x7FFF). RX only listens in left halves, so each
+    # frame = one I2S drive (per-slot bits) + an exact 256-clk
+    # right-half skip; ui[0] sits at 0 between drives.
+    for _ in range(100):
+        await i2s_send_and_capture(dut, 0x7FFF << 8)
+        await ClockCycles(dut.clk, 256)
+
+    # loud probe: 0x1000 in frame 100, captured frame 101 (the
+    # one-frame I2S pipeline) — env_100 = 32638 -> x1 passthrough
+    await i2s_send_and_capture(dut, 0x1000 << 8)   # frame 100
+    await ClockCycles(dut.clk, 256)
+    bits = await i2s_send_and_capture(dut, 0)      # frame 101 capture
+    got = tx_data_bits(bits)
+    assert got == 0x1000, f"loud probe: {got:#06x} != 0x1000 (x1)"
+
+    # 400 silent frames (frame 101, the capture frame above, drove the
+    # first): env 32766 -> 6721 (crosses below 16384 at silent frame 176)
+    await ClockCycles(dut.clk, 256)                # rest of frame 101
+    await ClockCycles(dut.clk, 512 * 399)          # frames 102..500
+
+    # quiet probe: 0x1000 in frame 501, captured frame 502 — env_501 =
+    # 6694 -> x4 = 0x4000 (no saturation: 0x4000 < 0x7FFF)
+    await i2s_send_and_capture(dut, 0x1000 << 8)   # frame 501
+    await ClockCycles(dut.clk, 256)
+    bits = await i2s_send_and_capture(dut, 0)      # frame 502 capture
+    got = tx_data_bits(bits)
+    assert got == 0x4000, f"quiet probe: {got:#06x} != 0x4000 (x4)"
+
+    # stability: 50 identical mid frames 0x6000 (frames 503..552).
+    # mid_outs[i] = frame 503+i's output = comp(x_502+i, env_502+i):
+    # i=0 echoes the quiet capture frame's 0 input; from i=1 the 0x6000
+    # drives attack env 6667 -> 24575 (frame 517, sticky thereafter).
+    await ClockCycles(dut.clk, 256)                # rest of frame 502
+    mid_outs = []
+    for _ in range(50):
+        bits = await i2s_send_and_capture(dut, 0x6000 << 8)
+        await ClockCycles(dut.clk, 256)
+        out = tx_data_bits(bits)
+        mid_outs.append(out - 0x10000 if out & 0x8000 else out)
+    last10 = mid_outs[-10:]   # frames 544..553, env = 24575 throughout
+    assert len(set(last10)) == 1, \
+        f"steady mid input must not hunt rungs: last 10 outputs {last10}"
+    assert last10[0] == 0x7FFF, \
+        f"steady mid rung: {last10[0]:#06x} != 0x7FFF (sat16(0x6000 <<< 1), x2)"
+
+
+@cocotb.test()
+async def test_comp_decay(dut):
+    """Shared-env pins for the comp task (v3 task 3): the env update
+    semantics are UNCHANGED from v2.2 (attack (env+mag)>>>1, release
+    env-(env>>>8)-(env!=0), async reset to 0, one update per frame on
+    sample_valid) — pinned here so the comp wiring cannot silently
+    disturb the block that task 4's fuzz bias also reads. Hierarchical
+    probes are RTL-only (guarded getattr — names may vanish in the
+    flat GL netlist; None voids the asserts; test_comp's port-level
+    assertions carry the GL coverage):
+      - env == 0 after reset;
+      - 100 loud frames (0x7FFF) attack env to 32766 (sticky from
+        frame 15) — assert env >= 16384;
+      - long silence terminates at EXACTLY 0 — the release's 1-LSB
+        floor (plain env-(env>>>8) stalls anywhere below 256). From
+        32766 the recursion reaches 0 on the 1388th silent frame
+        (frame 1487 here; below 256 the decay is env-1 per frame);
+        1400 covers it with 12 frames of margin (v2.2 pattern: 1258
+        frames from 19658)."""
+    clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
+    cocotb.start_soon(clock.start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0b0000_0010  # en[0] comp only (ui[1]); ui[7] = 0 (reserved)
+    dut.uio_in.value = 0
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+    def env():
+        # internal envelope reg — RTL-only probe (same guard as the
+        # v2.2 autolofi sites); None voids the env asserts below
+        e = getattr(dut.user_project, "env", None)
+        return None if e is None else int(e.value)
+
+    await _wait_left_start(dut)   # start of frame 0
+    assert env() in (None, 0), "env must reset to 0"
+
+    # 100 loud frames (0x7FFF): one drive + right-half skip per frame
+    for _ in range(100):
+        await i2s_send_and_capture(dut, 0x7FFF << 8)
+        await ClockCycles(dut.clk, 256)
+    assert env() is None or env() >= 16384, \
+        "100 loud frames must attack env past 16384 (to 32766)"
+
+    # 1400 silent frames (ui[0] idles low): release from 32766 hits
+    # exact 0 on the 1388th update
+    await ClockCycles(dut.clk, 512 * 1400)
+    assert env() in (None, 0), "long silence must decay env to exactly 0"
+
+
+@cocotb.test()
 async def test_dist_softknee(dut):
     """Dist stage (en[2]), v2.2 task 4 (kept until v3 task 5's diode knee):
     soft-knee piecewise-linear shaper on the stage input's magnitude —
