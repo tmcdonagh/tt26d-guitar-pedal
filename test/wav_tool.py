@@ -62,11 +62,19 @@ MODES = [
     ("fuzz",     0x02, 0),  # asym clip, env-biased negative point
     ("fuzzoct",  0x02, 1),  # fuzz + octave blend
     ("dist",     0x04, 0),  # diode-knee PWL, fixed drive x4
-    ("trem",     0x10, 0),  # k=0 (~2.93 Hz), fixed span (4 steps)
+    ("trem",     0x10, 0),  # smooth trem, K1 absent (inc 437, ~5 Hz)
     ("fuzzdist", 0x06, 0),  # fuzz clip, then diode knee
     ("all4",     0x17, 0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
 ]
-CHECK_MODES = list(MODES)
+# check modes: name, en, oct, k1 (knob K1 value 0..255 for the tb's RC pin
+# model, None = absent). Every listening mode runs K1-absent; the knob
+# modes pin the trem rate path (inc = (64 + k1[5:0]) << k1[7:6]).
+CHECK_MODES = [(name, en, oct_sw, None) for name, en, oct_sw in MODES] + [
+    ("trem_k1lo",  0x10, 0, 8),    # inc 72  (~0.82 Hz)
+    ("trem_k1mid", 0x10, 0, 128),  # inc 256 (~2.93 Hz)
+    ("trem_k1hi",  0x10, 0, 250),  # inc 976 (~11.2 Hz)
+]
+K1_RE = re.compile(r"^K1:(\d+) (\d+) (\d+)$")
 
 
 def wav2hex():
@@ -97,6 +105,16 @@ def parse_samples(log_path):
                 v = int(m.group(1), 16)
                 vals.append(v - 0x10000 if v & 0x8000 else v)
     return vals
+
+
+def parse_k1_probe(log_path):
+    """(value, present, moved) from the tb's "K1:" settle-probe line."""
+    with open(log_path) as f:
+        for line in f:
+            m = K1_RE.match(line.strip())
+            if m:
+                return tuple(int(g) for g in m.groups())
+    return None
 
 
 def hex2wav(name, out_dir=OUT_DIR):
@@ -238,21 +256,31 @@ def check():
         f.write("\n".join("%04x" % (s & 0xFFFF) for s in ex))
     with tempfile.TemporaryDirectory() as tmp:
         procs = {}
-        for name, en, oct_sw in MODES:
+        for name, en, oct_sw, k1 in CHECK_MODES:
             with open(os.path.join(tmp, f"{name}.log"), "w") as log:
                 procs[name] = subprocess.Popen(
                     [VL_EXE, f"+EN={en}", f"+OCT={oct_sw}", f"+N={EXCERPT_FRAMES}",
-                     f"+IN={EXCERPT_HEX}"],
+                     f"+IN={EXCERPT_HEX}", f"+K1={-1 if k1 is None else k1}"],
                     stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
         rcs = {name: p.wait() for name, p in procs.items()}
         bad = False
-        for name, en, oct_sw in CHECK_MODES:
+        for name, en, oct_sw, k1 in CHECK_MODES:
             if rcs[name] != 0:
                 bad = True
                 print(f"{name}: FAIL (sim exited with return code {rcs[name]})")
                 continue
-            want = golden_model.render(ex, en, oct=oct_sw)
-            got = parse_samples(os.path.join(tmp, f"{name}.log"))
+            log_path = os.path.join(tmp, f"{name}.log")
+            # the model applies knob_steady(k1) from frame 0: exact only if
+            # the RTL K1 reading is settled and still from EN_SETTLE - 1 on
+            probe = parse_k1_probe(log_path)
+            want_probe = (0 if k1 is None else golden_model.knob_steady(k1),
+                          0 if k1 is None else 1, 0)
+            if probe != want_probe:
+                bad = True
+                print(f"{name}: FAIL (K1 probe value/present/moved {probe} != {want_probe})")
+                continue
+            want = golden_model.render(ex, en, oct=oct_sw, k1=k1)
+            got = parse_samples(log_path)
             first = next((i for i in range(min(len(got), len(want))) if got[i] != want[i]), None)
             if first is None and len(got) != len(want):
                 first = min(len(got), len(want))

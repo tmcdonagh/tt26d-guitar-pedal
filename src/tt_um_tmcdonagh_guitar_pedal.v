@@ -13,8 +13,9 @@
  * Switches: DIPs on ui[6:1] (en[0]=comp .. en[4]=trem, en[5] = the
  * delay slot, a reserved identity stub; bit order = chain order) and the
  * fuzz octave switch on ui[7], all debounced (v3 task 7: 2-flop sync,
- * two agreeing samples 256 frames apart). uio[4:2] are knob pins (RC
- * inputs, read nowhere until the knob task); uio[5] reserved (SPI MISO).
+ * two agreeing samples 256 frames apart). uio[4:2] are the RC knob pins
+ * K1..K3 (knob_rc readers, v3 task 9: K1 = trem rate; K2/K3 read, no
+ * consumer yet); uio[5] reserved (SPI MISO).
  * uo[7] = dp clip LED; uo[2:0] = SPI idle (SCK=0, CS=1, MOSI=0, Rev B
  * PSRAM); uo[6:3] driven 0.
  * See docs/info.md and the spec in the ai-dev-archive.
@@ -126,12 +127,12 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  wire [5:0] en = sw[5:0];   // en[5] (ui[6]) only feeds the delay identity stub
+  wire [5:0] en = sw[5:0];   // en[5] (ui[6]) = delay slot enable, unused (identity stub)
 
   wire [15:0] s0 = sample_in;
 
   // ------------------------------------------------------------------
-  // Stage 1 — compressor (v3 task 3): env-driven shift-ladder makeup
+  // Step 1 — compressor (v3 task 3): env-driven shift-ladder makeup
   // gain toward the fixed reference TH = 16384 — no division, no
   // multiplier, gain in {x1, x2, x4} via arithmetic left shifts on
   // the sign-extended sample; fixed character, no param bit. Reads
@@ -170,15 +171,21 @@ module tt_um_tmcdonagh_guitar_pedal (
 
   // Sequenced chain (v3 task 8): one registered stage per clk, stepped
   // after sample_valid. step = 1 on the clk after sample_valid (env,
-  // trem count and sw are post-edge by then, as the old combinational
-  // chain saw them), runs to 6, idles at 0. Stage outputs are registered;
-  // stage n's logic reads stage n-1's register.
+  // the trem phase and sw are post-edge by then), runs to 6, idles at 0.
+  // Stage outputs are registered; stage n's logic reads stage n-1's
+  // register. Step map:
+  //   step 1: comp            -> s1_r
+  //   step 2: fuzz            -> s2_r
+  //   step 3: dist            -> s3_r
+  //   step 4: tone/gate slot  -> s4_r (identity for now)
+  //   step 5: phaser stub     -> s5_r
+  //   step 6: trem (mult)     -> effect_sample (delay stub is identity)
   reg [2:0]  step;
   reg [15:0] s1_r, s2_r, s3_r, s4_r, s5_r;
   reg        chain_done;   // 1-clk pulse, the clk after effect_sample loads
 
   // ------------------------------------------------------------------
-  // Stage 2 — fuzz (v3 task 4): Fuzz Face-inspired asymmetric clip +
+  // Step 2 — fuzz (v3 task 4): Fuzz Face-inspired asymmetric clip +
   // octave blend on the stage's CHAIN input s1_r — the task-3 routed
   // re-coupling (v2.2's cell-saving trim read the PRE-CHAIN sample_in
   // here, masking comp in every fuzz-on stack, probe-verified en=0x03
@@ -189,9 +196,10 @@ module tt_um_tmcdonagh_guitar_pedal (
   //   t_neg  = sat16(13107 + (env >>> 2))  (~ -0.4 FS at env 0,
   //             relaxing to -21298 at env 32766 — bias-starve
   //             dynamics: the negative clip point eases up with the
-  //             input level. env is read POST-update — the same
-  //             combinational-into-TX timing as comp, so frame N+1's
-  //             output is fuzz(x_N, env_N). env <= 32766 -> env>>>2
+  //             input level. env is read POST-update (env updates on
+  //             the sample_valid edge, step 2 runs after it), so the
+  //             word transmitted in frame N+1 is fuzz(x_N, env_N).
+  //             env <= 32766 -> env>>>2
   //             <= 8191 -> the sum <= 21298 < 32767: the sat16 clamp
   //             below is unreachable, kept as a guard for by-ear
   //             retunes; it tests bits [16:15] because the sum fits a
@@ -239,7 +247,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s2_w = en[1] ? fuzz_out : s1_r;
 
   // ------------------------------------------------------------------
-  // Stage 3 — distortion (v3 task 5): fixed drive x4 into a 3-piece
+  // Step 3 — distortion (v3 task 5): fixed drive x4 into a 3-piece
   // diode-knee PWL on the stage input's magnitude. a = sat_mag(s2);
   // w = 4a (18-bit, NO intermediate saturation — keeps the top soft):
   //   w <= 8192   : out = w                        (slope 1)
@@ -272,8 +280,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s3_w = en[2] ? dist_out : s2_r;
 
   // ------------------------------------------------------------------
-  // Stage 4 — phaser: identity stub (Rev B allpass stack; the enable
-  // is a no-op in Rev A).
+  // Step 5 — phaser: identity stub on s4_r (Rev B allpass stack; the
+  // enable is a no-op in Rev A). Step 4 (tone/gate slot) is a plain
+  // register copy s3_r -> s4_r for now.
   // ------------------------------------------------------------------
   wire [15:0] phaser_out = s4_r;   // Rev B
 
@@ -318,59 +327,55 @@ module tt_um_tmcdonagh_guitar_pedal (
   end
 
   // ------------------------------------------------------------------
-  // Stage 5 — tremolo: stepped-gain tremolo as built (v1): out =
-  // in >>> s with gain steps 1, 1/2, 1/4, 1/8, s = LFO gap >> 6
-  // (gap = distance from full gain), triangle LFO. v3 task 2 rate
-  // ladder base: rate k = 0 fixed (exp 13 -> 2^13-frame half-periods ->
-  // 2.93 Hz LFO full cycle at 48 kHz) until the knob stage (task 9)
-  // returns the rate control; the old rate pins are knob pins now.
-  // Depth span FIXED 255 = 4 gain steps (span/rshift are constants).
+  // RC knob readers (v3 task 9): K1 uio[2], K2 uio[3], K3 uio[4]. Each
+  // discharges its pin (drive_low -> uio_oe, uio_out = 0) then times the
+  // RC charge; value is the smoothed 8-bit reading, present = 0 after a
+  // timeout (knob absent). K1 sets the trem rate; K2/K3 have no consumer
+  // yet (listed in _unused until their tasks).
   // ------------------------------------------------------------------
-  wire [3:0] trem_exp = 4'd13;
+  wire [7:0] k1_value, k2_value, k3_value;
+  wire       k1_present, k2_present, k3_present;
+  wire       k1_drv, k2_drv, k3_drv;
 
-  wire [7:0] trem_span   = 8'd255;  // constant (see above)
-  wire [3:0] trem_rshift = 4'd8;    // span = 2^rshift - 1
+  knob_rc k1 (.clk(clk), .rst_n(rst_n), .pin_in(uio_in[2]), .drive_low(k1_drv),
+              .value(k1_value), .present(k1_present));
+  knob_rc k2 (.clk(clk), .rst_n(rst_n), .pin_in(uio_in[3]), .drive_low(k2_drv),
+              .value(k2_value), .present(k2_present));
+  knob_rc k3 (.clk(clk), .rst_n(rst_n), .pin_in(uio_in[4]), .drive_low(k3_drv),
+              .value(k3_value), .present(k3_present));
 
-  reg  [13:0] trem_cnt;
-  reg         trem_dir;   // 0 = falling (gain down), 1 = rising
+  // ------------------------------------------------------------------
+  // Step 6 — tremolo (v3 task 9): smooth triangle-LFO gain through the
+  // shared multiplier. 22-bit phase P steps on sample_valid while trem
+  // is enabled (P <= P + inc), else holds at 0:
+  //   inc  = K1 present ? (64 + value[5:0]) << value[7:6] : 437
+  //          (64..1016: 2^22/inc frames per cycle, ~0.73..11.6 Hz at
+  //          48 kHz; absent default 437 ~5.0 Hz)
+  //   tri  = P[21] ? ~P[20:13] : P[20:13]     (8-bit triangle)
+  //   gain = 256 - (tri >> 1) - (tri >> 2)    (66..256, 75% depth)
+  //   out  = (s5_r * gain) >>> 8              (|out| <= |s5_r|: no clamp)
+  // ------------------------------------------------------------------
+  reg  [21:0] trem_p;
+  wire [9:0]  trem_inc_k = {3'b000, 1'b1, k1_value[5:0]} << k1_value[7:6];
+  wire [9:0]  trem_inc   = k1_present ? trem_inc_k : 10'd437;
   always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      trem_cnt <= 14'd0;
-      trem_dir <= 1'b0;
-    end else if (sample_strobe) begin
-      if (trem_cnt == ((14'd1 << trem_exp) - 14'd1)) begin
-        trem_cnt <= 14'd0;
-        trem_dir <= ~trem_dir;
-      end else begin
-        trem_cnt <= trem_cnt + 14'd1;
-      end
-    end
+    if (!rst_n)            trem_p <= 22'd0;
+    else if (sample_valid) trem_p <= en[4] ? (trem_p + {12'd0, trem_inc}) : 22'd0;
   end
 
-  // Ramp width derivation (the v2.2 x5-drive lesson: the ramp
-  // arithmetic is exactly where a width bug hides): ramp = (cnt<<8)
-  // - cnt = cnt*255 with cnt <= 2^13-1 (k=0, the widest half-period
-  // — larger k only shrinks the terminal count, never these widths).
-  // Then cnt<<8 <= (2^13-1)*256 = 2,096,896 < 2^22 and ramp <=
-  // (2^13-1)*255 = 2,087,205 < 2^22: a 22-bit concat/shift/subtract
-  // chain cannot truncate at ANY k (k=3's small counter with the
-  // large gap shift only ever divides the 22-bit ramp down — falling
-  // gap <= 254, rising gap = 255 - that, both 8-bit-safe). The two
-  // subtract operands are the same 22-bit zero-extension of cnt, so
-  // the whole expression runs at 22 bits with no underflow
-  // (256*cnt >= cnt) and no assignment truncation.
-  wire [21:0] trem_ramp = ({8'd0, trem_cnt} << trem_rshift) - {8'd0, trem_cnt};
-  wire [7:0]  trem_gap = trem_dir ? (trem_span - (trem_ramp >> trem_exp))
-                                  : (trem_ramp >> trem_exp);
-  wire [15:0] trem_out = $signed(s5_r) >>> (trem_gap >> 6);
+  wire [7:0] trem_tri  = trem_p[21] ? ~trem_p[20:13] : trem_p[20:13];
+  wire [8:0] trem_gain = 9'd256 - {2'b00, trem_tri[7:1]} - {3'b000, trem_tri[7:2]};
+
+  // Shared multiplier: trem (step 6) is its only user so far; later
+  // steps (comp, gate, drive) mux their operands onto a/b by step.
+  wire signed [16:0] mul_a = {s5_r[15], s5_r};
+  wire        [11:0] mul_b = {3'b000, trem_gain};
+  wire signed [28:0] mul_p;
+  mult u_mult (.a(mul_a), .b(mul_b), .p(mul_p));
+
+  wire [15:0] trem_out = mul_p[23:8];   // >>> 8; fits 16 bits (gain <= 256)
 
   wire [15:0] s6_w = en[4] ? trem_out : s5_r;
-
-  // ------------------------------------------------------------------
-  // Stage 6 — delay/chorus: identity stub (Rev B QSPI-PSRAM block;
-  // the enable is a no-op in Rev A).
-  // ------------------------------------------------------------------
-  wire [15:0] delay_out = s6_w;   // Rev B (identity; folded into the last step)
 
   // ------------------------------------------------------------------
   // Chain output (name kept from v1: the audio tooling probes
@@ -395,7 +400,7 @@ module tt_um_tmcdonagh_guitar_pedal (
         3'd3: s3_r <= s3_w;            // dist
         3'd4: s4_r <= s3_r;            // tone/gate slot (identity for now)
         3'd5: s5_r <= s5_w;            // phaser stub
-        3'd6: effect_sample <= s6_w;   // trem (delay stub is identity)
+        3'd6: effect_sample <= s6_w;   // trem (the delay stub is identity)
         default: ;
       endcase
     end
@@ -423,22 +428,20 @@ module tt_um_tmcdonagh_guitar_pedal (
   // ------------------------------------------------------------------
   // Clip LED (v2.2 task 6): dp on uo[7] with ~2048-frame (~43 ms)
   // peak-hold. hit = (effect_sample == 16'h7FFF) || (effect_sample ==
-  // 16'h8000) — the two saturation rails (full-scale positive and
-  // -32768), which are bitwise complements, so no single equality
-  // covers both. Written as the value-equal reduction form (0x7FFF =
-  // 0_111111111111111: bit 15 clear, low 15 all ones; 0x8000 =
-  // 1_000000000000000: bit 15 set, low 15 all zeros) — one mux of two
-  // 15-bit reduction trees instead of two 16-bit comparator expands:
+  // 16'h8000) — the two saturation rails, which are bitwise
+  // complements, so no single equality covers both. Written as the
+  // value-equal reduction form — one mux of two 15-bit reduction trees
+  // instead of two 16-bit comparators:
   //   x[15]=0 -> &x[14:0]  (x == 0x7FFF)
   //   x[15]=1 -> ~|x[14:0] (x == 0x8000)
-  // The compare is evaluated once per output frame on chain_done —
-  // the clk after effect_sample loads (~8 clk after the valid edge) — so the detect sees each transmitted sample exactly
-  // once (bypass and the comb stages: the very value the TX shift
-  // sends next frame). Hold: a hit lights dp_q and reloads
-  // the 11-bit counter to 0; otherwise, while lit, the counter runs up
-  // to 2047 and clears dp_q on the edge it wraps (2047 + 1 = 0 in 11
-  // bits, so the terminal state needs no separate reset path). A hit
-  // mid-hold restarts the hold.
+  // The hit is taken at chain_done: the clk after effect_sample loads
+  // (step 6, ~8 clk after the sample_valid edge), once per output
+  // frame, so the detect sees each transmitted sample exactly once (the
+  // very value the TX shift sends next frame). Hold: a hit lights dp_q
+  // and reloads the 11-bit counter to 0; otherwise, while lit, the
+  // counter runs up to 2047 and clears dp_q on the edge it wraps
+  // (2047 + 1 = 0 in 11 bits, so the terminal state needs no separate
+  // reset path). A hit mid-hold restarts the hold.
   // ------------------------------------------------------------------
   wire hit = effect_sample[15] ? ~|effect_sample[14:0]   // 0x8000
                                :  &effect_sample[14:0];  // 0x7FFF
@@ -465,15 +468,23 @@ module tt_um_tmcdonagh_guitar_pedal (
   // SPI idle for Rev B PSRAM: SCK = 0, CS = 1 (deselected), MOSI = 0
   assign uo_out  = {dp_q, 4'b0000, 3'b010};
 
-  assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
-  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (knob pins K1..K3 on uio[4:2], reserved SPI MISO on uio[5])
+  // [7]=LRCLK, [6]=BCLK, [5]=0 (MISO input), [4:2]=0 (knob discharge
+  // level, enabled only while each reader drives), [1]=DAC data,
+  // [0]=MCLK = clk (512 fs)
+  assign uio_out = {lrclk, bclk, 1'b0, 3'b000, dac_data, clk};
+  // uio[7:6] + uio[1:0] outputs; uio[5] input (reserved SPI MISO);
+  // uio[4:2] = knob pins K3..K1, outputs only while discharging
+  assign uio_oe  = {2'b11, 1'b0, k3_drv, k2_drv, k1_drv, 2'b11};
 
   // List all unused inputs to prevent warnings
   // (ui[7:1] = switches and ui[0] = ADC data are live; uio[7:6]/[1:0]
-  // are clock/data outputs, their input side is unused; uio[4:2] knob
-  // pins are read nowhere until the knob task and uio[5] is the
-  // reserved SPI MISO. env feeds the comp ladder and the fuzz clip point)
-  wire _unused = &{ena, uio_in, en[5], delay_out, 1'b0};
+  // are clock/data outputs, their input side is unused; uio[5] is the
+  // reserved SPI MISO; uio[4:2] feed the knob readers. K2/K3 readings
+  // have no consumer until their tasks; the multiplier's bits outside
+  // the trem's >>> 8 window are unused)
+  wire _unused = &{ena, uio_in[7:5], uio_in[1:0], en[5],
+                   k2_value, k2_present, k3_value, k3_present,
+                   mul_p[28:24], mul_p[7:0], trem_tri[0], 1'b0};
 
 endmodule
 

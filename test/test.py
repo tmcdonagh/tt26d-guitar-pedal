@@ -7,7 +7,8 @@
 import cocotb
 import golden_model
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, Timer
+from cocotb.triggers import ClockCycles, Timer, ValueChange, with_timeout
+from cocotb.utils import get_sim_time
 
 
 @cocotb.test()
@@ -28,7 +29,11 @@ async def test_skeleton_baseline(dut):
 
     # MCLK output enabled on uio[0] and following clk.
     # Sample away from clock edges (comb outputs need settle time).
-    assert dut.uio_oe.value == 0b1100_0011, "uio_oe must enable only uio[7:6] and uio[1:0]"
+    # fixed bits: uio[7:6] + uio[1:0] outputs, uio[5] input; uio[4:2] are
+    # the knob readers' discharge drives (toggle; see test_pin_map)
+    assert int(dut.uio_oe.value) & 0b1110_0011 == 0b1100_0011, \
+        "uio_oe must enable uio[7:6] and uio[1:0], uio[5] an input"
+    assert int(dut.uio_out.value) & 0b0011_1100 == 0, "uio_out[5:2] must be 0"
     vals = []
     toggles = 0
     prev = None
@@ -132,6 +137,13 @@ def tx_data_bits(bits):
 # settle before it probes.
 SETTLE_FRAMES = 600
 
+# golden_model frame index of the frame start() returns at. The tb_audio /
+# model frame 0 starts at reset release (lr_cnt = 0, WS already low), so
+# the first WS fall after reset — start()'s "frame 0" — begins model frame
+# 1. Stateful per-frame paths (the trem phase from EN_SETTLE) need the
+# exact index: model inputs are [0] * START_FRAME + the driven words.
+START_FRAME = SETTLE_FRAMES + 1
+
 
 async def start(dut, ui_in, uio_in=0, clock=True):
     """Clock, reset, drive the inputs, then wait SETTLE_FRAMES frames for
@@ -164,30 +176,89 @@ async def resettle(dut, ui_in):
     await _wait_left_start(dut)
 
 
-async def _trem_probe(dut, cur, count, x=16384):
-    """LFO-count-locked capture for the trem tests. With the sim at the
-    start of frame `cur` (right after a WS fall; frames < cur may already
-    have been driven), advance/drive/capture so the returned value is
-    frame `count`'s output — the effect of frame count-1's input x,
-    produced with post-strobe LFO count == count (frame F's strobe
-    leaves count F+1). Caveat: that count == count correspondence holds
-    only before the first LFO wrap — once the counter wraps at 2^exp-1,
-    the post-strobe count is count mod 2^exp and the direction has
-    flipped (the k=1 CONFIG's count-4096 probe samples post-wrap count
-    0, rising). Probe counts here stay in the falling direction unless
-    they cross a wrap. Consecutive counts reuse the previous capture
-    round's drive (it drove the same x). Returns (new cur, out).
+async def fast_frames(dut, words):
+    """Low-overhead I2S driver for long runs: from a left-half start (as
+    start()/_wait_left_start return, 1 ns after the WS-fall clk edge)
+    drive one frame per 16-bit word on ui[0] and capture each frame's
+    TX word from uio[1], using sim-time Timers instead of per-clk
+    polling (~65 awaits/frame). Capture j is the result of input frame
+    j-1 (one-frame TX latency). Returns signed captures, ending at the
+    next left start (+1 ns)."""
+    outs = []
+    for w in words:
+        w &= 0xFFFF
+        v = 0
+        for slot in range(32):
+            dut.ui_in[0].value = (w >> (16 - slot)) & 1 if 1 <= slot <= 16 else 0
+            await Timer(4 * CLK_PERIOD_PS, unit="ps")   # mid-slot
+            if 1 <= slot <= 16:
+                v = (v << 1) | int(dut.uio_out[1].value)
+            await Timer(4 * CLK_PERIOD_PS, unit="ps")
+        await Timer(256 * CLK_PERIOD_PS, unit="ps")     # right half
+        outs.append(v - 0x10000 if v & 0x8000 else v)
+    return outs
 
-    Requires: count >= cur (increasing probes) and, when count == cur,
-    the previous round must have driven x on frame count-1."""
-    if cur <= count - 1:
-        await ClockCycles(dut.clk, 512 * (count - 1 - cur))
-        await i2s_send_and_capture(dut, (x & 0xFFFF) << 8)   # drive frame count-1
-        await _wait_left_start(dut)                          # start of frame count
-    bits = await i2s_send_and_capture(dut, (x & 0xFFFF) << 8)  # capture frame count
-    await _wait_left_start(dut)                              # start of frame count+1
-    out = tx_data_bits(bits)
-    return count + 1, (out - 0x10000 if out & 0x8000 else out)
+
+# RC knob pin model (v3 task 9): K1..K3 on uio[2..4]. While the reader
+# drives its pin (uio_oe[2+idx] = 1, discharge) the pin reads 0; after the
+# drive releases, the pin reads 1 exactly N = 64*v + 32 - SYNC_LAT clk
+# later (at the falling clk edge closing clk N), so the reader's charge
+# count lands mid-bin at 64*v + 32 and raw == v. SYNC_LAT = 2: the
+# 2-flop synchronizer (the count itself starts at 0 on the release edge).
+# v = None holds the pin at 0 (knob absent). Event-driven on uio_oe.
+KNOB_SYNC_LAT = 2
+
+
+class KnobPin:
+    def __init__(self, dut, idx, v):
+        self.dut, self.idx, self.v = dut, idx, v
+        self.pin = dut.uio_in[2 + idx]
+        self.task = cocotb.start_soon(self._run())
+
+    def _oe(self):
+        val = self.dut.uio_oe.value
+        return (int(val) >> (2 + self.idx)) & 1 if val.is_resolvable else None
+
+    async def _run(self):
+        prev = self._oe()
+        while True:
+            await ValueChange(self.dut.uio_oe)
+            cur = self._oe()
+            if cur == 1:
+                self.pin.value = 0
+            elif cur == 0 and prev == 1 and self.v is not None:
+                n = 64 * self.v + 32 - KNOB_SYNC_LAT
+                await Timer(n * CLK_PERIOD_PS + CLK_PERIOD_PS // 2, unit="ps")
+                cur = self._oe()
+                if cur == 0:          # still charging (no reset meanwhile)
+                    self.pin.value = 1
+            prev = cur
+
+
+def knob_pin(dut, idx, v):
+    """Start the knob pin model for K(idx+1); set .v later to re-time."""
+    return KnobPin(dut, idx, v)
+
+
+async def knob_cycle(dut, idx):
+    """Wait for one full charge phase of knob idx (uio_oe[2+idx] falls,
+    then rises = measurement done or timeout). Returns its length in clk.
+    Fails (instead of hanging) if no full cycle within 2 timeouts."""
+    return await with_timeout(_knob_cycle(dut, idx), 2 * 67000 * CLK_PERIOD_PS, "ps")
+
+
+async def _knob_cycle(dut, idx):
+    def oe():
+        val = dut.uio_oe.value
+        return (int(val) >> (2 + idx)) & 1 if val.is_resolvable else None
+    while oe() != 1:
+        await ValueChange(dut.uio_oe)
+    while oe() != 0:
+        await ValueChange(dut.uio_oe)
+    t0 = get_sim_time(unit="ps")
+    while oe() != 1:
+        await ValueChange(dut.uio_oe)
+    return round((get_sim_time(unit="ps") - t0) / CLK_PERIOD_PS)
 
 
 @cocotb.test()
@@ -325,8 +396,8 @@ async def test_reset_state(dut):
 # ui[5:1]=DIP effect enables en[4:0] (en[0]=comp .. en[4]=trem, bit
 # order = chain order), ui[6] reserved (the delay slot is an identity
 # stub), ui[7] = fuzz octave. All of ui[7:1] are debounced (see start()).
-# uio[4:2] are the knob pins (RC inputs, read nowhere until the knob
-# task; tests drive 0 = absent), uio[5] is reserved (SPI MISO).
+# uio[4:2] are the RC knob pins K1..K3 (tests drive 0 = absent unless a
+# knob_pin model runs), uio[5] is reserved (SPI MISO).
 
 @cocotb.test()
 async def test_comp(dut):
@@ -734,43 +805,138 @@ async def test_fuzz_dist_chain(dut):
     assert await chain_once(10000) == 17288    # blend 20000; w 80000
 
 
+def _probe(dut, *path):
+    """Guarded RTL-only internal probe (None on the flat GL netlist)."""
+    h = getattr(dut, "user_project", None)
+    for name in path:
+        h = getattr(h, name, None) if h is not None else None
+    return h
+
+
+async def _bare_reset(dut):
+    """Reset without the switch settle (the knob reader needs none)."""
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+
+
 @cocotb.test()
-async def test_tremolo(dut):
-    """Trem stage (en[4]): stepped-gain triangle LFO as built (v1) —
-    out = in >>> s, s = LFO gap >> 6 (gains 1, 1/2, 1/4, 1/8). Fixed
-    rate k = 0 (exp base 13: half-period 8192 frames, LFO full cycle
-    2.93 Hz at 48 kHz) until the knob stage returns the rate control;
-    the v3 task-2 k=1..3 rates (5.86/11.72/23.44 Hz) were pinned on
-    pin bits that no longer exist and come back as knob modes. Depth
-    span FIXED 255 (4 gain steps). The LFO counter value sampled by
-    each output is the post-increment one; frame F's input is output
-    in frame F+1 with count F+1 (validated against the v1 k=7
-    sequence). Task 7: the trem enable (ui[5]) goes through the switch
-    debounce, so the probes start after start()'s SETTLE_FRAMES settle
-    (the LFO runs from reset regardless — counts stay absolute frames
-    from the first left start after reset); every probe count is
-    beyond that. 7 exact values probed as boundary PAIRS at the
-    gain-step band edges, plus a wrap/direction probe (v1 parity)."""
-    await start(dut, 0b0010_0000)  # en[4] trem only (ui[5]); octave off
+async def test_knob_reader(dut):
+    """RC knob reader (knob_rc, K1 on uio[2]): discharge 1024 clk with
+    uio_oe[2] = 1, then charge until the pin reads 1; raw = cnt >> 6.
+    Port level: every charge phase lasts exactly 64*v + 33 clk (the pin
+    model's N = 64v + 32 - SYNC_LAT, + SYNC_LAT synchronizer, + the
+    detect edge), so uio_oe[2] toggles at the measurement rate. Probe
+    (RTL only): the first measurement loads value = raw = v (fast
+    startup), and after 20 measurements value == knob_steady(v) with
+    present = 1. Then the knob is pulled (pin held low): one timeout
+    (a 65536-clk charge phase) clears present, value holds."""
+    cocotb.start_soon(
+        Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2).start())
+    dut.ena.value = 1
+    dut.ui_in.value = 0
+    dut.uio_in.value = 0
+    kp = knob_pin(dut, 0, None)
+    k1 = _probe(dut, "k1")
+    # the port is named `value`, which a cocotb handle's .value shadows
+    kval = k1["value"] if k1 is not None else None
+    for v in (0, 77, 200):
+        kp.v = v
+        await _bare_reset(dut)
+        for m in range(20):
+            n = await knob_cycle(dut, 0)
+            assert n == 64 * v + 33, f"v={v} meas {m}: charge {n} clk != {64 * v + 33}"
+            if k1 is not None and m == 0:
+                await Timer(1, unit="ns")
+                assert int(kval.value) == v, f"v={v}: first raw/value {int(kval.value)} != {v}"
+        if k1 is not None:
+            await Timer(1, unit="ns")
+            assert int(kval.value) == golden_model.knob_steady(v)
+            assert int(k1.present.value) == 1, f"v={v}: present must be 1"
+    # absent: hold the pin low (set during the discharge phase)
+    kp.v = None
+    n = await knob_cycle(dut, 0)
+    assert n == 65536, f"absent: charge phase {n} clk != 65536 (timeout)"
+    if k1 is not None:
+        await Timer(1, unit="ns")
+        assert int(k1.present.value) == 0, "present must clear after a timeout"
+        assert int(kval.value) == golden_model.knob_steady(200), "value must hold"
 
-    # Each probe is (post-strobe LFO count, input x, expected output):
-    # out = x >>> (gap >> 6) with gap = ((cnt << 8) - cnt) >> exp
-    # (falling) — counts chosen as boundary PAIRS: the last count of
-    # one gain band and the first of the next (gap 63/64, 127/128,
-    # 191/192; s = gap>>6 = 0/1/2/3), so the ramp arithmetic is pinned
-    # exactly at every band edge (v2.2 lesson: boundary pairs, not end
-    # states). Wrap probe samples post-wrap count 0, rising (max gap
-    # 255 -> s=3). k=0 (exp 13): boundaries 2056/2057, 4112/4113,
-    # 6168/6169, wrap at 8192 (2.93 Hz full cycle).
-    probes = [(2056, 16384, 16384), (2057, 16384, 8192),
-              (4112, 16384, 8192), (4113, 16384, 4096),
-              (6168, 16384, 4096), (6169, 16384, 2048),
-              (8192, 16384, 2048)]
 
-    cur = SETTLE_FRAMES + 1
-    for count, x, exp in probes:
-        cur, out = await _trem_probe(dut, cur, count, x)
-        assert out == exp, f"count={count} x={x}: got {out}, exp {exp}"
+def _signed(x):
+    return x - 0x10000 if x & 0x8000 else x
+
+
+@cocotb.test()
+async def test_knob_absent_default(dut):
+    """K1 absent (pin tied low): the trem phase steps by the default 437
+    per frame (~5 Hz). Probe (RTL only): trem_p advances exactly 437 per
+    frame over 5 consecutive frames (and equals 437 * frames since the
+    enable reached the chain at EN_SETTLE). Port level: 20 consecutive
+    TX words on a constant 16384 equal golden_model (k1 = None)."""
+    await start(dut, 0x10 << 1)               # en[4] trem only, uio_in = 0
+    p = _probe(dut, "trem_p")
+    if p is not None:
+        ps = []
+        for _ in range(6):
+            ps.append(int(p.value))
+            await ClockCycles(dut.clk, 500)
+            await _wait_left_start(dut)
+        assert ps[0] == golden_model.TREM_INC_ABSENT * (START_FRAME - golden_model.EN_SETTLE)
+        d = [(b - a) & 0x3FFFFF for a, b in zip(ps, ps[1:])]
+        assert d == [437] * 5, f"phase steps {d}"
+    f0 = START_FRAME + (6 if p is not None else 0)
+    want = golden_model.render([0] * f0 + [16384] * 21, 0x10)
+    got = await fast_frames(dut, [16384] * 21)
+    assert got[1:] == want[f0:f0 + 20], f"got {got[1:]} want {want[f0:f0 + 20]}"
+
+
+# Smooth-trem step bound: gain = 256 - tri/2 - tri/4 moves by at most 2
+# per tri LSB, and tri moves by at most 1 per frame for every inc <= 8192
+# (K1 max inc 127 << 3 = 1016), so |dout| <= |x| * 2 / 256 = 128 at
+# x = 16384 (the old stepped trem jumped by 8192).
+TREM_MAX_STEP_16384 = 16384 * 2 // 256
+
+
+@cocotb.test()
+async def test_trem_smooth(dut):
+    """Smooth trem at K1 = 128 (inc = 256): constant 16384 for 2000
+    frames; the output equals golden_model frame-for-frame and never
+    steps by more than TREM_MAX_STEP_16384."""
+    knob_pin(dut, 0, 128)
+    await start(dut, 0x10 << 1)
+    n = 2000
+    got = (await fast_frames(dut, [16384] * (n + 1)))[1:]
+    want = golden_model.render([0] * START_FRAME + [16384] * n, 0x10, k1=128)[START_FRAME:]
+    first = next((i for i in range(n) if got[i] != want[i]), None)
+    assert first is None, f"frame {first}: got {got[first]} want {want[first]}"
+    step = max(abs(a - b) for a, b in zip(got, got[1:]))
+    assert step <= TREM_MAX_STEP_16384, f"max |dout| {step}"
+    assert len(set(got)) > 20, "trem must move"
+
+
+@cocotb.test()
+async def test_trem_rate_change(dut):
+    """K1 128 -> 250 mid-run (pin model re-timed): the phase keeps
+    accumulating (no reset/jump), so the output stays smooth across the
+    change. Before the change the output equals golden_model (k1 = 128);
+    across it max |dout| <= TREM_MAX_STEP_16384; probe (RTL only): the
+    knob value has moved to within the hysteresis of 250."""
+    kp = knob_pin(dut, 0, 128)
+    await start(dut, 0x10 << 1)
+    pre = (await fast_frames(dut, [16384] * 201))[1:]
+    want = golden_model.render([0] * START_FRAME + [16384] * 200, 0x10, k1=128)[START_FRAME:]
+    assert pre == want, "pre-change output must equal golden (k1=128)"
+    kp.v = 250
+    post = await fast_frames(dut, [16384] * 600)
+    seq = pre + post[1:]
+    step = max(abs(a - b) for a, b in zip(seq, seq[1:]))
+    assert step <= TREM_MAX_STEP_16384, f"max |dout| across the change {step}"
+    k1 = _probe(dut, "k1")
+    if k1 is not None:
+        kv = int(k1["value"].value)
+        assert int(k1.present.value) == 1
+        assert kv >= 248, f"knob value {kv} must track 250"
 
 
 @cocotb.test()
@@ -787,15 +953,16 @@ async def test_chain_enables(dut):
     dist stacked: the task-4 asym fuzz feeds the shaper mag(s2) (both
     fuzz clip points sit above the dist knees; dist is the v3 diode
     knee, octave off)."""
-    # trem first, on a fresh reset (needs the LFO advanced from reset: gap
-    # >> 6 = 2 at post-strobe counts 5000/5003 on the fixed k=0 /
-    # span-255 params — mid-band of the slowest rate, exp base 13)
+    # trem first, on a fresh reset (K1 absent -> inc 437): the expected
+    # words come from golden_model.render of the whole frame history
     await start(dut, 0b0010_0000)             # en[4] trem only (ui[5])
-    cur = SETTLE_FRAMES + 1
-    cur, out = await _trem_probe(dut, cur, 5000, 16384)
-    assert out == 4096, f"trem ON: 16384 >>> 2, got {out}"
-    cur, out = await _trem_probe(dut, cur, 5003, -32768)
-    assert out == -8192, f"trem ON: -32768 >>> 2, got {out}"
+    xs = [16384, -32768, 0]
+    got = await fast_frames(dut, xs)
+    want = golden_model.render([0] * START_FRAME + xs, 0x10)
+    assert got[1] == want[START_FRAME] == (16384 * golden_model.trem_gain(
+        437 * (START_FRAME + 1 - golden_model.EN_SETTLE))) >> 8, f"trem ON 16384: {got[1]}"
+    assert got[2] == want[START_FRAME + 1], f"trem ON -32768: {got[2]} != {want[START_FRAME + 1]}"
+    assert -32768 < got[2] < 0
 
     # every other stage on a fresh reset (env = 0 after the silent
     # settle) so the env-dependent pins can be derived from the golden
@@ -930,8 +1097,10 @@ async def test_enable_bounce(dut):
 
 @cocotb.test()
 async def test_pin_map(dut):
-    """v3 pin map at reset and idle: uio_oe = 0b1100_0011 (uio[7:6] +
-    uio[1:0] outputs; uio[4:2] knob pins and uio[5] MISO stay inputs),
+    """v3 pin map at reset and idle: uio_oe = {1,1,0,k3,k2,k1,1,1}
+    (uio[7:6] + uio[1:0] outputs, uio[5] MISO input; uio[4:2] are the
+    knob pins, driven low only while their reader discharges: all three
+    in reset and for the first 1024 clk after it), uio_out[5:2] = 0,
     uo[2:0] = 0b010 (SPI SCK low, CS high, MOSI low) with the dp LED
     and uo[6:3] dark."""
     cocotb.start_soon(
@@ -943,11 +1112,19 @@ async def test_pin_map(dut):
     await ClockCycles(dut.clk, 10)
     # asserted straight away in reset too — the idle level must not depend on state
     await Timer(1, unit="ns")
-    assert dut.uio_oe.value == 0b1100_0011, f"uio_oe in reset: {dut.uio_oe.value}"
+    assert dut.uio_oe.value == 0b1101_1111, f"uio_oe in reset: {dut.uio_oe.value}"
+    assert int(dut.uio_out.value) & 0b0011_1100 == 0, "uio_out[5:2] must be 0 in reset"
     assert int(dut.uo_out.value) & 0x07 == 0b010, "uo[2:0] must idle SCK=0 CS=1 MOSI=0 in reset"
     dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 1020)
+    await Timer(1, unit="ns")
+    assert dut.uio_oe.value == 0b1101_1111, "knob pins must discharge for 1024 clk"
+    await ClockCycles(dut.clk, 10)
+    await Timer(1, unit="ns")
+    assert dut.uio_oe.value == 0b1100_0011, "knob pins must release after the discharge"
+    assert int(dut.uio_out.value) & 0b0011_1100 == 0, "uio_out[5:2] must be 0"
     await start(dut, 0, clock=False)
-    assert dut.uio_oe.value == 0b1100_0011, f"uio_oe: {dut.uio_oe.value}"
+    assert int(dut.uio_oe.value) & 0b1110_0011 == 0b1100_0011, f"uio_oe: {dut.uio_oe.value}"
     assert int(dut.uo_out.value) & 0x07 == 0b010, \
         f"uo[2:0] must idle SCK=0 CS=1 MOSI=0, got {int(dut.uo_out.value) & 7:03b}"
     assert int(dut.uo_out.value) == 0x02, "uo[7:3] must be 0 at idle (dp dark)"
@@ -1053,15 +1230,15 @@ async def test_chain_latency(dut):
     NEXT frame, and a mid-level frame in the same position does not."""
     ins = [12000, -20000, 30000, 0]
     await start(dut, 0x17 << 1)
-    xs = [0] * SETTLE_FRAMES + ins
+    xs = [0] * START_FRAME + ins
     want = golden_model.render(xs, 0x17)
     for j, x in enumerate(ins):
         bits = await i2s_send_and_capture(dut, (x & 0xFFFF) << 8)
         await _wait_left_start(dut)
         out = tx_data_bits(bits)
         out = out - 0x10000 if out & 0x8000 else out
-        # capture j (frame SETTLE_FRAMES + j) carries frame (.. + j - 1)'s result
-        exp = want[SETTLE_FRAMES + j - 1]
+        # capture j (model frame START_FRAME + j) carries frame (.. + j - 1)'s result
+        exp = want[START_FRAME + j - 1]
         assert out == exp, f"frame {j}: got {out}, golden {exp}"
 
     # (b) LED timing, identity chain

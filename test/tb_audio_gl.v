@@ -37,9 +37,11 @@
 // Output: one "S:xxxx" line per frame on stdout (captured per-mode by the
 //         .log file in audio_out_gl/), converted to .wav by wav_tool.py
 //
-// +EN/+OCT/+N interface and ui/uio byte layout: identical to tb_audio.v
-// (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=fuzz octave via +OCT=,
-// ui[0]=ADC data; uio_in = 0: knob pins uio[4:2] low, uio[5] MISO idle).
+// +EN/+OCT/+N/+K1/+K2/+K3 interface and ui/uio byte layout: identical to
+// tb_audio.v (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=fuzz octave
+// via +OCT=, ui[0]=ADC data; knob pins uio[4:2] follow the same RC pin
+// model, -1 = absent = held low; uio[5] MISO idles low). The K1 settle
+// probe is RTL-only (tb_audio.v).
 // Samples are printed as prefixed "S:xxxx" lines, as in tb_audio.v.
 
 `timescale 1ps/1ps
@@ -52,7 +54,8 @@ module tb_audio_gl;
   reg rst_n = 1'b0;
   reg ena = 1'b1;
   reg [7:0] ui_in = 8'h00;
-  reg [7:0] uio_in = 8'h00;
+  wire [7:0] uio_in;
+  wire [7:0] uio_oe;
 
   // ~24.576 MHz clock
   always #(CLK_HALF) clk = ~clk;
@@ -75,7 +78,7 @@ module tb_audio_gl;
       .uo_out (),
       .uio_in (uio_in),
       .uio_out(uio_out),
-      .uio_oe (),
+      .uio_oe (uio_oe),
       .ena    (ena),
       .clk    (clk),
       .rst_n  (rst_n)
@@ -83,9 +86,44 @@ module tb_audio_gl;
 
   wire [7:0] uio_out;
 
+  // RC knob pin model (v3 task 9; same as test.py KnobPin): while the
+  // reader drives its pin (uio_oe[2+k] = 1, discharge) the pin reads 0;
+  // after the release it reads 1 exactly N = 64*v + 32 - SYNC_LAT clk
+  // later (set at the falling clk edge closing clk N), so the reader's
+  // charge count lands mid-bin at 64*v + 32 and raw == v. SYNC_LAT = 2
+  // (the reader's 2-flop synchronizer). v = -1 (+Kn absent, the
+  // default) holds the pin at 0 (knob absent). uio[5] (MISO) idles 0.
+  localparam integer SYNC_LAT = 2;
+  reg k1_pin = 1'b0, k2_pin = 1'b0, k3_pin = 1'b0;
+  integer k1c = 0, k2c = 0, k3c = 0;
+  assign uio_in = {3'b000, k3_pin, k2_pin, k1_pin, 2'b00};
+
+  always @(negedge clk) begin
+    if (k1v < 0 || uio_oe[2] !== 1'b0) begin k1_pin = 1'b0; k1c = 0; end
+    else begin
+      if (k1c == 64 * k1v + 32 - SYNC_LAT) k1_pin = 1'b1;
+      k1c = k1c + 1;
+    end
+  end
+  always @(negedge clk) begin
+    if (k2v < 0 || uio_oe[3] !== 1'b0) begin k2_pin = 1'b0; k2c = 0; end
+    else begin
+      if (k2c == 64 * k2v + 32 - SYNC_LAT) k2_pin = 1'b1;
+      k2c = k2c + 1;
+    end
+  end
+  always @(negedge clk) begin
+    if (k3v < 0 || uio_oe[4] !== 1'b0) begin k3_pin = 1'b0; k3c = 0; end
+    else begin
+      if (k3c == 64 * k3v + 32 - SYNC_LAT) k3_pin = 1'b1;
+      k3c = k3c + 1;
+    end
+  end
+
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
   integer en_dip = 0, oct_sw = 0, n_in = 0;
+  integer k1v = -1, k2v = -1, k3v = -1;   // knob plusargs, -1 = absent
   integer i, slot;
   reg [15:0] word;
   reg [15:0] cap;   // DAC-side sample reassembled from uio_out[1]
@@ -95,15 +133,18 @@ module tb_audio_gl;
     dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("OCT=%d", oct_sw);
     dummy = $value$plusargs("N=%d", n_in);
+    dummy = $value$plusargs("K1=%d", k1v);
+    dummy = $value$plusargs("K2=%d", k2v);
+    dummy = $value$plusargs("K3=%d", k3v);
     ui_in[7:1] = {oct_sw[0], en_dip[5:0]};      // ui[6:1]=enables en[5:0], ui[7]=fuzz octave
-    uio_in     = 8'h00;                         // knob pins uio[4:2] low (absent), uio[5] MISO idle
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
     $readmemh("audio_in.hex", mem);
     n_samples = n_in;
-    $display("loaded %0d samples, EN=%0d OCT=%0d", n_samples, en_dip, oct_sw);
+    $display("loaded %0d samples, EN=%0d OCT=%0d K1=%0d K2=%0d K3=%0d",
+             n_samples, en_dip, oct_sw, k1v, k2v, k3v);
 
     // reset
     rst_n = 1'b0;
