@@ -20,3 +20,5 @@ test/obj_dir/
 test/obj_dir_gl/
 test/sim_audio.vvp
 test/sim_audio_gl.vvp
+test/audio_excerpt.hex
+test/audio_model/

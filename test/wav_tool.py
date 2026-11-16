@@ -13,14 +13,22 @@ Usage (from test/):
     python3 wav_tool.py hex2wav
     python3 wav_tool.py gl-cmd       # print the GL iverilog command (dry run)
     python3 wav_tool.py gl-parity    # bit-exact GL-vs-RTL WAV check
+    python3 wav_tool.py check        # ~6 s excerpt: Verilator vs golden model
+    python3 wav_tool.py model        # full-riff golden renders -> audio_model/
 """
 import array
 import os
 import re
+import hashlib
 import shlex
+import struct
 import subprocess
 import sys
+import tempfile
 import wave
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # works under python3 -I
+import golden_model  # noqa: E402
 
 SR = 48000
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,6 +37,21 @@ IN_HEX = os.path.join(HERE, "audio_in.hex")
 OUT_DIR = os.path.join(HERE, "audio_out")
 OUT_DIR_GL = os.path.join(HERE, "audio_out_gl")  # netlist outputs; audio_out/ = RTL parity baseline
 GL_VVP = os.path.join(HERE, "sim_audio_gl.vvp")
+EXCERPT_HEX = os.path.join(HERE, "audio_excerpt.hex")
+MODEL_DIR = os.path.join(HERE, "audio_model")
+VL_EXE = os.path.join(HERE, "obj_dir", "sim_audio_vl")
+
+# 6 s window of the riff (2452800 = 51.1 s in), picked by script: first
+# 4800-frame-aligned start whose first second holds a frame with |x| >= 24000
+# (measured peak 30570) and which holds a stretch where a 2400-frame moving
+# max of |x| stays < 600 for >= 12000 frames (measured 16558 frames, 0.345 s).
+EXCERPT_START = 2452800
+EXCERPT_FRAMES = 288000
+
+# sha256 of little-endian int16 bytes of
+# golden_model.render(excerpt, en=0x02, tgb=True)[1024:], computed at 2063810
+# behavior. Fuzz-sound regression: any change to the fuzz voicing breaks it.
+FUZZ_BASELINE_SHA256 = "daadb2a3c1a6f891dd9cb47bd24bdfe0381babf752e514d2ed75e4484f3fe94c"
 
 # name, en (ui[6:1], bit order = chain order en[0]=comp..en[5]=delay;
 # +EN range 0..63), params (P0..P2 on uio[4:2]: P0=bit0=uio[2],
@@ -44,6 +67,7 @@ MODES = [
     ("fuzzdist", 0x06, 0x0),  # rectify + clip 16384, then soft knee
     ("all4",     0x17, 0x0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
 ]
+CHECK_MODES = list(MODES)
 
 
 def wav2hex():
@@ -173,6 +197,87 @@ def gl_parity():
         raise SystemExit(f"parity FAIL: {bad} — systematic debugging before any 'close enough' conclusion")
 
 
+def read_wav(path):
+    with wave.open(path, "rb") as w:
+        a = array.array("h")
+        a.frombytes(w.readframes(w.getnframes()))
+    return list(a)
+
+
+def vl_build():
+    subprocess.check_call(
+        ["verilator", "--binary", "--timing", "-j", "16", "-o", "sim_audio_vl",
+         "--top-module", "tb_audio", "--Mdir", os.path.join(HERE, "obj_dir"),
+         "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC",
+         os.path.join(HERE, "tb_audio.v")]
+        + sorted(os.path.join(HERE, "..", "src", f)
+                 for f in os.listdir(os.path.join(HERE, "..", "src")) if f.endswith(".v")),
+        cwd=HERE, stdout=subprocess.DEVNULL)
+
+
+def check():
+    """Fast gate: Verilator sim vs golden model on the excerpt, bit-exact."""
+    full = read_wav(IN_WAV)
+    ex = full[EXCERPT_START:EXCERPT_START + EXCERPT_FRAMES]
+    assert len(ex) == EXCERPT_FRAMES, "excerpt runs past end of audio_in.wav"
+    vl_build()
+    with open(EXCERPT_HEX, "w") as f:
+        f.write("\n".join("%04x" % (s & 0xFFFF) for s in ex))
+    with tempfile.TemporaryDirectory() as tmp:
+        procs = []
+        for name, en, params in MODES:
+            log = open(os.path.join(tmp, f"{name}.log"), "w")
+            procs.append(subprocess.Popen(
+                [VL_EXE, f"+EN={en}", f"+PARAMS={params}", f"+N={EXCERPT_FRAMES}",
+                 f"+IN={EXCERPT_HEX}", "+OUT=unused"],
+                stdout=log, stderr=subprocess.STDOUT, cwd=HERE))
+        for p in procs:
+            p.wait()
+        bad = False
+        for name, en, params in CHECK_MODES:
+            want = golden_model.render_params(ex, en, params)
+            got = []
+            with open(os.path.join(tmp, f"{name}.log")) as f:
+                for line in f:
+                    s = line.strip()
+                    if len(s) == 4 and all(c in "0123456789abcdefABCDEF" for c in s):
+                        v = int(s, 16)
+                        got.append(v - 0x10000 if v & 0x8000 else v)
+            first = next((i for i in range(min(len(got), len(want))) if got[i] != want[i]), None)
+            if first is None and len(got) != len(want):
+                first = min(len(got), len(want))
+            if first is None:
+                print(f"{name}: PASS")
+            else:
+                bad = True
+                g = got[first] if first < len(got) else None
+                print(f"{name}: FAIL (first mismatch frame {first}: got {g}/want {want[first] if first < len(want) else None})")
+    fz = golden_model.render(ex, en=0x02, tgb=True)[1024:]
+    digest = hashlib.sha256(struct.pack(f"<{len(fz)}h", *fz)).hexdigest()
+    if digest == FUZZ_BASELINE_SHA256:
+        print("fuzz-regression: PASS")
+    else:
+        bad = True
+        print(f"fuzz-regression: FAIL (sha256 {digest} != baseline {FUZZ_BASELINE_SHA256})")
+    if bad:
+        raise SystemExit(1)
+
+
+def model():
+    """Full-riff golden renders to audio_model/<mode>.wav (for listening)."""
+    os.makedirs(MODEL_DIR, exist_ok=True)
+    full = read_wav(IN_WAV)
+    for name, en, params in MODES:
+        out = golden_model.render_params(full, en, params)
+        path = os.path.join(MODEL_DIR, f"{name}.wav")
+        with wave.open(path, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(SR)
+            w.writeframes(array.array("h", out).tobytes())
+        print(f"{path}: {len(out)} samples")
+
+
 def run_mode(name, en, params, n, sim):
     out = os.path.join(OUT_DIR_GL if sim.startswith("gl") else OUT_DIR, f"{name}.hex")
     if sim == "gl":
@@ -211,6 +316,10 @@ def main():
         glvl_build()
     elif what == "gl-parity":
         gl_parity()
+    elif what == "check":
+        check()
+    elif what == "model":
+        model()
     elif what == "run":
         out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
         os.makedirs(out_dir, exist_ok=True)

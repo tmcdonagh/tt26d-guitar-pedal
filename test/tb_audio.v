@@ -15,14 +15,13 @@
 // Compile (icarus; ../src/*.v picks up the top module and its sources):
 //   $ iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/*.v
 // Listening-sim build (Verilator; the binary wav_tool.py runs). The
-// -Wno waivers cover WIDTH warnings in the trem arithmetic and the
-// template placeholder src/project.v (the task-4 dist rewrite is
-// warning-clean); --top-module pins the tb as the sim top:
+// -Wno waivers cover WIDTH warnings in the trem arithmetic;
+// --top-module pins the tb as the sim top:
 //   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
-//       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC -Wno-MULTITOP tb_audio.v ../src/*.v
+//       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
 //   vvp sim_audio.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out/fuzzoct.hex
-// Input:  audio_in.hex (one 16-bit sample per line, from audio_in.wav)
+// Input:  audio_in.hex, or +IN=<file> (one 16-bit sample per line, from audio_in.wav)
 // Output: $OUT, one 16-bit sample per frame
 
 `timescale 1ps/1ps
@@ -57,18 +56,20 @@ module tb_audio;
   integer i, slot;
   reg [15:0] word;
   integer dummy;
+  reg [8*256-1:0] in_file = "audio_in.hex";
 
   initial begin
     dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("PARAMS=%d", params);
     dummy = $value$plusargs("N=%d", n_in);
+    dummy = $value$plusargs("IN=%s", in_file);
     ui_in[7:1] = {1'b0, en_dip[5:0]};           // ui[6:1]=enables en[5:0], ui[7]=reserved (driven 0)
     uio_in     = {3'b000, params[2:0], 2'b00};  // P0..P2 on uio[4:2] (P0=bit0=uio[2])
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
-    $readmemh("audio_in.hex", mem);
+    $readmemh(in_file, mem);
     n_samples = n_in;
     $display("loaded %0d samples, EN=%0d PARAMS=%0d", n_samples, en_dip, params);
 
