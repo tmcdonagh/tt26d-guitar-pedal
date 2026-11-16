@@ -54,18 +54,17 @@ EXCERPT_FRAMES = 288000
 FUZZ_BASELINE_SHA256 = "daadb2a3c1a6f891dd9cb47bd24bdfe0381babf752e514d2ed75e4484f3fe94c"
 
 # name, en (ui[6:1], bit order = chain order en[0]=comp..en[5]=delay;
-# +EN range 0..63), params (P0..P2 on uio[4:2]: P0=bit0=uio[2],
-# P1=bit1=uio[3], P2=bit2=uio[4]; +PARAMS range 0..7)
+# +EN range 0..63), oct (ui[7] fuzz octave switch; +OCT 0/1). The switches
+# are debounced in the DUT: golden_model.EN_SETTLE frames render as off.
 MODES = [
-    ("bypass",   0x0,  0x0),  # all stages off — digital clean identity
-    ("comp",     0x01, 0x0),  # comp: env-driven gain steps
-    ("fuzz",     0x02, 0x0),  # asym clip, env-biased negative point
-    ("fuzzoct",  0x02, 0x1),  # fuzz + P0=1 octave blend
-    ("dist",     0x04, 0x0),  # diode-knee PWL, fixed drive x4
-    ("trem",     0x10, 0x0),  # k=0 (~2.93 Hz), fixed span (4 steps)
-    ("tremF",    0x10, 0x6),  # k=3 fast rate (~23.44 Hz) — by-ear chop comparison
-    ("fuzzdist", 0x06, 0x0),  # fuzz clip, then diode knee
-    ("all4",     0x17, 0x0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
+    ("bypass",   0x0,  0),  # all stages off — digital clean identity
+    ("comp",     0x01, 0),  # comp: env-driven gain steps
+    ("fuzz",     0x02, 0),  # asym clip, env-biased negative point
+    ("fuzzoct",  0x02, 1),  # fuzz + octave blend
+    ("dist",     0x04, 0),  # diode-knee PWL, fixed drive x4
+    ("trem",     0x10, 0),  # k=0 (~2.93 Hz), fixed span (4 steps)
+    ("fuzzdist", 0x06, 0),  # fuzz clip, then diode knee
+    ("all4",     0x17, 0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
 ]
 CHECK_MODES = list(MODES)
 
@@ -84,15 +83,25 @@ def wav2hex():
     return len(a)
 
 
+SAMPLE_RE = re.compile(r"^S:([0-9a-fA-F]{4})$")
+
+
+def parse_samples(log_path):
+    """Signed samples from a sim log: only the tb's prefixed "S:xxxx"
+    lines count (other $display output and sim chatter are ignored)."""
+    vals = []
+    with open(log_path) as f:
+        for line in f:
+            m = SAMPLE_RE.match(line.strip())
+            if m:
+                v = int(m.group(1), 16)
+                vals.append(v - 0x10000 if v & 0x8000 else v)
+    return vals
+
+
 def hex2wav(name, out_dir=OUT_DIR):
     # sample lines are $display'ed to stdout, captured in the .log file
-    vals = []
-    with open(os.path.join(out_dir, f"{name}.log")) as f:
-        for line in f:
-            s = line.strip()
-            if len(s) == 4 and all(c in "0123456789abcdefABCDEF" for c in s):
-                vals.append(int(s, 16))
-    samples = array.array("h", (v - 0x10000 if v & 0x8000 else v for v in vals))
+    samples = array.array("h", parse_samples(os.path.join(out_dir, f"{name}.log")))
     path = os.path.join(out_dir, f"{name}.wav")
     w = wave.open(path, "wb")
     w.setnchannels(1)
@@ -119,6 +128,12 @@ def gl_cmd():
 
 
 GLVL_LIB = os.path.join(HERE, "obj_dir_gl", "sky130_fd_sc_hd_glv.v")
+
+
+def verilator_cmd(exe, mdir, top, flags, sources):
+    """Shared Verilator --binary command (RTL and gate-level builds)."""
+    return (["verilator", "--binary", "--timing", "-j", "16", "-o", exe,
+             "--Mdir", mdir, "--top-module", top] + flags + sources)
 
 
 def glvl_make_lib():
@@ -150,16 +165,14 @@ def glvl_cmd():
     netlists). primitives.v (UDP models) is omitted: with -DFUNCTIONAL the
     cells come from the behavioral models in the transformed library copy,
     and the UDPs themselves come from glvl_stub.v."""
-    out = os.path.join(HERE, "obj_dir_gl")
-    return ["verilator", "--binary", "--timing", "-j", "16",
-            "-Wno-fatal", "-o", "sim_audio_glv",
-            "--Mdir", out,
-            "-DGL_TEST", "-DFUNCTIONAL", "-DUSE_POWER_PINS", "-DSIM",
-            "-DUNIT_DELAY=#1", "--top-module", "tb_audio_gl",
-            os.path.join(HERE, "tb_audio_gl.v"),
-            os.path.join(HERE, "glvl_stub.v"),
-            GLVL_LIB,
-            os.path.join(HERE, "gate_level_netlist.v")]
+    return verilator_cmd(
+        "sim_audio_glv", os.path.join(HERE, "obj_dir_gl"), "tb_audio_gl",
+        ["-Wno-fatal", "-DGL_TEST", "-DFUNCTIONAL", "-DUSE_POWER_PINS",
+         "-DSIM", "-DUNIT_DELAY=#1"],
+        [os.path.join(HERE, "tb_audio_gl.v"),
+         os.path.join(HERE, "glvl_stub.v"),
+         GLVL_LIB,
+         os.path.join(HERE, "gate_level_netlist.v")])
 
 
 def glvl_build():
@@ -205,13 +218,13 @@ def read_wav(path):
 
 
 def vl_build():
+    src = os.path.join(HERE, "..", "src")
     subprocess.check_call(
-        ["verilator", "--binary", "--timing", "-j", "16", "-o", "sim_audio_vl",
-         "--top-module", "tb_audio", "--Mdir", os.path.join(HERE, "obj_dir"),
-         "-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC",
-         os.path.join(HERE, "tb_audio.v")]
-        + sorted(os.path.join(HERE, "..", "src", f)
-                 for f in os.listdir(os.path.join(HERE, "..", "src")) if f.endswith(".v")),
+        verilator_cmd("sim_audio_vl", os.path.join(HERE, "obj_dir"), "tb_audio",
+                      ["-Wno-WIDTHEXPAND", "-Wno-WIDTHTRUNC"],
+                      [os.path.join(HERE, "tb_audio.v")]
+                      + sorted(os.path.join(src, f) for f in os.listdir(src)
+                               if f.endswith(".v"))),
         cwd=HERE, stdout=subprocess.DEVNULL)
 
 
@@ -224,25 +237,22 @@ def check():
     with open(EXCERPT_HEX, "w") as f:
         f.write("\n".join("%04x" % (s & 0xFFFF) for s in ex))
     with tempfile.TemporaryDirectory() as tmp:
-        procs = []
-        for name, en, params in MODES:
-            log = open(os.path.join(tmp, f"{name}.log"), "w")
-            procs.append(subprocess.Popen(
-                [VL_EXE, f"+EN={en}", f"+PARAMS={params}", f"+N={EXCERPT_FRAMES}",
-                 f"+IN={EXCERPT_HEX}", "+OUT=unused"],
-                stdout=log, stderr=subprocess.STDOUT, cwd=HERE))
-        for p in procs:
-            p.wait()
+        procs = {}
+        for name, en, oct_sw in MODES:
+            with open(os.path.join(tmp, f"{name}.log"), "w") as log:
+                procs[name] = subprocess.Popen(
+                    [VL_EXE, f"+EN={en}", f"+OCT={oct_sw}", f"+N={EXCERPT_FRAMES}",
+                     f"+IN={EXCERPT_HEX}"],
+                    stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
+        rcs = {name: p.wait() for name, p in procs.items()}
         bad = False
-        for name, en, params in CHECK_MODES:
-            want = golden_model.render_params(ex, en, params)
-            got = []
-            with open(os.path.join(tmp, f"{name}.log")) as f:
-                for line in f:
-                    s = line.strip()
-                    if len(s) == 4 and all(c in "0123456789abcdefABCDEF" for c in s):
-                        v = int(s, 16)
-                        got.append(v - 0x10000 if v & 0x8000 else v)
+        for name, en, oct_sw in CHECK_MODES:
+            if rcs[name] != 0:
+                bad = True
+                print(f"{name}: FAIL (sim exited with return code {rcs[name]})")
+                continue
+            want = golden_model.render(ex, en, oct=oct_sw)
+            got = parse_samples(os.path.join(tmp, f"{name}.log"))
             first = next((i for i in range(min(len(got), len(want))) if got[i] != want[i]), None)
             if first is None and len(got) != len(want):
                 first = min(len(got), len(want))
@@ -267,8 +277,8 @@ def model():
     """Full-riff golden renders to audio_model/<mode>.wav (for listening)."""
     os.makedirs(MODEL_DIR, exist_ok=True)
     full = read_wav(IN_WAV)
-    for name, en, params in MODES:
-        out = golden_model.render_params(full, en, params)
+    for name, en, oct_sw in MODES:
+        out = golden_model.render(full, en, oct=oct_sw)
         path = os.path.join(MODEL_DIR, f"{name}.wav")
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
@@ -278,22 +288,19 @@ def model():
         print(f"{path}: {len(out)} samples")
 
 
-def run_mode(name, en, params, n, sim):
-    out = os.path.join(OUT_DIR_GL if sim.startswith("gl") else OUT_DIR, f"{name}.hex")
+def run_mode(name, en, oct_sw, n, sim):
+    out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
+    args = [f"+EN={en}", f"+OCT={oct_sw}", f"+N={n}"]
     if sim == "gl":
-        cmd = ["vvp", GL_VVP, f"+EN={en}", f"+PARAMS={params}",
-               f"+N={n}", f"+OUT={out}"]
+        cmd = ["vvp", GL_VVP] + args
     elif sim == "glvl":
-        exe = os.path.join(HERE, "obj_dir_gl", "sim_audio_glv")
-        cmd = [exe, f"+EN={en}", f"+PARAMS={params}", f"+N={n}", f"+OUT={out}"]
+        cmd = [os.path.join(HERE, "obj_dir_gl", "sim_audio_glv")] + args
     elif sim == "verilator":
-        exe = os.path.join(HERE, "obj_dir", "sim_audio_vl")
-        cmd = [exe, f"+EN={en}", f"+PARAMS={params}", f"+N={n}", f"+OUT={out}"]
+        cmd = [VL_EXE] + args
     else:
-        cmd = ["vvp", "sim_audio.vvp", f"+EN={en}", f"+PARAMS={params}",
-               f"+N={n}", f"+OUT={out}"]
-    log = open(os.path.join(OUT_DIR_GL if sim.startswith("gl") else OUT_DIR, f"{name}.log"), "w")
-    return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
+        cmd = ["vvp", "sim_audio.vvp"] + args
+    with open(os.path.join(out_dir, f"{name}.log"), "w") as log:
+        return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
 
 
 def main():
@@ -328,7 +335,7 @@ def main():
         elif sim == "glvl":
             glvl_build()
         n = wav2hex()
-        procs = [run_mode(name, en, params, n, sim) for name, en, params in MODES]
+        procs = [run_mode(name, en, oct_sw, n, sim) for name, en, oct_sw in MODES]
         for p in procs:
             p.wait()
         for name, _, _ in MODES:

@@ -32,15 +32,15 @@
 //       $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v \
 //       gate_level_netlist.v
 // Run (per mode, same plusargs as the RTL build):
-//   vvp sim_audio_gl.vvp +EN=2 +PARAMS=1 +N=2818048 +OUT=audio_out_gl/fuzzoct.hex
+//   vvp sim_audio_gl.vvp +EN=2 +OCT=1 +N=2818048 +OUT=audio_out_gl/fuzzoct.hex
 // Input:  audio_in.hex (one 16-bit sample per line)
-// Output: one 16-bit sample per frame on stdout (captured per-mode by the
+// Output: one "S:xxxx" line per frame on stdout (captured per-mode by the
 //         .log file in audio_out_gl/), converted to .wav by wav_tool.py
 //
-// +EN/+PARAMS/+N interface and ui/uio byte layout: identical to tb_audio.v
-// (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=reserved driven 0,
-// ui[0]=ADC data; P0..P2 on uio[4:2] — P0=bit0=uio[2], P1=uio[3], P2=uio[4]
-// — and uio[5]=reserved Rev B MISO, driven 0).
+// +EN/+OCT/+N interface and ui/uio byte layout: identical to tb_audio.v
+// (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=fuzz octave via +OCT=,
+// ui[0]=ADC data; uio_in = 0: knob pins uio[4:2] low, uio[5] MISO idle).
+// Samples are printed as prefixed "S:xxxx" lines, as in tb_audio.v.
 
 `timescale 1ps/1ps
 
@@ -85,7 +85,7 @@ module tb_audio_gl;
 
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
-  integer en_dip = 0, params = 0, n_in = 0;
+  integer en_dip = 0, oct_sw = 0, n_in = 0;
   integer i, slot;
   reg [15:0] word;
   reg [15:0] cap;   // DAC-side sample reassembled from uio_out[1]
@@ -93,17 +93,17 @@ module tb_audio_gl;
 
   initial begin
     dummy = $value$plusargs("EN=%d", en_dip);
-    dummy = $value$plusargs("PARAMS=%d", params);
+    dummy = $value$plusargs("OCT=%d", oct_sw);
     dummy = $value$plusargs("N=%d", n_in);
-    ui_in[7:1] = {1'b0, en_dip[5:0]};           // ui[6:1]=enables en[5:0], ui[7]=reserved (driven 0)
-    uio_in     = {3'b000, params[2:0], 2'b00};  // P0..P2 on uio[4:2] (P0=bit0=uio[2])
+    ui_in[7:1] = {oct_sw[0], en_dip[5:0]};      // ui[6:1]=enables en[5:0], ui[7]=fuzz octave
+    uio_in     = 8'h00;                         // knob pins uio[4:2] low (absent), uio[5] MISO idle
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
     $readmemh("audio_in.hex", mem);
     n_samples = n_in;
-    $display("loaded %0d samples, EN=%0d PARAMS=%0d", n_samples, en_dip, params);
+    $display("loaded %0d samples, EN=%0d OCT=%0d", n_samples, en_dip, oct_sw);
 
     // reset
     rst_n = 1'b0;
@@ -127,7 +127,7 @@ module tb_audio_gl;
       end
       // right half: RX already latched; let registered effects settle
       repeat (256) @(posedge clk);
-      if (i > 0) $display("%04h", cap);
+      if (i > 0) $display("S:%04h", cap);
       // frame complete: 256 (left) + 256 (right) = 512 clk
     end
 

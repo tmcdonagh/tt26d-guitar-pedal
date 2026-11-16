@@ -29,13 +29,13 @@ pinout:
   ui[3]: "Enable: dist"
   ui[4]: "Enable: phaser"
   ui[5]: "Enable: trem"
-  ui[6]: "Enable: delay"
-  ui[7]: "Reserved (Rev B: delay character)"
+  ui[6]: "Reserved"
+  ui[7]: "Fuzz octave switch"
 
   # Outputs
-  uo[0]: "Reserved (Rev B SPI)"
-  uo[1]: "Reserved (Rev B SPI)"
-  uo[2]: "Reserved (Rev B SPI)"
+  uo[0]: "Reserved SPI SCK"
+  uo[1]: "Reserved SPI CS (idle high)"
+  uo[2]: "Reserved SPI MOSI"
   uo[3]: "Reserved (Rev B)"
   uo[4]: "Reserved (Rev B)"
   uo[5]: "Reserved (Rev B)"
@@ -45,10 +45,10 @@ pinout:
   # Bidirectional pins
   uio[0]: "MCLK (24.576 MHz output)"
   uio[1]: "I2S DAC data out"
-  uio[2]: "Param P0"
-  uio[3]: "Param P1"
-  uio[4]: "Param P2"
-  uio[5]: "Reserved (Rev B: PSRAM MISO)"
+  uio[2]: "Knob K1 trem rate (RC)"
+  uio[3]: "Knob K2 tone (RC)"
+  uio[4]: "Knob K3 drive (RC)"
+  uio[5]: "Reserved (SPI MISO)"
   uio[6]: "I2S BCLK (master, 3.072 MHz)"
   uio[7]: "I2S LRCLK/WS (master, 48 kHz)"
 

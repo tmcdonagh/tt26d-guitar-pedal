@@ -83,30 +83,38 @@ def trem(s, t):
     return s >> (gap >> 6)
 
 
-def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False, trem_k=0):
+# Switch-debounce settle (RTL: 2-flop sync -> deb_div, an 8-bit counter on
+# sample_strobe; every 256th strobe is a tick that samples the switches,
+# and sw updates when two consecutive ticks agree, from reset-0 state).
+# Strobe n (n = 1, 2, ...) latches input frame n-1, so tick 1 is strobe 256
+# (frame 255, sample differs from the reset-0 previous tick, sw unchanged)
+# and tick 2 is strobe 512 (frame 511): sw updates on that strobe's clock
+# edge, the same edge that latches frame 511's sample, so frame 511 is the
+# first output computed with the switch values. Frames before it render
+# with en = 0, oct = 0 (switches held constant from reset).
+EN_SETTLE = 511
+
+
+def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False):
     """k1..k3 (0..255 or None) and tgb (tone/gate bypass, model-only) are
-    reserved for later voicing stages. trem_k (0..3, rate 2.93 Hz << k) is
-    the current trem rate field, removed once k* pots replace it."""
+    reserved for later voicing stages. Trem is fixed at k=0 (2.93 Hz)
+    until the knob stage. en/oct are the switch values held from reset:
+    they take effect at frame EN_SETTLE (debounce)."""
     env = Env()
-    t = Trem(13 - trem_k)
+    t = Trem(13)
     out = []
-    for x in xs:
+    for i, x in enumerate(xs):
         t.step()
         e = env.step(x)
         s = x
-        if en & 1:
+        en_i, oct_i = (en, oct) if i >= EN_SETTLE else (0, 0)
+        if en_i & 1:
             s = comp(s, e)
-        if en & 2:
-            s = fuzz(s, e, oct)
-        if en & 4:
+        if en_i & 2:
+            s = fuzz(s, e, oct_i)
+        if en_i & 4:
             s = dist(s)
-        if en & 16:
+        if en_i & 16:
             s = trem(s, t)
         out.append(s)
     return out
-
-
-def render_params(xs, en, params):
-    """Current RTL params byte (uio[4:2]): oct = params & 1, trem rate =
-    params >> 1. Removed in task 7."""
-    return render(xs, en, oct=params & 1, trem_k=(params >> 1) & 3)

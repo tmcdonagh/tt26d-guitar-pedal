@@ -10,12 +10,13 @@
  * task 4; phaser and delay are identity stubs, Rev B; the v2.2 crush
  * slot is removed, its envelope follower retained as the shared
  * dynamics source).
- * Enables: DIP switches direct on ui[6:1] (en[0]=comp .. en[5]=delay,
- * bit order = chain order); ui[7] reserved (Rev B delay character).
- * Params on uio[4:2]: P0=uio[2] (fuzz octave blend, live from task 4),
- * P1/P2 = trem rate bits {uio[4], uio[3]}; uio[5] reserved (Rev B
- * PSRAM MISO).
- * uo[7] = dp clip LED; uo[6:0] driven 0 (uo[2:0] reserved Rev B SPI).
+ * Switches: DIPs on ui[6:1] (en[0]=comp .. en[4]=trem, en[5] = the
+ * delay slot, a reserved identity stub; bit order = chain order) and the
+ * fuzz octave switch on ui[7], all debounced (v3 task 7: 2-flop sync,
+ * two agreeing samples 256 frames apart). uio[4:2] are knob pins (RC
+ * inputs, read nowhere until the knob task); uio[5] reserved (SPI MISO).
+ * uo[7] = dp clip LED; uo[2:0] = SPI idle (SCK=0, CS=1, MOSI=0, Rev B
+ * PSRAM); uo[6:3] driven 0.
  * See docs/info.md and the spec in the ai-dev-archive.
  */
 
@@ -82,14 +83,50 @@ module tt_um_tmcdonagh_guitar_pedal (
   // Effect chain + enables (v3 task 1, 2x2 Rev A): serial comp ->
   // fuzz -> dist -> phaser -> trem -> delay, enable-bypass per stage,
   // en bit order = chain order (en[0]=comp .. en[5]=delay) — DIP
-  // switches direct on ui[6:1] (ui[7] reserved, Rev B delay char).
+  // switches on ui[6:1] (debounced), ui[7] = fuzz octave switch.
   // Bypass stays true bypass, wired externally with a 3PDT switch
   // around the pedal (all-off DIP = "digital clean": audio still runs
   // through the ADC -> identity chain -> DAC, a distinct mode from
   // true bypass). Comp carries the env-driven gain ladder (task 3);
   // phaser and delay are identity stubs in Rev A.
   // ------------------------------------------------------------------
-  wire [5:0] en = ui_in[6:1];
+  // ------------------------------------------------------------------
+  // Switch debounce (v3 task 7). Each of ui[7:1] passes a 2-flop
+  // synchronizer; an 8-bit frame divider counts sample_strobe and every
+  // 256th strobe (deb_div wrapping) is a tick that samples the
+  // synchronized bits into deb_s. If the new sample equals the previous
+  // tick's sample the switch bank sw updates (two agreeing ticks 256
+  // frames ~ 5.3 ms apart), else it holds — so contact bounce shorter
+  // than a tick pair never reaches the chain. sw = {oct, en[5:0]}
+  // (ui[7], ui[6:1]); everything resets to 0 (pedal boots with all
+  // effects off; the switch inputs have external pull-downs), so a
+  // switch set at power-up reaches the chain at strobe 512 (frame 511's
+  // sample is the first processed with it; golden_model EN_SETTLE).
+  // ------------------------------------------------------------------
+  reg [6:0] sw_s1, sw_s2;   // synchronizer
+  reg [7:0] deb_div;        // frame divider, wraps every 256 frames
+  reg [6:0] deb_s;          // previous tick's sample
+  reg [6:0] sw;             // debounced {oct, en[5:0]}
+  wire      deb_tick = sample_strobe && (deb_div == 8'hFF);
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      sw_s1   <= 7'd0;
+      sw_s2   <= 7'd0;
+      deb_div <= 8'd0;
+      deb_s   <= 7'd0;
+      sw      <= 7'd0;
+    end else begin
+      sw_s1 <= ui_in[7:1];
+      sw_s2 <= sw_s1;
+      if (sample_strobe) deb_div <= deb_div + 8'd1;
+      if (deb_tick) begin
+        deb_s <= sw_s2;
+        if (sw_s2 == deb_s) sw <= sw_s2;
+      end
+    end
+  end
+
+  wire [5:0] en = sw[5:0];   // en[5] (ui[6]) only feeds the delay identity stub
 
   wire [15:0] s0 = sample_in;
 
@@ -154,17 +191,17 @@ module tt_um_tmcdonagh_guitar_pedal (
   //   fuzz_core = x[15] ? (-shaped) : shaped (sat16 negate; shaped <=
   //             21298 -> -shaped >= -21298 > -32768: that clamp is
   //             unreachable too, kept per the convention)
-  // P0 = uio[2] blends the full-wave-rectified copy (the octave):
-  //   fuzz_out = P0 ? sat16(shaped + a) : fuzz_core
+  // The octave switch (ui[7]) blends the full-wave-rectified copy (the octave):
+  //   fuzz_out = oct ? sat16(shaped + a) : fuzz_core
   // shaped + a >= 0 always (both non-negative), so the blend's sat16
-  // clamps UPPER only (max 21298 + 32767 -> 0x7FFF): under P0=1
-  // fuzz_out is non-negative in every reachable state; under P0=0 it
+  // clamps UPPER only (max 21298 + 32767 -> 0x7FFF): with the octave on
+  // fuzz_out is non-negative in every reachable state; with it off it
   // is signed (the plain asym fuzz); dist below takes |s2| either way.
   // ------------------------------------------------------------------
   wire [15:0] fuzz_mag = (s1 == 16'h8000) ? 16'h7FFF   // saturating |s1|
                        : s1[15] ? (~s1 + 16'd1) : s1;
 
-  wire fuzz_oct = uio_in[2];   // P0: octave blend (live from task 4)
+  wire fuzz_oct = sw[6];   // debounced ui[7]: octave blend
 
   // negative clip point sat16(13107 + (env >>> 2))
   wire [16:0] fuzz_tn_sum = 17'd13107 + {3'b000, env[15:2]};
@@ -204,8 +241,8 @@ module tt_um_tmcdonagh_guitar_pedal (
   // knee constants. Shift-add only, no multipliers.
   // ------------------------------------------------------------------
   // Direct saturating |x| on the actual stage input s2 (sign stays
-  // s2[15] below). Correct for every enable/P0 combination, including
-  // fuzz's signed core output under P0=0.
+  // s2[15] below). Correct for every enable/octave combination, including
+  // fuzz's signed core output with the octave off.
   wire [15:0] dist_mag = (s2 == 16'h8000) ? 16'h7FFF   // saturating |s2|
                        : s2[15] ? (~s2 + 16'd1) : s2;
 
@@ -275,18 +312,12 @@ module tt_um_tmcdonagh_guitar_pedal (
   // Stage 5 — tremolo: stepped-gain tremolo as built (v1): out =
   // in >>> s with gain steps 1, 1/2, 1/4, 1/8, s = LFO gap >> 6
   // (gap = distance from full gain), triangle LFO. v3 task 2 rate
-  // ladder: k = {uio[4], uio[3]} = {P2, P1} (0..3) with exp base
-  // 13 - k (k=0..3 -> 2^(13-k)-frame half-periods -> LFO full-cycle
-  // rates 2.93/5.86/11.72/23.44 Hz at 48 kHz — the musical 2.9-23.4
-  // Hz range from the listening session; the interim 23.4-187.5 Hz
-  // v2.2-base ladder read as jitter). Depth span FIXED 255 = 4 gain
-  // steps: the v2.2 depth bit lived on uio[5], which is the Rev B
-  // PSRAM MISO pin in the v3 map — leaving it wired would let the
-  // reserved pin control trem depth, so span/rshift are constants
-  // now.
+  // ladder base: rate k = 0 fixed (exp 13 -> 2^13-frame half-periods ->
+  // 2.93 Hz LFO full cycle at 48 kHz) until the knob stage (task 9)
+  // returns the rate control; the old rate pins are knob pins now.
+  // Depth span FIXED 255 = 4 gain steps (span/rshift are constants).
   // ------------------------------------------------------------------
-  wire [1:0] trem_k   = {uio_in[4], uio_in[3]};
-  wire [3:0] trem_exp = 4'd13 - {2'b0, trem_k};
+  wire [3:0] trem_exp = 4'd13;
 
   wire [7:0] trem_span   = 8'd255;  // constant (see above)
   wire [3:0] trem_rshift = 4'd8;    // span = 2^rshift - 1
@@ -402,19 +433,19 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  assign uo_out  = {dp_q, 7'b000_0000}; // uo[7] = dp clip LED (peak-hold); uo[6:3] reserved Rev B, uo[2:0] Rev B SPI — all driven 0
+  // uo[7] = dp clip LED (peak-hold); uo[6:3] reserved, driven 0; uo[2:0] =
+  // SPI idle for Rev B PSRAM: SCK = 0, CS = 1 (deselected), MOSI = 0
+  assign uo_out  = {dp_q, 4'b0000, 3'b010};
 
   assign uio_out = {lrclk, bclk, 4'b0, dac_data, clk}; // [7]=LRCLK, [6]=BCLK, [1]=DAC data, [0]=MCLK = clk (512 fs)
-  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (params P2..P0 + reserved Rev B MISO on uio[5])
+  assign uio_oe  = 8'b1100_0011; // uio[7:6] + uio[1:0] outputs (LRCLK/BCLK + MCLK/DAC data); uio[5:2] inputs (knob pins K1..K3 on uio[4:2], reserved SPI MISO on uio[5])
 
   // List all unused inputs to prevent warnings
-  // (uio[4:3] = trem rate bits, uio[2] = P0 fuzz octave blend, ui[6:1]
-  // = enables and ui[0] = ADC data are live; uio[7:6]/[1:0] are
-  // clock/data outputs, their input side is unused; ui[7] = Rev B
-  // delay char and uio[5] = Rev B PSRAM MISO are reserved with no
-  // reader yet. env feeds the comp ladder and the fuzz clip point)
-  wire _unused = &{ena, ui_in[7], uio_in[5], uio_in[7:6],
-                   uio_in[1:0], 1'b0};
+  // (ui[7:1] = switches and ui[0] = ADC data are live; uio[7:6]/[1:0]
+  // are clock/data outputs, their input side is unused; uio[4:2] knob
+  // pins are read nowhere until the knob task and uio[5] is the
+  // reserved SPI MISO. env feeds the comp ladder and the fuzz clip point)
+  wire _unused = &{ena, uio_in, 1'b0};
 
 endmodule
 

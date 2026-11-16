@@ -5,12 +5,14 @@
 // 16-bit samples through the real I2S input pins and writes one output
 // sample per frame. Runs entirely inside Icarus — ~30 s per mode.
 //
-// v3 task 1 byte layout: this tb drives the effect enables on ui[6:1]
-// (+EN=, 0..63: bit order = chain order, en[0]=comp..en[5]=delay; ui[7]
-// is reserved, Rev B delay char — driven 0) and the params on uio[4:2]
-// (+PARAMS=, 0..7: P0=bit0 on uio[2], P1=bit1 on uio[3], P2=bit2 on
-// uio[4]; uio[5] is reserved, Rev B PSRAM MISO — driven 0).
-// ui[0] is still the per-slot ADC data bit, assigned separately below.
+// v3 task 7 byte layout: this tb drives the effect enables on ui[6:1]
+// (+EN=, 0..63: bit order = chain order, en[0]=comp..en[5]=delay) and the
+// fuzz octave switch on ui[7] (+OCT=, 0/1). The switches are debounced in
+// the DUT (they reach the chain at frame 511; golden_model.EN_SETTLE).
+// uio_in is 0: the knob pins uio[4:2] read low (absent) and uio[5] (SPI
+// MISO) idles. ui[0] is the per-slot ADC data bit, assigned below.
+// Each output sample is printed as a prefixed line "S:xxxx" on stdout;
+// wav_tool.py parses only those lines.
 //
 // Compile (icarus; ../src/*.v picks up the top module and its sources):
 //   $ iverilog -g2012 -o sim_audio.vvp tb_audio.v ../src/*.v
@@ -20,9 +22,9 @@
 //   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
 //       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
-//   vvp sim_audio.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out/fuzzoct.hex
+//   vvp sim_audio.vvp +EN=2 +OCT=1 +N=2818047 +OUT=audio_out/fuzzoct.hex
 // Input:  audio_in.hex, or +IN=<file> (one 16-bit sample per line, from audio_in.wav)
-// Output: $OUT, one 16-bit sample per frame
+// Output: one "S:xxxx" line per frame on stdout
 
 `timescale 1ps/1ps
 
@@ -52,7 +54,7 @@ module tb_audio;
 
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
-  integer en_dip = 0, params = 0, n_in = 0;
+  integer en_dip = 0, oct_sw = 0, n_in = 0;
   integer i, slot;
   reg [15:0] word;
   integer dummy;
@@ -60,18 +62,18 @@ module tb_audio;
 
   initial begin
     dummy = $value$plusargs("EN=%d", en_dip);
-    dummy = $value$plusargs("PARAMS=%d", params);
+    dummy = $value$plusargs("OCT=%d", oct_sw);
     dummy = $value$plusargs("N=%d", n_in);
     dummy = $value$plusargs("IN=%s", in_file);
-    ui_in[7:1] = {1'b0, en_dip[5:0]};           // ui[6:1]=enables en[5:0], ui[7]=reserved (driven 0)
-    uio_in     = {3'b000, params[2:0], 2'b00};  // P0..P2 on uio[4:2] (P0=bit0=uio[2])
+    ui_in[7:1] = {oct_sw[0], en_dip[5:0]};      // ui[6:1]=enables en[5:0], ui[7]=fuzz octave
+    uio_in     = 8'h00;                         // knob pins uio[4:2] low (absent), uio[5] MISO idle
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
     $readmemh(in_file, mem);
     n_samples = n_in;
-    $display("loaded %0d samples, EN=%0d PARAMS=%0d", n_samples, en_dip, params);
+    $display("loaded %0d samples, EN=%0d OCT=%0d", n_samples, en_dip, oct_sw);
 
     // reset
     rst_n = 1'b0;
@@ -88,7 +90,7 @@ module tb_audio;
       end
       // right half: RX already latched; let registered effects settle
       repeat (256) @(posedge clk);
-      $display("%04h", dut.effect_sample);
+      $display("S:%04h", dut.effect_sample);
       // frame complete: 256 (left) + 256 (right) = 512 clk
     end
 
