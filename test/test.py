@@ -1038,3 +1038,42 @@ async def test_clip_dp(dut):
     await Timer(1, unit="ns")
     assert dp() == 0, "dp must clear within 2048+64 frames of the clip frame"
     assert seg_ok(), "uo[6:0] must still read idle (0x02) after the dp clears"
+
+
+@cocotb.test()
+async def test_chain_latency(dut):
+    """Task 8 (sequenced chain): pins the chain's frame-level latency
+    and the clip-LED timing across the combinational -> 6-step refactor.
+    (a) en = 0x17 (comp + fuzz + dist + trem; ui_in = 0x2E): three known frames then a zero frame; each
+    TX value (captured one frame after its input, mono contract) equals
+    golden_model.render of the same input history — the silent settle
+    frames are rendered too so env and the trem LFO line up. (b) en = 0:
+    a 0x7FFF frame lights uo[7] within 16 clk of the frame's valid edge
+    (not before the strobe), well before the frame's TX load of the
+    NEXT frame, and a mid-level frame in the same position does not."""
+    ins = [12000, -20000, 30000, 0]
+    await start(dut, 0x17 << 1)
+    xs = [0] * SETTLE_FRAMES + ins
+    want = golden_model.render(xs, 0x17)
+    for j, x in enumerate(ins):
+        bits = await i2s_send_and_capture(dut, (x & 0xFFFF) << 8)
+        await _wait_left_start(dut)
+        out = tx_data_bits(bits)
+        out = out - 0x10000 if out & 0x8000 else out
+        # capture j (frame SETTLE_FRAMES + j) carries frame (.. + j - 1)'s result
+        exp = want[SETTLE_FRAMES + j - 1]
+        assert out == exp, f"frame {j}: got {out}, golden {exp}"
+
+    # (b) LED timing, identity chain
+    await start(dut, 0)
+    await i2s_send_and_capture(dut, 0x1000 << 8)
+    await ClockCycles(dut.clk, 16)
+    await Timer(1, unit="ns")
+    assert int(dut.uo_out[7].value) == 0, "mid-level frame must not light the LED"
+    await _wait_left_start(dut)
+    await i2s_send_and_capture(dut, 0x7FFF << 8)
+    await Timer(1, unit="ns")
+    assert int(dut.uo_out[7].value) == 0, "LED lit before the clip frame's valid edge"
+    await ClockCycles(dut.clk, 16)
+    await Timer(1, unit="ns")
+    assert int(dut.uo_out[7].value) == 1, "LED must light within 16 clk of the valid edge"
