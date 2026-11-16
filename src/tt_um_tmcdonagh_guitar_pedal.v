@@ -5,11 +5,11 @@
  * Silicon Guitar Pedal — multi-effect DSP core (v3: 2x2 silicon
  * pedalboard, Rev A). I2S master in/out (codec-agnostic), serial
  * effect chain comp -> fuzz -> distortion -> phaser -> trem -> delay
- * with per-stage enable bypass (comp: env-driven shift-ladder gain,
- * task 3; fuzz: asymmetric clip + octave blend on its chain input,
- * task 4; phaser and delay are identity stubs, Rev B; the v2.2 crush
- * slot is removed, its envelope follower retained as the shared
- * dynamics source).
+ * with per-stage enable bypass (comp: smoothed-envelope compressor,
+ * slewed gain through the shared multiplier, task 10; fuzz: asymmetric
+ * clip + octave blend on its chain input, task 4; phaser and delay are
+ * identity stubs, Rev B; the v2.2 crush slot is removed, its envelope
+ * follower retained for the fuzz bias).
  * Switches: DIPs on ui[6:1] (en[0]=comp .. en[4]=trem, en[5] = the
  * delay slot, a reserved identity stub; bit order = chain order) and the
  * fuzz octave switch on ui[7], all debounced (v3 task 7: 2-flop sync,
@@ -88,7 +88,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   // Bypass stays true bypass, wired externally with a 3PDT switch
   // around the pedal (all-off DIP = "digital clean": audio still runs
   // through the ADC -> identity chain -> DAC, a distinct mode from
-  // true bypass). Comp carries the env-driven gain ladder (task 3);
+  // true bypass). Comp is the slewed-gain compressor (task 10);
   // phaser and delay are identity stubs in Rev A.
   // ------------------------------------------------------------------
   // ------------------------------------------------------------------
@@ -132,40 +132,92 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s0 = sample_in;
 
   // ------------------------------------------------------------------
-  // Step 1 — compressor (v3 task 3): env-driven shift-ladder makeup
-  // gain toward the fixed reference TH = 16384 — no division, no
-  // multiplier, gain in {x1, x2, x4} via arithmetic left shifts on
-  // the sign-extended sample; fixed character, no param bit. Reads
-  // the shared env block below (the retained v2.2 envelope follower
-  // on the PRE-CHAIN input magnitude, one update per audio frame):
-  //   env >= 24576 -> x1   (loud: at/above 1.5*TH)
-  //   16384..24575 -> x2   (mid: TH .. 1.5*TH)
-  //   env  < 16384 -> x4   (quiet: below TH)
-  // Decoded on env[14:13] — the top two bits of env's REACHABLE
-  // range: env tops out at 32766 (the (env+mag)>>>1 attack rounds
-  // down from 32767), so env[15] NEVER sets, the live range is the
-  // 15 bits [14:0], and the quadrant size is 8192 — 2'b11 -> env >=
-  // 3*8192 = 24576 -> x1, 2'b10 -> [16384, 24576) -> x2, 2'b0x ->
-  // env < 16384 -> x4. (The plan line wrote env[15:14] — dead code:
-  // 2'b11/2'b10 are unreachable there, gain would pin at x4 forever
-  // and the pinned loud probe could never pass; [14:13] is that
-  // predicate on the reachable range, giving the ruled x4 boundary
-  // at exactly env < 16384.) TH = 16384 provisional (by-ear retune
-  // sanctioned). Saturation: s0 <<< gain_sh is exact in an 18-bit
-  // sign-extended container (|s0| <= 32768 -> |s0 <<< 2| <= 131072
-  // = 2^17, inside the 18-bit signed range with one spare MSB); the
-  // shifted value fits 16 bits iff the two bits above [15] replicate
-  // the sign (comp_sh[17:16] == {2{comp_sh[15]}}), else clamp to the
-  // rails 0x7FFF / 0x8000.
+  // Step 1 — compressor (v3 task 10): smoothed envelope, 1.5 dB gain
+  // table, slewed gain through the shared multiplier. The state runs
+  // every frame whatever en[0] is (so cenv can also key the gate, task 11):
+  //   cenv (24-bit 16.8) on m = sat_mag(sample_in), the pre-chain input:
+  //     attack ((m << 8) > cenv): cenv += ((m << 8) - cenv) >> 5
+  //     release:                  cenv -= (cenv >> 12) + (cenv != 0)
+  //     (the 1-LSB floor makes the release terminate at exactly 0)
+  //   L = cenv[23:8]; lvl_q = 4*e + m2 (e = L's MSB index, m2 = the two
+  //     bits below it, zero-filled for e < 2; 0 for L == 0): 1.5 dB steps
+  //   over = max(0, lvl_q - 44)  (knee at L = 2048)
+  //   gq = max(-8, 6 - ((over * 5) >> 3))  (ratio 8/5 above the knee)
+  //   target = MANT[gq & 3] shifted by gq >>> 2, MANT = 256/304/362/431
+  //     (2^(k/4) in 8.8); reachable gq is 6..-3 -> target 724..152
+  //   g (12-bit, reset 256 = unity) <= g + ((target - g) >>> 3)
+  //   s1 = en[0] ? sat16((s0 * g) >>> 8) : s0, the multiplier at step 1
+  // cenv and g update on the sample_valid edge, each from the other's
+  // pre-edge value (g slews toward the target of the pre-edge cenv);
+  // step 1 multiplies by the post-edge g.
   // ------------------------------------------------------------------
-  wire [1:0] gain_sh = (env[14:13] == 2'b11) ? 2'd0
-                     : (env[14:13] == 2'b10) ? 2'd1
-                                             : 2'd2;
+  reg  [23:0] cenv;
+  reg  [11:0] comp_g;
+  wire signed [28:0] mul_p;   // shared multiplier product (u_mult below)
+  wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|, cenv and env
+                    : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
 
-  wire [17:0] comp_sh  = {{2{s0[15]}}, s0} <<< gain_sh;
-  wire        comp_ovf = (comp_sh[17:16] != {2{comp_sh[15]}});
-  wire [15:0] comp_out = comp_ovf ? (comp_sh[17] ? 16'h8000 : 16'h7FFF)
-                                  : comp_sh[15:0];
+  // attack test and gap from one 25-bit subtract: (m << 8) > cenv iff
+  // the difference is non-negative and non-zero (mag[15] is 0, so the
+  // shifted magnitude fits 24 bits)
+  wire [24:0] cenv_gap = {1'b0, mag, 8'h00} - {1'b0, cenv};
+  wire        cenv_atk = ~cenv_gap[24] & (|cenv_gap[23:0]);
+  // release decrement (cenv >> 12) + (cenv != 0): cenv < 2^23, so
+  // cenv[23:12] <= 2047 and the 12-bit sum cannot carry out
+  wire [11:0] cenv_dec = cenv[23:12] + {11'd0, |cenv};
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)            cenv <= 24'd0;
+    else if (sample_valid) cenv <= cenv_atk ? cenv + {5'd0, cenv_gap[23:5]}
+                                            : cenv - {12'd0, cenv_dec};
+  end
+
+  // level: leading-one index e of L and the two bits below it ({L, 2'b00}
+  // supplies the zero fill for e < 2)
+  wire [15:0] comp_l  = cenv[23:8];
+  wire [17:0] comp_lx = {comp_l, 2'b00};
+  reg  [3:0]  comp_e;
+  integer     ci;
+  always @(*) begin
+    comp_e = 4'd0;
+    for (ci = 1; ci < 16; ci = ci + 1)
+      if (comp_l[ci]) comp_e = ci[3:0];
+  end
+  wire [1:0] comp_m2   = comp_lx[comp_e +: 2];
+  wire [5:0] comp_lvl  = (comp_l == 16'd0) ? 6'd0 : {comp_e, comp_m2};
+
+  // gain index: over <= 63 - 44 = 19, red = (5 * over) >> 3 <= 11, so
+  // gq = 6 - red >= -5 and the -8 floor below is unreachable (kept per
+  // the brief's table definition)
+  wire [5:0] comp_over = (comp_lvl > 6'd44) ? comp_lvl - 6'd44 : 6'd0;
+  wire [7:0] comp_ov5  = {2'b00, comp_over} + {comp_over, 2'b00};
+  wire signed [5:0] comp_gq_r = 6'sd6 - $signed({1'b0, comp_ov5[7:3]});
+  wire signed [3:0] comp_gq   = (comp_gq_r < -6'sd8) ? -4'sd8 : comp_gq_r[3:0];
+
+  // target: mantissa by gq[1:0], exponent gq >>> 2 in -2..1
+  wire [8:0] comp_mant = (comp_gq[1:0] == 2'd0) ? 9'd256
+                       : (comp_gq[1:0] == 2'd1) ? 9'd304
+                       : (comp_gq[1:0] == 2'd2) ? 9'd362 : 9'd431;
+  wire [11:0] comp_tgt = (comp_gq[3:2] == 2'b01) ? {2'b00, comp_mant, 1'b0}  // << 1
+                       : (comp_gq[3:2] == 2'b00) ? {3'b000, comp_mant}       // x1
+                       : (comp_gq[3:2] == 2'b11) ? {4'b0000, comp_mant[8:1]} // >> 1
+                                                 : {5'b00000, comp_mant[8:2]}; // >> 2
+
+  // slew: g + ((target - g) >>> 3), 13-bit signed gap; g stays within
+  // [min target, max target] (64..724), so the 12-bit sum never wraps
+  wire signed [12:0] comp_gap = $signed({1'b0, comp_tgt}) - $signed({1'b0, comp_g});
+  wire signed [12:0] comp_stp = comp_gap >>> 3;
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n)            comp_g <= 12'd256;
+    else if (sample_valid) comp_g <= comp_g + comp_stp[11:0];
+  end
+
+  // output: (s0 * g) >>> 8 is p[28:8]; it fits 16 bits iff p[28:23]
+  // all equal the sign, else clamp to the rails
+  wire        comp_ovf = ~((&mul_p[28:23]) | ~(|mul_p[28:23]));
+  wire [15:0] comp_out = comp_ovf ? (mul_p[28] ? 16'h8000 : 16'h7FFF)
+                                  : mul_p[23:8];
 
   wire [15:0] s1_w = en[0] ? comp_out : s0;
 
@@ -289,10 +341,11 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s5_w = en[3] ? phaser_out : s4_r;
 
   // ------------------------------------------------------------------
-  // Shared dynamics source (v3): the v2.2 auto-lofi envelope follower,
-  // retained after the crush slot's removal — the comp gain ladder
-  // (task 3) and the fuzz negative clip point (task 4) read it.
-  // 16-bit envelope of the PRE-CHAIN input magnitude (mag below, the
+  // Fast envelope (v3): the v2.2 auto-lofi envelope follower, retained
+  // after the crush slot's removal — the fuzz negative clip point
+  // (task 4) reads it; the compressor has its own smoothed cenv.
+  // 16-bit envelope of the PRE-CHAIN input magnitude (mag, shared with
+  // cenv and declared with it above, the
   // saturating |sample_in| idiom — env's own source since task 4 moved
   // stage 2 onto its chain input; fix-round ruling — the player's
   // dynamics live in the raw input):
@@ -302,12 +355,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   //     ~5.3 ms; the 1-LSB floor makes the decay terminate at exactly
   //     0 (the plain subtract-shift stalls anywhere below 256).
   // env tops out at 32766 — env[15] never sets. One update per audio
-  // frame on sample_valid. Feeds the comp gain ladder (task 3) and the
-  // fuzz negative clip point (task 4) above.
+  // frame on sample_valid.
   // ------------------------------------------------------------------
   reg  [15:0] env;
-  wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|
-                    : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
   wire [16:0] env_atk = {1'b0, env} + {1'b0, mag};       // 17-bit env+mag
   wire        env_nz  = (env != 16'd0);                   // release floor
 
@@ -366,11 +416,12 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [7:0] trem_tri  = trem_p[21] ? ~trem_p[20:13] : trem_p[20:13];
   wire [8:0] trem_gain = 9'd256 - {2'b00, trem_tri[7:1]} - {3'b000, trem_tri[7:2]};
 
-  // Shared multiplier: trem (step 6) is its only user so far; later
-  // steps (comp, gate, drive) mux their operands onto a/b by step.
-  wire signed [16:0] mul_a = {s5_r[15], s5_r};
-  wire        [11:0] mul_b = {3'b000, trem_gain};
-  wire signed [28:0] mul_p;
+  // Shared multiplier, operands muxed by step: comp at step 1 (s0 x g),
+  // trem at step 6 (s5_r x gain). Each step registers its own function
+  // of mul_p (comp_out above, trem_out below).
+  wire               mul_comp = (step == 3'd1);
+  wire signed [16:0] mul_a = mul_comp ? {s0[15], s0} : {s5_r[15], s5_r};
+  wire        [11:0] mul_b = mul_comp ? comp_g : {3'b000, trem_gain};
   mult u_mult (.a(mul_a), .b(mul_b), .p(mul_p));
 
   wire [15:0] trem_out = mul_p[23:8];   // >>> 8; fits 16 bits (gain <= 256)
@@ -480,11 +531,11 @@ module tt_um_tmcdonagh_guitar_pedal (
   // (ui[7:1] = switches and ui[0] = ADC data are live; uio[7:6]/[1:0]
   // are clock/data outputs, their input side is unused; uio[5] is the
   // reserved SPI MISO; uio[4:2] feed the knob readers. K2/K3 readings
-  // have no consumer until their tasks; the multiplier's bits outside
-  // the trem's >>> 8 window are unused)
+  // have no consumer until their tasks; the multiplier's fraction bits
+  // below the >>> 8 are unused)
   wire _unused = &{ena, uio_in[7:5], uio_in[1:0], en[5],
                    k2_value, k2_present, k3_value, k3_present,
-                   mul_p[28:24], mul_p[7:0], trem_tri[0], 1'b0};
+                   mul_p[7:0], trem_tri[0], 1'b0};
 
 endmodule
 

@@ -58,7 +58,7 @@ FUZZ_BASELINE_SHA256 = "daadb2a3c1a6f891dd9cb47bd24bdfe0381babf752e514d2ed75e448
 # are debounced in the DUT: golden_model.EN_SETTLE frames render as off.
 MODES = [
     ("bypass",   0x0,  0),  # all stages off — digital clean identity
-    ("comp",     0x01, 0),  # comp: env-driven gain steps
+    ("comp",     0x01, 0),  # comp: smoothed env, 1.5 dB gain table, slewed gain
     ("fuzz",     0x02, 0),  # asym clip, env-biased negative point
     ("fuzzoct",  0x02, 1),  # fuzz + octave blend
     ("dist",     0x04, 0),  # diode-knee PWL, fixed drive x4
@@ -290,6 +290,15 @@ def check():
                 bad = True
                 g = got[first] if first < len(got) else None
                 print(f"{name}: FAIL (first mismatch frame {first}: got {g}/want {want[first] if first < len(want) else None})")
+    # golden-model selftest (cenv release terminates at exactly 0 — too
+    # slow to show in cocotb)
+    st = subprocess.run([sys.executable, "-I", os.path.join(HERE, "golden_model.py"),
+                         "--selftest"], capture_output=True, text=True)
+    if st.returncode == 0:
+        print(st.stdout.strip())
+    else:
+        bad = True
+        print(f"selftest: FAIL (exit {st.returncode}) {st.stdout.strip()} {st.stderr.strip()}")
     fz = golden_model.render(ex, en=0x02, tgb=True)[1024:]
     digest = hashlib.sha256(struct.pack(f"<{len(fz)}h", *fz)).hexdigest()
     if digest == FUZZ_BASELINE_SHA256:

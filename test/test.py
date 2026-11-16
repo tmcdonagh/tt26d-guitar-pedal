@@ -400,146 +400,139 @@ async def test_reset_state(dut):
 # knob_pin model runs), uio[5] is reserved (SPI MISO).
 
 @cocotb.test()
-async def test_comp(dut):
-    """Comp stage (en[0]), v3 task 3: env-driven shift-ladder gain —
-    comp_out = sat16(s0 <<< gain_sh), the ladder reading the shared env
-    block (the retained v2.2 envelope follower on the PRE-CHAIN input
-    magnitude; update semantics unchanged — attack (env+mag)>>>1,
-    release env-(env>>>8)-(env!=0), one update per frame on
-    sample_valid):
-      env >= 24576  -> gain_sh 0 (x1, loud)
-      16384..24575  -> gain_sh 1 (x2, mid)
-      env  < 16384  -> gain_sh 2 (x4, quiet)
-    decoded on env[14:13] — the top two bits of env's REACHABLE range
-    (env tops out at 32766, env[15] never sets, so the quadrant size
-    is 8192 and thresholds land at 16384 / 3*8192 = 24576; a literal
-    env[15:14] slice would leave x1/x2 unreachable, pinning x4
-    forever). TH = 16384 provisional (by-ear retune sanctioned). No
-    param bit (fixed character).
-
-    Frame timing (pinned, differs from the v2.2 crush latch): the
-    output transmitted in frame N+1 is comp(x_N, env_N) — env AFTER
-    frame N's own valid-edge update. comp is combinational into the
-    TX load (frame N+1's first left-half clk, ~255 clk after frame
-    N's valid edge), whereas the v2.2 crush latch registered on the
-    same valid edge and read env one frame older. The probe word
-    0x1000 (mag 4096) only ever RELEASES env at both probes (env
-    32766 / 6721 both > 4096), so the pinned values are insensitive
-    to that one-frame distinction.
-
-    Phases (frames numbered from the first _wait_left_start):
-      - 100 loud frames 0x7FFF (frames 0..99): env attacks 16383 ->
-        ... -> 32766, sticky from frame 15 ((32766+32767)>>1 = 32766);
-      - loud probe 0x1000 (frame 100), captured frame 101:
-        comp(0x1000, env_100 = 32638) — release 32766-127-1, still in
-        the x1 quadrant -> 0x1000;
-      - 400 silent frames (frames 101..500; the capture frame above
-        drove the first, ui[0] idling low): env releases to 6721
-        (below 16384 from silent frame 176);
-      - quiet probe 0x1000 (frame 501), captured frame 502:
-        comp(0x1000, env_501 = 6694) — release 6721-26-1, below 16384
-        -> x4 -> 0x4000. This is the port-level proof that env < 16384
-        (no hierarchical probe — GL-visible);
-      - stability (Review Focus 3): 50 identical mid frames 0x6000
-        (frames 503..552), capturing each frame's output mid_outs[i]
-        = output of frame 503+i = comp(x_502+i, env_502+i). env
-        attacks 6667 -> 24575 by frame 517 and STICKS: mag 24576 >
-        env 24575 keeps the attack branch and (24575+24576)>>1 =
-        24575 — a sticky fixed point ONE LSB below the 24576 x1
-        threshold, the maximally hunting-prone steady state. The last
-        10 captures (frames 544..553, env = 24575 throughout) must be
-        identical to each other (no per-frame rung hunting) and equal
-        sat16(0x6000 <<< 1) = 0x7FFF — the x2 rung (a hunting x1 rung
-        would emit 0x6000)."""
-    await start(dut, 0b0000_0010)  # en[0] comp only (ui[1]); octave off
-    # at a left-half start (frame 0 of this test; env is 0 — silent settle)
-
-    # 100 loud frames (0x7FFF). RX only listens in left halves, so each
-    # frame = one I2S drive (per-slot bits) + an exact 256-clk
-    # right-half skip; ui[0] sits at 0 between drives.
-    for _ in range(100):
-        await i2s_send_and_capture(dut, 0x7FFF << 8)
-        await ClockCycles(dut.clk, 256)
-
-    # loud probe: 0x1000 in frame 100, captured frame 101 (the
-    # one-frame I2S pipeline) — env_100 = 32638 -> x1 passthrough
-    await i2s_send_and_capture(dut, 0x1000 << 8)   # frame 100
-    await ClockCycles(dut.clk, 256)
-    bits = await i2s_send_and_capture(dut, 0)      # frame 101 capture
-    got = tx_data_bits(bits)
-    assert got == 0x1000, f"loud probe: {got:#06x} != 0x1000 (x1)"
-
-    # 400 silent frames (frame 101, the capture frame above, drove the
-    # first): env 32766 -> 6721 (crosses below 16384 at silent frame 176)
-    await ClockCycles(dut.clk, 256)                # rest of frame 101
-    await ClockCycles(dut.clk, 512 * 399)          # frames 102..500
-
-    # quiet probe: 0x1000 in frame 501, captured frame 502 — env_501 =
-    # 6694 -> x4 = 0x4000 (no saturation: 0x4000 < 0x7FFF)
-    await i2s_send_and_capture(dut, 0x1000 << 8)   # frame 501
-    await ClockCycles(dut.clk, 256)
-    bits = await i2s_send_and_capture(dut, 0)      # frame 502 capture
-    got = tx_data_bits(bits)
-    assert got == 0x4000, f"quiet probe: {got:#06x} != 0x4000 (x4)"
-
-    # stability: 50 identical mid frames 0x6000 (frames 503..552).
-    # mid_outs[i] = frame 503+i's output = comp(x_502+i, env_502+i):
-    # i=0 echoes the quiet capture frame's 0 input; from i=1 the 0x6000
-    # drives attack env 6667 -> 24575 (frame 517, sticky thereafter).
-    await ClockCycles(dut.clk, 256)                # rest of frame 502
-    mid_outs = []
-    for _ in range(50):
-        bits = await i2s_send_and_capture(dut, 0x6000 << 8)
-        await ClockCycles(dut.clk, 256)
-        out = tx_data_bits(bits)
-        mid_outs.append(out - 0x10000 if out & 0x8000 else out)
-    last10 = mid_outs[-10:]   # frames 544..553, env = 24575 throughout
-    assert len(set(last10)) == 1, \
-        f"steady mid input must not hunt rungs: last 10 outputs {last10}"
-    assert last10[0] == 0x7FFF, \
-        f"steady mid rung: {last10[0]:#06x} != 0x7FFF (sat16(0x6000 <<< 1), x2)"
+async def test_comp_ratio(dut):
+    """Comp stage (en[0]), v3 task 10: a real compressor. State (golden
+    Comp): cenv, a 16.8 smoothed envelope of the PRE-CHAIN magnitude
+    (attack 1/32 of the gap, release cenv>>12 with a 1-LSB floor); lvl_q
+    = 4*e + m2 of L = cenv>>8 (MSB index, two bits below it); gain target
+    from the 1.5 dB table above the knee lvl_q 44; g slews 1/8 of the gap
+    per frame. Output sat16((s0 * g) >>> 8).
+    Constant +2048 (steady out A) and +16384 (steady out B), each from a
+    fresh reset: both exactly golden frame-for-frame, B/A < 4 for an
+    input ratio of 8, and the last 10 outputs of each run identical (no
+    hunting). The golden model converges by frame 63 for 16384 (2048
+    sits below the knee and is constant from frame 0), so a 200-frame
+    window stands in for the plan's 2000 (CI also runs gate-level)."""
+    n = 200
+    steady = []
+    for i, amp in enumerate((2048, 16384)):
+        await start(dut, 0b0000_0010, clock=(i == 0))   # en[0] comp only
+        got = await fast_frames(dut, [amp] * n + [0])
+        want = golden_model.render([0] * START_FRAME + [amp] * n, 0x01)[START_FRAME:]
+        # capture j carries input frame j-1's result
+        assert got[1:] == want, f"comp {amp}: first mismatch at " \
+            f"{next(j for j in range(n) if got[1 + j] != want[j])}"
+        last10 = got[-10:]
+        assert len(set(last10)) == 1, f"comp {amp} must settle: last 10 {last10}"
+        steady.append(last10[0])
+    a, b = steady
+    assert (a, b) == (5736, 16384), f"steady outs {a}, {b}"
+    assert b < 4 * a, f"B/A = {b / a:.3f} must be < 4 (input ratio 8)"
 
 
 @cocotb.test()
-async def test_comp_decay(dut):
-    """Shared-env pins for the comp task (v3 task 3): the env update
-    semantics are UNCHANGED from v2.2 (attack (env+mag)>>>1, release
-    env-(env>>>8)-(env!=0), async reset to 0, one update per frame on
-    sample_valid) — pinned here so the comp wiring cannot silently
-    disturb the block that task 4's fuzz bias also reads. Hierarchical
-    probes are RTL-only (guarded getattr — names may vanish in the
-    flat GL netlist; None voids the asserts; test_comp's port-level
-    assertions carry the GL coverage):
-      - env == 0 after reset;
-      - 100 loud frames (0x7FFF) attack env to 32766 (sticky from
-        frame 15) — assert env >= 16384;
-      - long silence terminates at EXACTLY 0 — the release's 1-LSB
-        floor (plain env-(env>>>8) stalls anywhere below 256). From
-        32766 the recursion reaches 0 on the 1388th silent frame
-        (frame 1487 here; below 256 the decay is env-1 per frame);
-        1400 covers it with 12 frames of margin (v2.2 pattern: 1258
-        frames from 19658)."""
-    await start(dut, 0b0000_0010)  # en[0] comp only (ui[1]); octave off
+async def test_comp_slew(dut):
+    """Comp gain slew (v3 task 10): settle on +2048 (g stalls at 717, the
+    upward slew's 1/8 step rounding to 0 within 8 of the 724 target),
+    then step to +16384 for 200 frames: the output equals golden frame-
+    for-frame, and the golden g trajectory moves by at most
+    (|target - g| >> 3) + 1 per frame (the slew bound; the +1 is the
+    arithmetic-shift rounding of a negative gap)."""
+    pre, n = 100, 200
+    await start(dut, 0b0000_0010)                     # en[0] comp only
+    xs = [2048] * pre + [16384] * n
+    got = await fast_frames(dut, xs + [0])
+    want = golden_model.render([0] * START_FRAME + xs, 0x01)[START_FRAME:]
+    assert got[1:] == want, \
+        f"comp slew: first mismatch at {next(j for j in range(len(xs)) if got[1 + j] != want[j])}"
+    st = golden_model.Comp()
+    for _ in range(START_FRAME):
+        st.step(0)
+    for x in xs:
+        g0, t = st.g, golden_model.comp_target(st.cenv)
+        assert abs(st.step(x) - g0) <= (abs(t - g0) >> 3) + 1
+    assert want[pre - 1] == 5736 and want[-1] == 16384
 
-    def env():
-        # internal envelope reg — RTL-only probe (same guard as the
-        # v2.2 autolofi sites); None voids the env asserts below
-        e = getattr(dut.user_project, "env", None)
-        return None if e is None else int(e.value)
 
-    assert env() in (None, 0), "env must be 0 (reset + silent settle)"
+@cocotb.test()
+async def test_comp_rails(dut):
+    """Comp rails + clip LED with comp ON (v3 task 10). After the silent
+    settle g = 717 (golden). (a) Clip LED: a ramp 8000, 9000, .. whose
+    raw values never reach a rail; golden puts the first rail output
+    (sat16(12000 * 717 >>> 8) = 32767) at ramp frame 4 — the rail is
+    comp gain alone. uo[7] is dark before that frame's valid edge and
+    lit by its end (hit taken at chain_done on the effect_sample the TX
+    sends next frame), dark at the end of every earlier frame, and the
+    next frame's capture is that rail value. (b) +32767 and -32768,
+    each after 400 silent frames, give exactly 32767 / -32768 on the
+    first loud frame (golden)."""
+    await start(dut, 0b0000_0010)                     # en[0] comp only
 
-    # 100 loud frames (0x7FFF): one drive + right-half skip per frame
-    for _ in range(100):
-        await i2s_send_and_capture(dut, 0x7FFF << 8)
+    def dp():
+        return int(dut.uo_out[7].value)
+
+    ramp = [8000 + 1000 * j for j in range(8)]
+    want = golden_model.render([0] * START_FRAME + ramp, 0x01)[START_FRAME:]
+    k = next(j for j, v in enumerate(want) if v in (32767, -32768))
+    assert k == 4 and want[k] == 32767 and all(abs(x) < 32767 for x in ramp)
+    caps = []
+    for j in range(k + 1):
+        bits = await i2s_send_and_capture(dut, ramp[j] << 8)
+        caps.append(_signed(tx_data_bits(bits)))
+        await Timer(1, unit="ns")
+        assert dp() == 0, f"LED lit before ramp frame {j}'s valid edge"
         await ClockCycles(dut.clk, 256)
-    assert env() is None or env() >= 16384, \
-        "100 loud frames must attack env past 16384 (to 32766)"
+        await Timer(1, unit="ns")
+        assert dp() == (1 if j == k else 0), f"LED after ramp frame {j}: {dp()}"
+    bits = await i2s_send_and_capture(dut, 0)
+    caps.append(_signed(tx_data_bits(bits)))
+    assert caps[1:] == want[:k + 1], f"ramp captures {caps[1:]} != {want[:k + 1]}"
+    assert dp() == 1
 
-    # 1400 silent frames (ui[0] idles low): release from 32766 hits
-    # exact 0 on the 1388th update
-    await ClockCycles(dut.clk, 512 * 1400)
-    assert env() in (None, 0), "long silence must decay env to exactly 0"
+    # (b) rails after 400 silent frames each
+    xs = ramp[:k + 1] + [0]
+    await ClockCycles(dut.clk, 256)                   # rest of the capture frame
+    for word in (32767, -32768):
+        await ClockCycles(dut.clk, 512 * 400)
+        got = await fast_frames(dut, [word, 0])
+        xs += [0] * 400 + [word, 0]
+        want = golden_model.render([0] * START_FRAME + xs, 0x01)
+        assert got[1] == want[-2] == word, f"rail {word}: {got[1]} (golden {want[-2]})"
+
+
+@cocotb.test()
+async def test_cenv_decay(dut):
+    """Comp envelope release (v3 task 10), RTL-only cenv probe (guarded;
+    None voids it on the flat GL netlist — test_comp_* carry GL): 100
+    loud frames attack cenv, then 300 silent frames; the probe equals
+    the golden cenv exactly at the end of the loud run and after every
+    100 silent frames. Release = cenv - (cenv >> 12) - (cenv != 0);
+    termination at exactly 0 (~34k frames from full scale, too long
+    here) is proven by `golden_model.py --selftest` (wav_tool check)."""
+    await start(dut, 0b0000_0010)                     # en[0] comp only
+    probe = _probe(dut, "cenv")
+    # RTL (where the chain's step reg is visible) must expose cenv
+    assert probe is not None or _probe(dut, "step") is None, "RTL has no cenv"
+
+    def cenv():
+        return None if probe is None else int(probe.value)
+
+    st = golden_model.Comp()
+    for _ in range(START_FRAME):
+        st.step(0)
+    assert cenv() in (None, st.cenv) and st.cenv == 0
+    await fast_frames(dut, [0x7FFF] * 100)
+    for _ in range(100):
+        st.step(0x7FFF)
+    assert cenv() in (None, st.cenv), f"cenv after loud {cenv()} != {st.cenv}"
+    for k in range(3):
+        await ClockCycles(dut.clk, 512 * 100)
+        for _ in range(100):
+            st.step(0)
+        assert cenv() in (None, st.cenv), f"cenv after {100 * (k + 1)} silent: {cenv()} != {st.cenv}"
+    assert 0 < st.cenv < 8037707     # released, not yet at the floor
+    if probe is not None:
+        assert cenv() == 7469837
 
 
 @cocotb.test()
@@ -593,8 +586,7 @@ async def test_fuzz_asym(dut):
       a = sat_mag(x); t = x[15] ? sat16(13107 + (env >>> 2)) : 19660
       (the negative clip point relaxes with the input envelope —
       bias-starve dynamics; env is the shared PRE-CHAIN envelope, read
-      post-update: the output captured in frame N+1 is fuzz(x_N, env_N),
-      the same combinational-into-TX timing comp pins);
+      post-update: the output captured in frame N+1 is fuzz(x_N, env_N));
       shaped = a > t ? t : a; fuzz_core = x[15] ? -shaped : shaped.
     octave off throughout (the plain asym fuzz; the octave blend is
     test_fuzz_octave). Env-dependence is Review Focus 4: the SAME
@@ -622,18 +614,13 @@ async def test_fuzz_asym(dut):
         first lrclk read): env_510 = attack (6510+24576)>>1 = 15543
         -> t_neg = 13107 + 3885 = 16992 -> -16992 (vs -21234 loud on
         the same input — Review Focus 4's two distinct pins);
-      - re-coupling probes on 0x1000 with env in the x4 quadrant:
-        en=0x03 (frame 512, env 15421): comp x4 -> s1 = 0x4000 ->
-        shaped = 16384 (sub-t_pos) -> +16384 — the fuzz stage receives
-        the COMPED amplitude. PRE-FIX value: 4096 (fuzz read
-        mag(sample_in); comp masked) — this assert fails there;
-        en=0x05 (frame 514, env 15299): dist reads a direct
-        saturating |s2| (= s1 with fuzz off) -> comp x4 -> 16384 ->
-        diode knee dist(16384) = +16384 (pre-fix: the pre-chain 4096
-        -> dist(4096) = 10240). Task 7: the en changes go through the
-        switch debounce, so each re-coupling probe settles 600 silent
-        frames first; env decays to < 16384 (x4 quadrant) and a
-        positive probe's value is env-free, so the pins stand."""
+      - re-coupling probes on 0x1000, each from a fresh reset (comp
+        gain golden g = 717 after the silent settle; task 10's slewed
+        compressor): en=0x03: s1 = 11472 -> fuzz passes it -> +11472
+        — the fuzz stage receives the COMPED amplitude (PRE-FIX value
+        4096: fuzz read mag(sample_in); comp masked); en=0x05: dist
+        reads a direct saturating |s2| (= s1 with fuzz off) ->
+        dist(11472) = +15156 (pre-fix: dist(4096) = 10240)."""
     # en[1] fuzz only (ui[2]); octave off (ui[7] = 0): the plain asym fuzz
     await start(dut, 0b0000_0100)              # at the start of frame 0 (env 0)
 
@@ -697,22 +684,25 @@ async def test_fuzz_asym(dut):
     got = out - 0x10000 if out & 0x8000 else out
     assert got == -16992, f"quiet -24576: {got} != -16992 (env 15543)"
 
-    # re-coupling probe 1 (the mandatory fix): comp+fuzz, env 15421
-    # (x4 quadrant) -> s1 = 0x4000 -> shaped = 16384 -> +16384.
-    # PRE-FIX: 4096 (fuzz read the pre-chain mag) — this assert fails
-    # on the v2.2-trim RTL: the probe's purpose
-    await resettle(dut, 0x03 << 1)       # switches go through the debounce
-    got = await fuzz_once(0x1000, en_val=0x03)
-    assert got == 16384, \
-        f"comp->fuzz re-coupling: {got} != 16384 (pre-fix value 4096)"
+    # re-coupling probes (the mandatory fix): each on a fresh reset, so
+    # the comp gain is golden's post-settle g = 717 (cenv 0). comp+fuzz:
+    # s1 = sat16(4096 * 717 >>> 8) = 11472 (sub-t_pos) -> +11472. PRE-FIX:
+    # 4096 (fuzz read the pre-chain mag) — the probe's purpose
+    async def chain_fresh(en_val, word16):
+        await start(dut, en_val << 1, clock=False)
+        got = await fast_frames(dut, [word16, 0])
+        want = golden_model.render([0] * START_FRAME + [word16], en_val)[START_FRAME]
+        return got[1], want
+
+    got, want = await chain_fresh(0x03, 0x1000)
+    assert got == want == 11472, \
+        f"comp->fuzz re-coupling: {got} != {want} (pre-fix value 4096)"
 
     # re-coupling probe 2: comp+dist (fuzz off) — dist reads |s2| = |s1|:
-    # comp x4 -> 16384 -> dist(16384) = +16384
-    # (pre-fix: the pre-chain 4096 -> dist(4096) = 10240)
-    await resettle(dut, 0x05 << 1)
-    got = await fuzz_once(0x1000, en_val=0x05)
-    assert got == golden_model.dist(16384) == 16384, \
-        f"comp->dist re-coupling: {got} != 16384 (pre-fix value 10240)"
+    # 11472 -> dist(11472) = +15156 (pre-fix: dist(4096) = 10240)
+    got, want = await chain_fresh(0x05, 0x1000)
+    assert got == want == golden_model.dist(11472) == 15156, \
+        f"comp->dist re-coupling: {got} != {want} (pre-fix value 10240)"
 
 
 @cocotb.test()
@@ -970,20 +960,26 @@ async def test_chain_enables(dut):
     # capture frame) and the silent settle after each enable change.
     await start(dut, 0b0000_0100, clock=False)   # en[1] fuzz only (ui[2])
     ref_env = golden_model.Env()
-    state = {"en": 0x02, "e": 0}
+    ref_comp = golden_model.Comp()               # comp state runs whatever en is
+    for _ in range(START_FRAME):
+        ref_comp.step(0)
+    state = {"en": 0x02, "e": 0, "g": ref_comp.g}
 
     async def stage_once(en_val, word16):
         if en_val != state["en"]:
             await resettle(dut, en_val << 1)     # ui[6:1] = en; debounced
             for _ in range(SETTLE_FRAMES):
                 ref_env.step(0)
+                ref_comp.step(0)
             state["en"] = en_val
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
         state["e"] = ref_env.step(word16)        # env after the x frame
+        state["g"] = ref_comp.step(word16)       # comp gain for the x frame
         await _wait_left_start(dut)
         bits = await i2s_send_and_capture(dut, 0)
         ref_env.step(0)                          # the capture frame
+        ref_comp.step(0)
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
@@ -1004,11 +1000,13 @@ async def test_chain_enables(dut):
 
     # phaser en[3] and delay en[5] (Rev A identity stubs) must pass
     # +-full-scale bit-exact when enabled, through the slot AND every
-    # disabled stage; comp en[0] is live, but +-full-scale saturates
-    # through its gain, so it reads identity here. All three stacked
-    # is identity too.
-    assert await stage_once(0x1, -32768) == -32768    # comp (sat16 gain)
-    assert await stage_once(0x1, 32767) == 32767
+    # disabled stage; comp en[0] is live: its value is golden comp at
+    # the frame's gain g (after the silences here g >= 256, so
+    # +-full-scale saturates and reads identity). All three stacked is
+    # identity too.
+    for x in (-32768, 32767):                         # comp (sat16 gain)
+        got = await stage_once(0x1, x)
+        assert got == golden_model.comp(x, state["g"]) == x, f"comp {x}: {got} (g {state['g']})"
     assert await stage_once(0x8, -32768) == -32768    # phaser stub
     assert await stage_once(0x8, 32767) == 32767
     assert await stage_once(0x20, -32768) == -32768   # delay stub

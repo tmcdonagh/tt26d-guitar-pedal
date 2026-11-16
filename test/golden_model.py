@@ -96,9 +96,63 @@ def trem_gain(p):
     return 256 - (t >> 1) - (t >> 2)
 
 
-def comp(s, env):
-    sh = 0 if env >= 24576 else (1 if env >= 16384 else 2)
-    return sat16(s << sh)
+# Compressor (v3 task 10): a smoothed 16.8 envelope cenv on the pre-chain
+# magnitude, a log-ish level lvl_q (4 steps per octave), a 1.5 dB-step gain
+# table above the knee and a slewed gain g applied through the multiplier.
+COMP_MANT = (256, 304, 362, 431)   # 2^(k/4) in 8.8, k = 0..3
+COMP_KNEE = 44                     # lvl_q of L = 2048 (e = 11, m2 = 0)
+COMP_G_RESET = 256                 # unity
+
+
+def comp_level(cenv):
+    """lvl_q = 4*e + m2 of L = cenv >> 8: e = index of L's MSB, m2 = the
+    two bits below it (zero-filled when e < 2); 0 for L == 0."""
+    L = cenv >> 8
+    if L == 0:
+        return 0
+    e = L.bit_length() - 1
+    m2 = (L >> (e - 2)) & 3 if e >= 2 else (L << (2 - e)) & 3
+    return 4 * e + m2
+
+
+def comp_target(cenv):
+    """Gain target from the level: 1.5 dB per lvl_q step, ratio 8/5 above
+    the knee (red = 5/8 of the overshoot), floored at gq = -8."""
+    over = max(0, comp_level(cenv) - COMP_KNEE)
+    gq = max(-8, 6 - ((over * 5) >> 3))
+    m, sh = COMP_MANT[gq & 3], gq >> 2
+    return m << sh if sh >= 0 else m >> -sh
+
+
+def cenv_release(c):
+    """cenv release with the 1-LSB floor: terminates at exactly 0."""
+    return c - (c >> 12) - (1 if c else 0)
+
+
+class Comp:
+    """Compressor state, one step per frame on the sample_valid edge from
+    the pre-edge values (g slews toward the target of the pre-edge cenv);
+    runs whether or not comp is enabled. step() returns the post-edge g,
+    the gain the chain applies to this frame's sample."""
+
+    def __init__(self):
+        self.cenv = 0
+        self.g = COMP_G_RESET
+
+    def step(self, x):
+        t = comp_target(self.cenv)
+        self.g += (t - self.g) >> 3
+        m = smag(x) << 8
+        if m > self.cenv:
+            self.cenv += (m - self.cenv) >> 5
+        else:
+            self.cenv = cenv_release(self.cenv)
+        return self.g
+
+
+def comp(s, g):
+    """sat16((s * g) >>> 8) — the shared multiplier at step 1."""
+    return sat16((s * g) >> 8)
 
 
 def fuzz(s, env, oct):
@@ -148,17 +202,19 @@ def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False):
     frame 0: valid because trem only reads it from EN_SETTLE on, long
     after the reader's first measurement (fast startup, ~34 frames)."""
     env = Env()
+    cst = Comp()
     inc = trem_inc(k1)
     p = 0
     out = []
     for i, x in enumerate(xs):
         e = env.step(x)
+        g = cst.step(x)
         s = x
         en_i, oct_i = (en, oct) if i >= EN_SETTLE else (0, 0)
         # trem phase: steps on sample_valid while enabled, else held at 0
         p = (p + inc) & 0x3FFFFF if en_i & 16 else 0
         if en_i & 1:
-            s = comp(s, e)
+            s = comp(s, g)
         if en_i & 2:
             s = fuzz(s, e, oct_i)
         if en_i & 4:
@@ -167,3 +223,23 @@ def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False):
             s = trem(s, p)
         out.append(s)
     return out
+
+
+def selftest():
+    """cenv release from full scale reaches exactly 0 (the 1-LSB floor;
+    the plain c - (c >> 12) stalls below 4096). Returns the frame count."""
+    c = (32767 << 8) - 31          # attack fixed point at full scale
+    n = 0
+    while c:
+        c = cenv_release(c)
+        n += 1
+        assert n < 100000, "cenv release does not terminate"
+    return n
+
+
+if __name__ == "__main__":
+    import sys
+    if sys.argv[1:] == ["--selftest"]:
+        print(f"selftest: cenv release full scale -> 0 in {selftest()} frames: PASS")
+    else:
+        raise SystemExit("usage: golden_model.py --selftest")
