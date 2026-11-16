@@ -11,8 +11,9 @@
 // the DUT (they reach the chain at frame 511; golden_model.EN_SETTLE).
 // The knob pins uio[4:2] follow an RC pin model (+K1= +K2= +K3=, 0..255,
 // -1 = absent = pin held low, the default) and uio[5] (SPI MISO) idles
-// low. ui[0] is the per-slot ADC data bit, assigned below. A final
-// "K1:value present moved" line reports the K1 settle probe.
+// low. ui[0] is the per-slot ADC data bit, assigned below. Final
+// "K1:/K2:/K3: value present moved" lines report the knob settle probes
+// (RTL only).
 // Each output sample is printed as a prefixed line "S:xxxx" on stdout;
 // wav_tool.py parses only those lines.
 //
@@ -24,7 +25,7 @@
 //   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
 //       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
-//   vvp sim_audio.vvp +EN=2 +OCT=1 +N=2818047 +OUT=audio_out/fuzzoct.hex
+//   vvp sim_audio.vvp +EN=2 +OCT=1 +N=2818047 +K1=-1 +K2=-1 +K3=-1 > fuzzoct.log
 // Input:  audio_in.hex, or +IN=<file> (one 16-bit sample per line, from audio_in.wav)
 // Output: one "S:xxxx" line per frame on stdout
 
@@ -63,6 +64,7 @@ module tb_audio;
   // (the reader's 2-flop synchronizer). v = -1 (+Kn absent, the
   // default) holds the pin at 0 (knob absent). uio[5] (MISO) idles 0.
   localparam integer SYNC_LAT = 2;
+  integer k1v = -1, k2v = -1, k3v = -1;   // knob plusargs, -1 = absent (declared before use)
   reg k1_pin = 1'b0, k2_pin = 1'b0, k3_pin = 1'b0;
   integer k1c = 0, k2c = 0, k3c = 0;
   assign uio_in = {3'b000, k3_pin, k2_pin, k1_pin, 2'b00};
@@ -100,11 +102,23 @@ module tb_audio;
   always @(posedge clk)
     if (k1_arm && (dut.k1.value !== k1_ref || dut.k1.present !== k1_pref))
       k1_moved = 1'b1;
+  // the same probe on K2 (tone shift), printed as "K2:value present moved"
+  reg [7:0] k2_ref = 8'd0;
+  reg       k2_pref = 1'b0, k2_moved = 1'b0;
+  always @(posedge clk)
+    if (k1_arm && (dut.k2.value !== k2_ref || dut.k2.present !== k2_pref))
+      k2_moved = 1'b1;
+
+  // and on K3 (dist drive), printed as "K3:value present moved"
+  reg [7:0] k3_ref = 8'd0;
+  reg       k3_pref = 1'b0, k3_moved = 1'b0;
+  always @(posedge clk)
+    if (k1_arm && (dut.k3.value !== k3_ref || dut.k3.present !== k3_pref))
+      k3_moved = 1'b1;
 
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
   integer en_dip = 0, oct_sw = 0, n_in = 0;
-  integer k1v = -1, k2v = -1, k3v = -1;   // knob plusargs, -1 = absent
   integer i, slot;
   reg [15:0] word;
   integer dummy;
@@ -139,6 +153,10 @@ module tb_audio;
       if (i == EN_SETTLE - 1) begin
         k1_ref  = dut.k1.value;
         k1_pref = dut.k1.present;
+        k2_ref  = dut.k2.value;
+        k2_pref = dut.k2.present;
+        k3_ref  = dut.k3.value;
+        k3_pref = dut.k3.present;
         k1_arm  = 1'b1;
       end
       // drive one frame's left half: 32 slots x 8 clk, I2S data on ui[0]
@@ -153,6 +171,8 @@ module tb_audio;
     end
 
     $display("K1:%0d %0d %0d", k1_ref, k1_pref, k1_moved);
+    $display("K2:%0d %0d %0d", k2_ref, k2_pref, k2_moved);
+    $display("K3:%0d %0d %0d", k3_ref, k3_pref, k3_moved);
     $display("done: %0d frames", n_samples);
     $finish;
   end

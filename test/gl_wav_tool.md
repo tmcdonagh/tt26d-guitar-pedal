@@ -1,112 +1,99 @@
-# Gate-level WAV parity runbook (v2.2 task 7)
+# Gate-level WAV parity runbook (2x2 design)
 
 Once the GDS CI run is green, prove the netlist produces the same audio as
-the RTL: run every `wav_tool.py` mode against the real `gate_level_netlist.v`
-and require **bit-exact** outputs vs the RTL `.wav` files in `audio_out/`
-(plan Global Constraints, netlist parity gate). Sampling instants are
-input-edge-determined, so no tolerance is expected.
+the golden model: run the `wav_tool.py check` excerpt against the real
+`gate_level_netlist.v` and require **bit-exact** output for every mode.
+Sampling instants are input-edge-determined, so no tolerance is expected.
+
+> **WARNING: the `test/gate_level_netlist.v` currently in the tree is a STALE
+> v2.2 1x1 netlist (it still contains the old `crush_hold` net). It does NOT
+> match this design and MUST be replaced before any gate-level run.**
+> `wav_tool.py glvl-build` (and therefore `SIM=glvl check`/`run`) refuses it
+> with a "STALE NETLIST" error. The file is untracked; replace it, do not
+> commit it.
+
+## Getting the netlist
+
+1. Take the green GDS workflow run on the 2x2 design and download its
+   artifact (named `tt_submission` or similar).
+2. Inside it, take the gate-level Verilog `<top>.v`
+   (`tt_um_tmcdonagh_guitar_pedal.v`; a local harden has it under
+   `runs/*/results/final/verilog/gl/`).
+3. Copy it to `test/gate_level_netlist.v` (the name the Makefile's
+   `GATES=yes` path also uses).
 
 ## Prerequisites
 
-- `gate_level_netlist.v` in `test/` — download the `tt_submission` artifact
-  from the green GDS workflow run (or copy from
-  `runs/*/results/final/verilog/gl/` of a local harden) and `cp` it to
-  `test/gate_level_netlist.v`, the same name the Makefile's `GATES=yes` path
-  uses.
-- `PDK_ROOT` exported, pointing at a sky130A PDK install (the same one the
-  GDS/gl_test CI uses; locally e.g. via volare/ciel).
-- iverilog + the RTL baseline: first run `python3 wav_tool.py run` (verilator,
-  default SIM) so `audio_out/*.wav` is fresh RTL evidence.
+- The fresh `test/gate_level_netlist.v` above.
+- `PDK_ROOT` pointing at a sky130A PDK install (e.g. `~/.volare-pdk`; the
+  same PDK the GDS/gl_test CI uses).
+- Verilator (the default GL path); iverilog only for the slow `SIM=gl`
+  fallback.
 
-## Modes (SIM env var)
-
-- `SIM=glvl` — **Verilator GL: the default for parity work** (minutes per
-  full 9-mode pass). Compiles the same FUNCTIONAL cell models to C++.
-  Requires two build-time pieces created for this (see `glvl_stub.v` and
-  `wav_tool.py glvl_make_lib()`): behavioral models for the primitives.v
-  UDPs (Verilator cannot compile UDPs; all 17 transcribed from their
-  tables, power-guarded per the `_pp$PG$N` semantics), and a transformed
-  library copy (strips `#1` instance delays, which Verilator parses as
-  parameter overrides; rewrites skipped NOTIFIER positional args as `1'bx`).
-- `SIM=gl` — iverilog GL: same defines/sources as the Makefile `GATES=yes`
-  path, correct but slow (~7 h/mode on a 1×1 netlist). Fallback only.
-
-## 1. The compile command
-
-`test/tb_audio_gl.v` is `tb_audio.v` with the GL power-pin instantiation from
-`test/tb.v`. The compile mirrors the Makefile's `GATES=yes` define set and the
-sky130 cell source list **exactly** (same order):
-
-```sh
-export PDK_ROOT=/path/to/pdk   # contains sky130A/libs.ref/sky130_fd_sc_hd/...
-cd test
-iverilog -g2012 -s tb_audio_gl -DGL_TEST -DFUNCTIONAL -DUSE_POWER_PINS -DSIM \
-  -D'UNIT_DELAY=#1' -o sim_audio_gl.vvp tb_audio_gl.v \
-  $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/verilog/primitives.v \
-  $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v \
-  gate_level_netlist.v
-```
-
-Print it without running anything (dry run): `python3 wav_tool.py gl-cmd`.
-
-## 2. Run all 9 modes
-
-Everything below is wrapped in `wav_tool.py`:
+## Parity check (the gate)
 
 ```sh
 cd test
-export PDK_ROOT=/path/to/pdk
-SIM=gl python3 wav_tool.py run       # builds sim_audio_gl.vvp, runs all modes,
-                                     # writes audio_out_gl/{mode}.{log,wav}
+PDK_ROOT=~/.volare-pdk SIM=glvl python3 wav_tool.py check
 ```
 
-Modes run in parallel (9 `vvp` processes), same as the RTL pass. Manual
-equivalent for one mode:
+This builds the Verilator gate-level binary (`tb_audio_gl.v` + `glvl_stub.v`
++ a transformed sky130 cell library + the netlist), runs the ~6 s excerpt
+through every `CHECK_MODES` entry (15 modes), and compares each bit-exactly
+against `golden_model.py`, plus return codes, lengths, the fuzz sha and the
+golden-model selftest. Logs go to `audio_out_gl/`. The K1/K2/K3 settle
+probes are skipped: the GL tb does not print them, and the plain RTL
+`python3 -I wav_tool.py check` already proves them (the netlist is meant to
+be equivalent).
+
+## Optional: full riff
 
 ```sh
-vvp sim_audio_gl.vvp +EN=2 +PARAMS=1 +N=2818047 +OUT=audio_out_gl/fuzzoct.hex \
-  > audio_out_gl/fuzzoct.log
+PDK_ROOT=~/.volare-pdk SIM=glvl python3 wav_tool.py run          # writes audio_out_gl/{mode}.{log,wav}
+python3 wav_tool.py model                                         # golden renders -> audio_model/
+PDK_ROOT=~/.volare-pdk SIM=glvl python3 wav_tool.py model-parity  # GL vs golden, bit-exact
 ```
 
-(see `wav_tool.py` `MODES` for every mode's `en`/`params` pair).
+(`python3 wav_tool.py gl-parity` instead compares `audio_out_gl/` against the
+RTL `audio_out/` from a plain `python3 wav_tool.py run`.)
 
-## 3. The parity check — bit-exact, no tolerance
+## Testbench interface
+
+`tb_audio_gl.v` plusargs: `+EN` (ui[6:1] enables, 0..63), `+OCT` (ui[7] fuzz
+octave, 0/1), `+N` (frames), `+IN` (input hex, default `audio_in.hex`),
+`+K1`, `+K2`, `+K3` (knob raw value 0..255 through the RC pin model, -1 =
+absent). Manual run of one mode:
 
 ```sh
-python3 wav_tool.py gl-parity
+obj_dir_gl/sim_audio_glv +EN=2 +OCT=1 +N=288000 +IN=audio_excerpt.hex \
+  +K1=-1 +K2=-1 +K3=-1 > audio_out_gl/fuzzoct.log
 ```
 
-compares each `audio_out_gl/{mode}.wav` payload byte-for-byte against
-`audio_out/{mode}.wav` (header and frame count must match too) and prints
-PASS/FAIL per mode. Manual equivalent (wave-payload diff):
+Print the iverilog (`SIM=gl`, ~7 h/mode on a 1x1 netlist, fallback only) or
+Verilator commands without running: `python3 wav_tool.py gl-cmd` /
+`glvl-cmd`.
 
-```sh
-python3 - <<'EOF'
-import wave
-for m in "bypass comp fuzz fuzzoct dist trem tremF fuzzdist all4".split():
-    a = wave.open(f"audio_out/{m}.wav"); b = wave.open(f"audio_out_gl/{m}.wav")
-    print(m, a.readframes(a.getnframes()) == b.readframes(b.getnframes()))
-EOF
-```
-
-**On any mismatch: systematic debugging before any "close enough" conclusion.**
-The gate is bit-exact; "audibly identical" or "a few LSBs off" is a FAIL.
-Likely mismatch sources, in order: stale RTL baseline (re-run step 0), stale
-netlist vs current `src/`, X-propagation from a floating input in the harness,
-or a real synthesis bug (that's the point of the gate).
+**On any mismatch: systematic debugging before any "close enough"
+conclusion.** The gate is bit-exact. Likely sources, in order: stale
+netlist vs current `src/`, X-propagation from a floating input in the
+harness, or a real synthesis bug (that is the point of the gate).
 
 ## Known risks / notes
 
 - Output capture is port-based: `tb_audio_gl.v` reassembles the DAC sample
-  from `uio_out[1]` (slots 1–16, mid-slot) — the RTL's internal
-  `effect_sample` alias does NOT survive netlist flattening (proven by the
-  first GL compile; opt_clean collapses it). The tb handles the one-frame
-  DAC lag internally (flush frame + print alignment), so GL logs stay
-  index-aligned with the RTL logs and `gl-parity` compares 1:1.
-- The netlist is flat (sub-module internals exist only as escaped net
-  names); only top-level names are probeable.
-- `UNIT_DELAY=#1` gives every cell a unit delay — if deep paths ever
-  misbehave (X / parity FAIL only under GL), check path depth vs the 40.5 ns
-  clock period; the CI `gl_test` job shares this risk and is the cross-check.
-- GL outputs live in `audio_out_gl/` so the RTL evidence in `audio_out/` is
+  from `uio_out[1]` (slots 1-16, mid-slot); the RTL's internal
+  `effect_sample` alias does not survive netlist flattening. The tb handles
+  the one-frame DAC lag (flush frame + print alignment), so GL logs stay
+  index-aligned with the RTL logs.
+- The netlist is flat; only top-level names are probeable.
+- `UNIT_DELAY=#1` gives every cell a unit delay; if deep paths misbehave
+  (X / parity FAIL only under GL), check path depth vs the 40.5 ns clock.
+- Verilator needs behavioral models for the primitives.v UDPs
+  (`glvl_stub.v`) and a transformed cell library copy (`glvl_make_lib()`
+  strips `#1` instance delays and rewrites skipped NOTIFIER args).
+- GL outputs live in `audio_out_gl/`, so the RTL evidence in `audio_out/` is
   never overwritten.
+- **CI note:** the cocotb gate-level job (`gl_test`) may take 0.5-2 h on the
+  2x2 netlist. If it nears the job time limit, the largest tests are
+  `test_chain_enables`, `test_gate_hysteresis`, `test_clip_dp`,
+  `test_fuzz_asym`, `test_trem_smooth` and `test_env_decay`.

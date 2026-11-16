@@ -14,7 +14,10 @@ Usage (from test/):
     python3 wav_tool.py gl-cmd       # print the GL iverilog command (dry run)
     python3 wav_tool.py gl-parity    # bit-exact GL-vs-RTL WAV check
     python3 wav_tool.py check        # ~6 s excerpt: Verilator vs golden model
+                                     # (SIM=glvl: same, on the gate-level netlist)
     python3 wav_tool.py model        # full-riff golden renders -> audio_model/
+    python3 wav_tool.py model-parity # bit-exact audio_out/ (run) vs audio_model/ (model)
+Modes = MODES (= CHECK_MODES: listening modes plus the K1/K2/K3 knob modes).
 """
 import array
 import os
@@ -56,7 +59,7 @@ FUZZ_BASELINE_SHA256 = "daadb2a3c1a6f891dd9cb47bd24bdfe0381babf752e514d2ed75e448
 # name, en (ui[6:1], bit order = chain order en[0]=comp..en[5]=delay;
 # +EN range 0..63), oct (ui[7] fuzz octave switch; +OCT 0/1). The switches
 # are debounced in the DUT: golden_model.EN_SETTLE frames render as off.
-MODES = [
+LISTEN_MODES = [
     ("bypass",   0x0,  0),  # all stages off — digital clean identity
     ("comp",     0x01, 0),  # comp: smoothed env, 1.5 dB gain table, slewed gain
     ("fuzz",     0x02, 0),  # asym clip, env-biased negative point
@@ -66,15 +69,24 @@ MODES = [
     ("fuzzdist", 0x06, 0),  # fuzz clip, then diode knee
     ("all4",     0x17, 0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
 ]
-# check modes: name, en, oct, k1 (knob K1 value 0..255 for the tb's RC pin
-# model, None = absent). Every listening mode runs K1-absent; the knob
-# modes pin the trem rate path (inc = (64 + k1[5:0]) << k1[7:6]).
-CHECK_MODES = [(name, en, oct_sw, None) for name, en, oct_sw in MODES] + [
-    ("trem_k1lo",  0x10, 0, 8),    # inc 72  (~0.82 Hz)
-    ("trem_k1mid", 0x10, 0, 128),  # inc 256 (~2.93 Hz)
-    ("trem_k1hi",  0x10, 0, 250),  # inc 976 (~11.2 Hz)
+# check modes: name, en, oct, k1, k2, k3 (knob K1..K3 values 0..255 for the
+# tb's RC pin model, None = absent). Every listening mode runs both
+# knobs absent; the K1 modes pin the trem rate path (inc = (64 +
+# k1[5:0]) << k1[7:6]), the K2 modes the tone shift (kt = 4 - k2[7:6]:
+# k2=0 -> kt 4 dark, k2=255 -> kt 1 bright).
+CHECK_MODES = [(name, en, oct_sw, None, None, None) for name, en, oct_sw in LISTEN_MODES] + [
+    ("trem_k1lo",  0x10, 0, 8, None, None),    # inc 72  (~0.82 Hz)
+    ("trem_k1mid", 0x10, 0, 128, None, None),  # inc 256 (~2.93 Hz)
+    ("trem_k1hi",  0x10, 0, 250, None, None),  # inc 976 (~11.2 Hz)
+    ("fuzz_k2dark",   0x02, 0, None, 0, None),    # fuzz + tone kt 4 (darkest)
+    ("fuzz_k2bright", 0x02, 0, None, 255, None),  # fuzz + tone kt 1 (brightest)
+    ("dist_k3lo",  0x04, 0, None, None, 0),    # dist drive x1 (256)
+    ("dist_k3hi",  0x04, 0, None, None, 255),  # dist drive x7.97 (2041)
 ]
+MODES = CHECK_MODES   # `run`/`model`/parity cover every mode, knob modes included
 K1_RE = re.compile(r"^K1:(\d+) (\d+) (\d+)$")
+K2_RE = re.compile(r"^K2:(\d+) (\d+) (\d+)$")
+K3_RE = re.compile(r"^K3:(\d+) (\d+) (\d+)$")
 
 
 def wav2hex():
@@ -107,11 +119,12 @@ def parse_samples(log_path):
     return vals
 
 
-def parse_k1_probe(log_path):
-    """(value, present, moved) from the tb's "K1:" settle-probe line."""
+def parse_k1_probe(log_path, regex=K1_RE):
+    """(value, present, moved) from the tb's "K1:" (K2:/K3: via regex)
+    settle-probe line."""
     with open(log_path) as f:
         for line in f:
-            m = K1_RE.match(line.strip())
+            m = regex.match(line.strip())
             if m:
                 return tuple(int(g) for g in m.groups())
     return None
@@ -199,6 +212,12 @@ def glvl_build():
         raise SystemExit(f"missing {netlist} — copy it from the GDS run artifacts (gl_wav_tool.md)")
     if not os.environ.get("PDK_ROOT"):
         raise SystemExit("PDK_ROOT must point at the sky130A PDK (see gl_wav_tool.md)")
+    with open(netlist, errors="replace") as f:
+        if "crush_hold" in f.read():
+            raise SystemExit(
+                f"STALE NETLIST: {netlist} contains the old v2.2 `crush_hold` net — it is a "
+                "1x1 netlist of a previous design, not this 2x2 one. Replace it with the "
+                "`<top>.v` from the GDS workflow's tt_submission artifact (gl_wav_tool.md).")
     glvl_make_lib()
     subprocess.check_call(glvl_cmd(), cwd=HERE)
 
@@ -215,7 +234,7 @@ def gl_build():
 def gl_parity():
     """Parity gate: every GL mode's .wav must be bit-exact vs the RTL .wav."""
     bad = []
-    for name, _, _ in MODES:
+    for name, *_ in MODES:
         with wave.open(os.path.join(OUT_DIR, f"{name}.wav")) as a, \
              wave.open(os.path.join(OUT_DIR_GL, f"{name}.wav")) as b:
             ok = ((a.getnchannels(), a.getsampwidth(), a.getframerate(), a.getnframes())
@@ -246,40 +265,62 @@ def vl_build():
         cwd=HERE, stdout=subprocess.DEVNULL)
 
 
+def probes_ok(log_path, k1, k2, k3, name):
+    """RTL-only K1/K2/K3 settle probes (the model applies knob_steady(k)
+    from frame 0: exact only if the RTL reading is settled and unmoved)."""
+    for tag, regex, k in (("K1", K1_RE, k1), ("K2", K2_RE, k2), ("K3", K3_RE, k3)):
+        probe = parse_k1_probe(log_path, regex)
+        want = (0 if k is None else golden_model.knob_steady(k),
+                0 if k is None else 1, 0)
+        if probe != want:
+            print(f"{name}: FAIL ({tag} probe value/present/moved {probe} != {want})")
+            return False
+    return True
+
+
 def check():
     """Fast gate: Verilator sim vs golden model on the excerpt, bit-exact."""
+    gl = os.environ.get("SIM", "verilator") == "glvl"
     full = read_wav(IN_WAV)
     ex = full[EXCERPT_START:EXCERPT_START + EXCERPT_FRAMES]
     assert len(ex) == EXCERPT_FRAMES, "excerpt runs past end of audio_in.wav"
-    vl_build()
+    if gl:
+        glvl_build()   # also refuses a stale netlist
+        exe = os.path.join(HERE, "obj_dir_gl", "sim_audio_glv")
+        os.makedirs(OUT_DIR_GL, exist_ok=True)
+    else:
+        vl_build()
+        exe = VL_EXE
     with open(EXCERPT_HEX, "w") as f:
         f.write("\n".join("%04x" % (s & 0xFFFF) for s in ex))
     with tempfile.TemporaryDirectory() as tmp:
+        if gl:
+            tmp = OUT_DIR_GL   # netlist logs land in audio_out_gl/<mode>.log
         procs = {}
-        for name, en, oct_sw, k1 in CHECK_MODES:
+        for name, en, oct_sw, k1, k2, k3 in CHECK_MODES:
             with open(os.path.join(tmp, f"{name}.log"), "w") as log:
                 procs[name] = subprocess.Popen(
-                    [VL_EXE, f"+EN={en}", f"+OCT={oct_sw}", f"+N={EXCERPT_FRAMES}",
-                     f"+IN={EXCERPT_HEX}", f"+K1={-1 if k1 is None else k1}"],
+                    [exe, f"+EN={en}", f"+OCT={oct_sw}", f"+N={EXCERPT_FRAMES}",
+                     f"+IN={EXCERPT_HEX}", f"+K1={-1 if k1 is None else k1}",
+                     f"+K2={-1 if k2 is None else k2}",
+                     f"+K3={-1 if k3 is None else k3}"],
                     stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
         rcs = {name: p.wait() for name, p in procs.items()}
         bad = False
-        for name, en, oct_sw, k1 in CHECK_MODES:
+        for name, en, oct_sw, k1, k2, k3 in CHECK_MODES:
             if rcs[name] != 0:
                 bad = True
                 print(f"{name}: FAIL (sim exited with return code {rcs[name]})")
                 continue
             log_path = os.path.join(tmp, f"{name}.log")
-            # the model applies knob_steady(k1) from frame 0: exact only if
-            # the RTL K1 reading is settled and still from EN_SETTLE - 1 on
-            probe = parse_k1_probe(log_path)
-            want_probe = (0 if k1 is None else golden_model.knob_steady(k1),
-                          0 if k1 is None else 1, 0)
-            if probe != want_probe:
+            # The K1/K2/K3 settle probes are RTL-only: tb_audio_gl.v does not
+            # print them. The RTL `check` proves them and the netlist is
+            # meant to be equivalent, so GL mode makes only the bit-exact
+            # sample comparison below.
+            if not gl and not probes_ok(log_path, k1, k2, k3, name):
                 bad = True
-                print(f"{name}: FAIL (K1 probe value/present/moved {probe} != {want_probe})")
                 continue
-            want = golden_model.render(ex, en, oct=oct_sw, k1=k1)
+            want = golden_model.render(ex, en, oct=oct_sw, k1=k1, k2=k2, k3=k3)
             got = parse_samples(log_path)
             first = next((i for i in range(min(len(got), len(want))) if got[i] != want[i]), None)
             if first is None and len(got) != len(want):
@@ -314,8 +355,8 @@ def model():
     """Full-riff golden renders to audio_model/<mode>.wav (for listening)."""
     os.makedirs(MODEL_DIR, exist_ok=True)
     full = read_wav(IN_WAV)
-    for name, en, oct_sw in MODES:
-        out = golden_model.render(full, en, oct=oct_sw)
+    for name, en, oct_sw, k1, k2, k3 in MODES:
+        out = golden_model.render(full, en, oct=oct_sw, k1=k1, k2=k2, k3=k3)
         path = os.path.join(MODEL_DIR, f"{name}.wav")
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
@@ -325,9 +366,30 @@ def model():
         print(f"{path}: {len(out)} samples")
 
 
-def run_mode(name, en, oct_sw, n, sim):
+def model_parity():
+    """Bit-exact check: every full-riff sim WAV in audio_out/ (SIM=...
+    outputs: audio_out_gl/ with SIM=gl*) vs the golden render in audio_model/
+    (`model` first)."""
+    out_dir = OUT_DIR_GL if os.environ.get("SIM", "verilator").startswith("gl") else OUT_DIR
+    bad = []
+    for name, *_ in MODES:
+        a = read_wav(os.path.join(out_dir, f"{name}.wav"))
+        b = read_wav(os.path.join(MODEL_DIR, f"{name}.wav"))
+        first = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
+        ok = first is None and len(a) == len(b)
+        print(f"{name}: {'PASS' if ok else 'FAIL'} ({len(a)} vs {len(b)} samples"
+              + ("" if ok else f", first diff at {first}") + ")")
+        if not ok:
+            bad.append(name)
+    if bad:
+        raise SystemExit(f"model-parity FAIL: {bad}")
+
+
+def run_mode(name, en, oct_sw, k1, k2, k3, n, sim):
     out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
-    args = [f"+EN={en}", f"+OCT={oct_sw}", f"+N={n}"]
+    args = [f"+EN={en}", f"+OCT={oct_sw}", f"+N={n}",
+            f"+K1={-1 if k1 is None else k1}", f"+K2={-1 if k2 is None else k2}",
+            f"+K3={-1 if k3 is None else k3}"]
     if sim == "gl":
         cmd = ["vvp", GL_VVP] + args
     elif sim == "glvl":
@@ -347,7 +409,7 @@ def main():
     if what == "wav2hex":
         print(wav2hex(), "samples")
     elif what == "hex2wav":
-        for name, _, _ in MODES:
+        for name, *_ in MODES:
             p, n = hex2wav(name)
             print(f"{p}: {n} samples")
     elif what == "gl-cmd":
@@ -364,6 +426,8 @@ def main():
         check()
     elif what == "model":
         model()
+    elif what == "model-parity":
+        model_parity()
     elif what == "run":
         out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
         os.makedirs(out_dir, exist_ok=True)
@@ -372,10 +436,14 @@ def main():
         elif sim == "glvl":
             glvl_build()
         n = wav2hex()
-        procs = [run_mode(name, en, oct_sw, n, sim) for name, en, oct_sw in MODES]
-        for p in procs:
-            p.wait()
-        for name, _, _ in MODES:
+        procs = [run_mode(name, en, oct_sw, k1, k2, k3, n, sim)
+                 for name, en, oct_sw, k1, k2, k3 in MODES]
+        rcs = [p.wait() for p in procs]
+        failed = [(m[0], rc) for m, rc in zip(MODES, rcs) if rc != 0]
+        if failed:
+            raise SystemExit("run FAIL: simulator exited non-zero: "
+                             + ", ".join(f"{n} (rc {rc})" for n, rc in failed))
+        for name, *_ in MODES:
             path, cnt = hex2wav(name, out_dir)
             print(f"{path}: {cnt} samples")
     else:

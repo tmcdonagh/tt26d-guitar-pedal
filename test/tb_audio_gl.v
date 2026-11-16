@@ -4,7 +4,7 @@
 // Gate-level audio parity runner (v2.2 task 7): same harness as tb_audio.v
 // — streams audio_in.hex through the real I2S input pins, one output
 // sample per frame via $display — but compiled against the real
-// gate_level_netlist.v instead of the RTL. Used by wav_tool.py (SIM=gl)
+// gate_level_netlist.v instead of the RTL. Used by wav_tool.py (SIM=gl, SIM=glvl)
 // and test/gl_wav_tool.md: every mode's output must be BIT-EXACT vs the
 // RTL .wav in audio_out/ (netlist parity gate, plan Global Constraints).
 //
@@ -32,12 +32,12 @@
 //       $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v \
 //       gate_level_netlist.v
 // Run (per mode, same plusargs as the RTL build):
-//   vvp sim_audio_gl.vvp +EN=2 +OCT=1 +N=2818048 +OUT=audio_out_gl/fuzzoct.hex
-// Input:  audio_in.hex (one 16-bit sample per line)
+//   vvp sim_audio_gl.vvp +EN=2 +OCT=1 +N=2818048 +K1=-1 +K2=-1 +K3=-1 > audio_out_gl/fuzzoct.log
+// Input:  audio_in.hex, or +IN=<file> (one 16-bit sample per line)
 // Output: one "S:xxxx" line per frame on stdout (captured per-mode by the
 //         .log file in audio_out_gl/), converted to .wav by wav_tool.py
 //
-// +EN/+OCT/+N/+K1/+K2/+K3 interface and ui/uio byte layout: identical to
+// +EN/+OCT/+N/+IN/+K1/+K2/+K3 interface and ui/uio byte layout: identical to
 // tb_audio.v (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=fuzz octave
 // via +OCT=, ui[0]=ADC data; knob pins uio[4:2] follow the same RC pin
 // model, -1 = absent = held low; uio[5] MISO idles low). The K1 settle
@@ -94,6 +94,7 @@ module tb_audio_gl;
   // (the reader's 2-flop synchronizer). v = -1 (+Kn absent, the
   // default) holds the pin at 0 (knob absent). uio[5] (MISO) idles 0.
   localparam integer SYNC_LAT = 2;
+  integer k1v = -1, k2v = -1, k3v = -1;   // knob plusargs, -1 = absent (declared before use)
   reg k1_pin = 1'b0, k2_pin = 1'b0, k3_pin = 1'b0;
   integer k1c = 0, k2c = 0, k3c = 0;
   assign uio_in = {3'b000, k3_pin, k2_pin, k1_pin, 2'b00};
@@ -123,16 +124,17 @@ module tb_audio_gl;
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
   integer en_dip = 0, oct_sw = 0, n_in = 0;
-  integer k1v = -1, k2v = -1, k3v = -1;   // knob plusargs, -1 = absent
   integer i, slot;
   reg [15:0] word;
   reg [15:0] cap;   // DAC-side sample reassembled from uio_out[1]
   integer dummy;
+  reg [8*256-1:0] in_file = "audio_in.hex";
 
   initial begin
     dummy = $value$plusargs("EN=%d", en_dip);
     dummy = $value$plusargs("OCT=%d", oct_sw);
     dummy = $value$plusargs("N=%d", n_in);
+    dummy = $value$plusargs("IN=%s", in_file);
     dummy = $value$plusargs("K1=%d", k1v);
     dummy = $value$plusargs("K2=%d", k2v);
     dummy = $value$plusargs("K3=%d", k3v);
@@ -141,7 +143,7 @@ module tb_audio_gl;
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
-    $readmemh("audio_in.hex", mem);
+    $readmemh(in_file, mem);
     n_samples = n_in;
     $display("loaded %0d samples, EN=%0d OCT=%0d K1=%0d K2=%0d K3=%0d",
              n_samples, en_dip, oct_sw, k1v, k2v, k3v);

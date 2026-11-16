@@ -535,6 +535,94 @@ async def test_cenv_decay(dut):
         assert cenv() == 7469837
 
 
+class Hist:
+    """Frame history of a dirt-stage test (v3 task 11): fuzz/dist outputs
+    pass through the tone low-pass and the noise gate, which carry state
+    across frames, so every probe is checked against golden_model.render
+    of the whole history ([0] * START_FRAME + the driven frames) instead
+    of an isolated-frame literal. The gate is opened beforehand by a
+    loud priming run (L >= 256) so the outputs are non-zero."""
+
+    def __init__(self, en, oct_sw=0, k3=None):
+        self.en, self.oct, self.k3 = en, oct_sw, k3
+        self.xs = [0] * START_FRAME
+
+    def add(self, x, n=1):
+        self.xs += [x] * n
+
+    def render(self, en=None):
+        tap = []
+        out = golden_model.render(self.xs, self.en if en is None else en,
+                                  oct=self.oct, k3=self.k3, tap=tap)
+        return out, tap
+
+
+async def prime_gate(dut, hist, amp=20000, n=120):
+    """Drive n loud frames (gate opens at ~62, gg full ~19 frames later);
+    leaves the sim at a left-half start, as fast_frames does."""
+    await fast_frames(dut, [amp] * n)
+    hist.add(amp, n)
+
+
+async def dirt_frame(dut, hist, word16, direct=False):
+    """Drive word16 in one frame, then a zero capture frame (two frames,
+    appended to hist). The captured output must equal golden for the
+    word's frame (tone + gate included). Returns (stage, out, i): stage =
+    the RTL s3_r probe (the dist-stage output the tone filter sees) read
+    40 clk after the word's valid edge, None where the probe is absent
+    (flat GL netlist); i = the word's history index. direct=True skips
+    the leading WS wait (right after start()/fast_frames, which already
+    return at a left start)."""
+    if not direct:
+        await _wait_left_start(dut)
+    await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
+    await ClockCycles(dut.clk, 40)
+    p = _probe(dut, "s3_r")
+    stage = None if p is None else _signed(int(p.value))
+    await _wait_left_start(dut)
+    out = _signed(tx_data_bits(await i2s_send_and_capture(dut, 0)))
+    i = len(hist.xs)
+    hist.add(word16)
+    hist.add(0)
+    want, tap = hist.render()
+    assert out == want[i], f"word {word16}: out {out} != golden {want[i]}"
+    assert stage in (None, tap[i]), f"word {word16}: s3_r {stage} != golden {tap[i]}"
+    return stage, out, i
+
+
+HOLD_FRAMES = 48    # tone (kt 2) settles to within 1 LSB of a DC input
+
+
+async def hold_frames(dut, hist, word16, n=HOLD_FRAMES, direct=True):
+    """Gate-level-visible probe: drive word16 for n frames (a DC hold, so
+    the tone low-pass settles and the open gate passes it), then check
+    EVERY captured port word against golden_model.render of the whole
+    history. Returns (port, stage, i, want, tap): the last captured port
+    word and its golden index i (the hold's second-last frame, one-frame
+    TX latency), the RTL s3_r probe read after the last frame (the
+    dist-stage output of the hold's last frame; None on GL, else asserted
+    == tap[-1]), and the full golden want/tap lists. The gate must
+    already be open (prime_gate). Frame-continuous with the previous
+    prime_gate/hold_frames call (capture 0 is that call's last frame);
+    direct=True expects the sim at a left start (as fast_frames leaves
+    it — a second WS wait there can race), direct=False waits for one
+    (after a dirt_frame, which ends mid-frame)."""
+    if not direct:
+        await _wait_left_start(dut)
+    base = len(hist.xs)
+    outs = await fast_frames(dut, [word16] * n)
+    hist.add(word16, n)
+    want, tap = hist.render()
+    # capture j is the result of input frame base + j - 1
+    for j, o in enumerate(outs):
+        assert o == want[base - 1 + j], \
+            f"hold {word16}: port {o} != golden {want[base - 1 + j]} (frame {base - 1 + j})"
+    p = _probe(dut, "s3_r")
+    stage = None if p is None else _signed(int(p.value))
+    assert stage in (None, tap[-1]), f"hold {word16}: s3_r {stage} != golden {tap[-1]}"
+    return outs[-1], stage, base + n - 2, want, tap
+
+
 @cocotb.test()
 async def test_dist_diode(dut):
     """Dist stage (en[2]), v3 task 5: fixed drive x4 into a 3-piece diode
@@ -544,16 +632,21 @@ async def test_dist_diode(dut):
     (slope 1/16, max 20479 — sat16 never reached). Sign reapplied from
     x[15]. Fuzz is off, so the input is the raw sample. Exact points
     pin both seams (K1 at a=2048, K2 at a=8192, both sides) and the
-    extremes; each is also asserted against golden_model.dist."""
+    extremes; each is also asserted against golden_model.dist. Since
+    task 11 the pins read the RTL s3_r probe (the dist-stage output,
+    before tone + gate; guarded, GL carries the port check) and the port
+    output is checked against golden after a loud run that opens the
+    gate (Hist/dirt_frame)."""
     await start(dut, 0b0000_1000)  # en[2] dist only (ui[3]); octave off
+    hist = Hist(0x04)
+    await prime_gate(dut, hist)
 
-    async def dist_once(word16):
-        await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
-        await _wait_left_start(dut)
-        bits = await i2s_send_and_capture(dut, 0)
-        out = tx_data_bits(bits)
-        return out - 0x10000 if out & 0x8000 else out
+    async def dist_once(word16, first=False):
+        # the stage value (RTL s3_r probe; None on GL) is the pinned
+        # dist output; the port output (through tone + gate) is checked
+        # against golden inside dirt_frame
+        stage, _, _ = await dirt_frame(dut, hist, word16, direct=first)
+        return stage
 
     points = [
         (1000, 4000),      # linear x4 below K1
@@ -569,10 +662,90 @@ async def test_dist_diode(dut):
         (-1000, -4000),    # sign reapplied, linear region
         (-16384, -16384),  # w = 65536 -> 14336 + 32768/16 = 16384
     ]
-    for x, want in points:
+    for k, (x, want) in enumerate(points):
         assert want == golden_model.dist(x), f"pin {x}: {want} != golden"
-        got = await dist_once(x)
-        assert got == want, f"dist({x}) = {got}, expected {want}"
+        got = await dist_once(x, first=(k == 0))
+        assert got in (None, want), f"dist({x}) = {got}, expected {want}"
+
+    # Gate-level-visible seam pass (the pins above read the RTL s3_r
+    # probe; at the port a single frame is hidden by the tone low-pass).
+    # A DC hold lets the tone settle (the >>> floor leaves the 16.4
+    # state up to 3/16 LSB under 16*s3, so the port reads s3 or s3-1)
+    # and the open gate passes it. Golden settled port words: 2047/2048/
+    # 2049 -> 8188/8191/8192 (the K1 seam, three distinct words) and
+    # 8191/8192/8193 -> 14334/14335/14335 (K2 low side distinct; 8192 vs
+    # 8193 are equal in dist itself). Every frame of every hold is
+    # asserted against golden, so these distinctions are GL-visible.
+    settled = {}
+    for x in (2047, 2048, 2049, 8191, 8192, 8193):
+        port, stage, i, want_out, tap = await hold_frames(
+            dut, hist, x, direct=(x != 2047))
+        assert tap[-1] == golden_model.dist(x)
+        settled[x] = port
+    assert len({settled[2047], settled[2048], settled[2049]}) == 3, settled
+    assert settled[8191] != settled[8192], settled
+
+
+async def _drive_points(dut, k3, points, en=0x04):
+    """Fresh run with K3 = k3 (None = absent): prime the gate, then for
+    each x hold it and require the dist-stage output (RTL s3_r probe,
+    None on GL) and the settled port word to equal golden at the K3
+    drive; every frame is golden-checked inside hold_frames. Returns the
+    list of (x, settled port, golden dist)."""
+    if k3 is not None:
+        knob_pin(dut, 2, k3)
+    await start(dut, en << 1)
+    kp = _probe(dut, "k3")
+    if kp is not None:
+        assert int(kp.present.value) == (0 if k3 is None else 1)
+        if k3 is not None:
+            assert int(kp["value"].value) == golden_model.knob_steady(k3)
+    hist = Hist(en, k3=k3)
+    await prime_gate(dut, hist)
+    dq = golden_model.drive_q8(k3)
+    res = []
+    for x in points:
+        port, stage, i, want, tap = await hold_frames(dut, hist, x)
+        d = golden_model.dist(x, dq)
+        assert tap[-1] == d and stage in (None, d), f"x={x}: stage {stage} != {d}"
+        assert abs(port) <= 32767 and abs(d) <= 32767
+        res.append((x, port, d))
+    return res
+
+
+@cocotb.test()
+async def test_drive_default(dut):
+    """K3 absent: drive = 1024 (x4) — every test_dist_diode point is
+    unchanged (that test reruns the pins in the same suite; here the
+    golden default is pinned and K3 reads absent). Pins at the port after
+    a DC hold: three points across the knee pieces."""
+    assert golden_model.drive_q8(None) == 1024
+    pts = (1000, 4096, 32767)
+    res = await _drive_points(dut, None, pts)
+    assert [d for _, _, d in res] == [golden_model.dist(x) for x in pts]
+    assert [d for _, _, d in res] == [4000, 10240, 20479]
+
+
+@cocotb.test()
+async def test_drive_rails(dut):
+    """K3 = 255: drive = 256 + 7*255 = 2041 (x7.97). Full-scale inputs:
+    w = 261,248 (18 bits, no pre-knee saturation) -> top piece
+    14336 + (261248 - 32768)/16 = 28615, inside +-32767 for both rails
+    (the -32768 input sat-mags to 32767 first); no wrap."""
+    assert golden_model.drive_q8(255) == 2041
+    res = await _drive_points(dut, 255, (32767, -32768, 1000))
+    assert [d for _, _, d in res] == [28615, -28615, 7972]
+    assert abs(res[0][1]) <= 32767 and abs(res[1][1]) <= 32767
+
+
+@cocotb.test()
+async def test_drive_mid(dut):
+    """K3 = 128: drive = 256 + 7*128 = 1152 (x4.5). Three points, one
+    per knee piece (+ a negative): 1000 -> 4500 (linear); 8000 ->
+    w 36000 -> 14538 (top piece); -20000 -> w 90000 -> -17913."""
+    assert golden_model.drive_q8(128) == 1152
+    res = await _drive_points(dut, 128, (1000, 8000, -20000))
+    assert [d for _, _, d in res] == [4500, 14538, -17913]
 
 
 @cocotb.test()
@@ -620,49 +793,49 @@ async def test_fuzz_asym(dut):
         — the fuzz stage receives the COMPED amplitude (PRE-FIX value
         4096: fuzz read mag(sample_in); comp masked); en=0x05: dist
         reads a direct saturating |s2| (= s1 with fuzz off) ->
-        dist(11472) = +15156 (pre-fix: dist(4096) = 10240)."""
+        dist(11472) = +15156 (pre-fix: dist(4096) = 10240).
+    Since task 11 every pinned value is the fuzz/dist STAGE output read
+    from the RTL s3_r probe (before tone + gate; guarded, None on GL),
+    and the port output is checked against golden_model.render of the
+    whole frame history (Hist/dirt_frame); the 100 loud frames open
+    the gate for the main run, the fresh-reset probes (gate closed)
+    pin the stage only."""
     # en[1] fuzz only (ui[2]); octave off (ui[7] = 0): the plain asym fuzz
     await start(dut, 0b0000_0100)              # at the start of frame 0 (env 0)
 
     # 100 loud frames (0x7FFF): env attacks to 32766, sticky from frame 15
+    hist = Hist(0x02)                          # tone + gate follow the fuzz
     for _ in range(100):
         await i2s_send_and_capture(dut, 0x7FFF << 8)
         await ClockCycles(dut.clk, 256)
+    hist.add(0x7FFF, 100)
 
     # corner probe (inline — the sim is at frame 100's start): -32768
     # with env 32766 -> t_neg 21298 (max) -> -21298
-    await i2s_send_and_capture(dut, 0x8000 << 8)   # frame 100
-    await _wait_left_start(dut)                    # frame 101
-    bits = await i2s_send_and_capture(dut, 0)      # capture frame 101
-    out = tx_data_bits(bits)
-    got = out - 0x10000 if out & 0x8000 else out
-    assert got == -21298, f"corner -32768: {got} != -21298 (env 32766)"
+    got, _, _ = await dirt_frame(dut, hist, -32768, direct=True)  # frames 100, 101
+    assert got in (None, -21298), f"corner -32768: {got} != -21298 (env 32766)"
 
-    async def fuzz_once(word16, en_val=0x02):
-        # drive word16 in the next frame, capture the frame after
-        # (stage_once pattern; en_val documents the active stack)
-        # (the switches are set by start()/resettle() — debounced)
-        await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
-        await _wait_left_start(dut)
-        bits = await i2s_send_and_capture(dut, 0)
-        out = tx_data_bits(bits)
-        return out - 0x10000 if out & 0x8000 else out
+    async def fuzz_once(word16):
+        # drive word16 in the next frame, capture the frame after; the
+        # pinned value is the fuzz-stage output (RTL s3_r probe, None on
+        # GL), the port output through tone + gate is golden-checked
+        # (the switches are set by start() — debounced)
+        return (await dirt_frame(dut, hist, word16))[0]
 
     # loud -24576 (frame 102): env 32510 -> t_neg 21234 -> -21234
     got = await fuzz_once(-24576)
-    assert got == -21234, f"loud -24576: {got} != -21234 (env 32510)"
+    assert got in (None, -21234), f"loud -24576: {got} != -21234 (env 32510)"
 
     # +24576 (frame 104): positive clip point 19660 (env-free path)
     got = await fuzz_once(24576)
-    assert got == 19660, f"+24576: {got} != 19660 (t_pos)"
+    assert got in (None, 19660), f"+24576: {got} != 19660 (t_pos)"
 
     # sub-clip unity, both signs — the negative KEEPS its sign (the
     # v2.2 rectifier mapped -1000 -> +1000)
     got = await fuzz_once(1000)
-    assert got == 1000, f"+1000: {got} != 1000 (sub-clip unity)"
+    assert got in (None, 1000), f"+1000: {got} != 1000 (sub-clip unity)"
     got = await fuzz_once(-1000)
-    assert got == -1000, f"-1000: {got} != -1000 (sign kept, no rectify)"
+    assert got in (None, -1000), f"-1000: {got} != -1000 (sign kept, no rectify)"
 
     # 401 silent frames (capture frame 109 + 400 bulk frames 110..509):
     # env releases to 6510. The quiet probe drives DIRECTLY after the
@@ -673,36 +846,50 @@ async def test_fuzz_asym(dut):
     # drive is deterministic).
     await ClockCycles(dut.clk, 256)             # rest of frame 109
     await ClockCycles(dut.clk, 512 * 400)       # frames 110..509
+    hist.add(0, 400)
 
     # quiet -24576 (frame 510): env_510 = attack (6510 + 24576)>>1 =
     # 15543 -> t_neg = 13107 + 3885 = 16992 -> -16992. Same input as
     # the loud probe, distinct pin (Review Focus 4)
-    await i2s_send_and_capture(dut, 0xA000 << 8)    # frame 510 (-24576)
-    await _wait_left_start(dut)                     # frame 511
-    bits = await i2s_send_and_capture(dut, 0)       # capture frame 511
-    out = tx_data_bits(bits)
-    got = out - 0x10000 if out & 0x8000 else out
-    assert got == -16992, f"quiet -24576: {got} != -16992 (env 15543)"
+    got, _, _ = await dirt_frame(dut, hist, -24576, direct=True)  # frames 510, 511
+    assert got in (None, -16992), f"quiet -24576: {got} != -16992 (env 15543)"
 
     # re-coupling probes (the mandatory fix): each on a fresh reset, so
     # the comp gain is golden's post-settle g = 717 (cenv 0). comp+fuzz:
     # s1 = sat16(4096 * 717 >>> 8) = 11472 (sub-t_pos) -> +11472. PRE-FIX:
     # 4096 (fuzz read the pre-chain mag) — the probe's purpose
     async def chain_fresh(en_val, word16):
+        # the gate is still closed on a fresh reset, so the pinned value
+        # is the stage output (RTL s3_r; None on GL), not the port word
         await start(dut, en_val << 1, clock=False)
-        got = await fast_frames(dut, [word16, 0])
-        want = golden_model.render([0] * START_FRAME + [word16], en_val)[START_FRAME]
-        return got[1], want
+        h = Hist(en_val)
+        stage, _, _ = await dirt_frame(dut, h, word16, direct=True)
+        return stage, h
 
-    got, want = await chain_fresh(0x03, 0x1000)
-    assert got == want == 11472, \
-        f"comp->fuzz re-coupling: {got} != {want} (pre-fix value 4096)"
+    async def recoupled_at_port(h, pre_fix_en):
+        # Gate-level-visible follow-up on the same run: a loud DC pre-roll
+        # opens the gate, then a DC hold of 0x1000 settles the tone, and
+        # the port word is asserted against golden on every frame. The
+        # re-coupling is visible at the port: the same history rendered
+        # with comp OFF (pre_fix_en: what a stage reading the pre-chain
+        # sample would produce) settles to a different word.
+        await _wait_left_start(dut)
+        await prime_gate(dut, h)
+        port, _, i, want, _ = await hold_frames(dut, h, 0x1000)
+        alt, _ = h.render(pre_fix_en)
+        assert port == want[i] != alt[i], f"re-coupling at port: {port} vs pre-fix {alt[i]}"
+
+    got, h = await chain_fresh(0x03, 0x1000)
+    assert got in (None, 11472), \
+        f"comp->fuzz re-coupling: {got} != 11472 (pre-fix value 4096)"
+    await recoupled_at_port(h, 0x02)
 
     # re-coupling probe 2: comp+dist (fuzz off) — dist reads |s2| = |s1|:
     # 11472 -> dist(11472) = +15156 (pre-fix: dist(4096) = 10240)
-    got, want = await chain_fresh(0x05, 0x1000)
-    assert got == want == golden_model.dist(11472) == 15156, \
-        f"comp->dist re-coupling: {got} != {want} (pre-fix value 10240)"
+    got, h = await chain_fresh(0x05, 0x1000)
+    assert got in (None, 15156) and golden_model.dist(11472) == 15156, \
+        f"comp->dist re-coupling: {got} != 15156 (pre-fix value 10240)"
+    await recoupled_at_port(h, 0x04)
 
 
 @cocotb.test()
@@ -723,35 +910,38 @@ async def test_fuzz_octave(dut):
       +24576 -> sat16(19660 + 24576) = 32767 (upper rail);
       -32768 -> 32767 (shaped = t_neg(env) >= 13107, sat-mag 32767 ->
         saturated for any env).
-    Octave-off contrast on the same words (the switch change goes
-    through the debounce): -10000 -> -10000 (core), +24576 -> 19660."""
+    Octave-off contrast on the same words (a fresh run): -10000 ->
+    -10000 (core), +24576 -> 19660. Pins read the RTL s3_r probe (the
+    fuzz output before tone + gate, guarded); ports are golden-checked."""
     # en[1] fuzz only (ui[2]) + octave on (ui[7])
     await start(dut, 0b1000_0100)
+    hist = Hist(0x02, 1)
+    await prime_gate(dut, hist)
 
-    async def oct_once(word16):
-        await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
-        await _wait_left_start(dut)
-        bits = await i2s_send_and_capture(dut, 0)
-        out = tx_data_bits(bits)
-        return out - 0x10000 if out & 0x8000 else out
+    async def oct_once(word16, first=False):
+        # stage value = fuzz output (RTL s3_r probe, None on GL); the
+        # port word is golden-checked through tone + gate in dirt_frame
+        return (await dirt_frame(dut, hist, word16, direct=first))[0]
 
     # octave on (ui[7]): the octave blend
-    got = await oct_once(10000)
-    assert got == 20000, f"oct +10000: {got} != 20000 (blend 2a)"
+    got = await oct_once(10000, first=True)
+    assert got in (None, 20000), f"oct +10000: {got} != 20000 (blend 2a)"
     got = await oct_once(-10000)
-    assert got == 20000, f"oct -10000: {got} != 20000 (blend erases sign)"
+    assert got in (None, 20000), f"oct -10000: {got} != 20000 (blend erases sign)"
     got = await oct_once(24576)
-    assert got == 32767, f"oct +24576: {got} != 32767 (sat16 upper rail)"
+    assert got in (None, 32767), f"oct +24576: {got} != 32767 (sat16 upper rail)"
     got = await oct_once(-32768)
-    assert got == 32767, f"oct -32768: {got} != 32767 (sat for any env)"
+    assert got in (None, 32767), f"oct -32768: {got} != 32767 (sat for any env)"
 
-    # octave off contrast on the same words: the core values
-    await resettle(dut, 0b0000_0100)
-    got = await oct_once(-10000)
-    assert got == -10000, f"core -10000: {got} != -10000 (core keeps sign)"
+    # octave off contrast on the same words: the core values (a fresh
+    # run: the golden history carries one constant switch setting)
+    await start(dut, 0b0000_0100, clock=False)
+    hist = Hist(0x02, 0)
+    await prime_gate(dut, hist)
+    got = await oct_once(-10000, first=True)
+    assert got in (None, -10000), f"core -10000: {got} != -10000 (core keeps sign)"
     got = await oct_once(24576)
-    assert got == 19660, f"core +24576: {got} != 19660 (core clip)"
+    assert got in (None, 19660), f"core +24576: {got} != 19660 (core clip)"
 
 
 @cocotb.test()
@@ -759,11 +949,12 @@ async def test_fuzz_dist_chain(dut):
     """Fuzz + dist stacked (en = 0x6, octave off): the task-4 asym fuzz feeds
     the v3 diode-knee shaper on the CHAIN value — dist consumes
     mag(s2) with s2 = fuzz_out (signed, octave off; sign from s2[15]).
-    Every expected value is golden_model.dist of the fuzz output. Env
-    values are the probe frames' post-update env, model-derived from
-    reset 0 (the first probe attacks to half its mag, then the capture
-    frames release): -20000 frames the env-biased negative clip
-    (env_0 = 10000 -> t_neg = 15607 -> fuzz -15607 -> dist -16189);
+    Every expected value is golden_model.dist of the fuzz output; the
+    pins are the RTL s3_r stage output (guarded), ports golden-checked
+    after a priming run that opens the gate (task 11). Env values are
+    the probe frames' post-update env, model-derived: -20000 frames the env-biased negative clip
+    (after the priming env 9999 attacks to 14999 -> t_neg = 16856 ->
+    fuzz -16856 -> dist -16502);
     5000 is below the fuzz clip (-> 11144); 10000 is shaped WITHOUT the
     fuzz clip (fuzz passes it at sub-t_pos unity -> 14788); 20000 clips
     at t_pos 19660 -> 17203; and an octave-on stacking probe pins the
@@ -771,19 +962,22 @@ async def test_fuzz_dist_chain(dut):
     blend sat16(10000+10000) = 20000 (non-negative, so dist's sign
     input s2[15] reads 0) -> +17288."""
     await start(dut, 0b0000_1100)  # en[2:1] fuzz + dist, octave off
+    hist = Hist(0x06)
+    await prime_gate(dut, hist, amp=10000)   # env 10000, gate open
 
-    async def chain_once(word16):
-        await _wait_left_start(dut)
-        await i2s_send_and_capture(dut, word16 << 8)
-        await _wait_left_start(dut)
-        bits = await i2s_send_and_capture(dut, 0)
-        out = tx_data_bits(bits)
-        return out - 0x10000 if out & 0x8000 else out
+    async def chain_once(word16, first=False):
+        # the dist-stage output (RTL s3_r probe, None on GL); the port
+        # word is golden-checked through tone + gate in dirt_frame
+        return (await dirt_frame(dut, hist, word16, direct=first))[0]
 
-    assert await chain_once(-20000) == -16189  # env 10000, t_neg 15607 -> w 62428
-    assert await chain_once(5000) == 11144     # below the fuzz clip: w 20000
-    assert await chain_once(10000) == 14788    # fuzz passes 10000; w 40000
-    assert await chain_once(20000) == 17203    # clip 19660; w 78640
+    # -20000 frames the env-biased negative clip: env 9999 after the
+    # priming (the sticky point under a constant 10000), attack to 14999
+    # -> t_neg 16856 -> fuzz -16856 -> dist -16502
+    assert golden_model.dist(golden_model.fuzz(-20000, 14999, 0)) == -16502
+    assert await chain_once(-20000, first=True) in (None, -16502)
+    assert await chain_once(5000) in (None, 11144)    # below the fuzz clip: w 20000
+    assert await chain_once(10000) in (None, 14788)   # fuzz passes 10000; w 40000
+    assert await chain_once(20000) in (None, 17203)   # clip 19660; w 78640
 
     # octave-on stacking probe (fix round): the octave blend INTO dist —
     # +10000 -> fuzz blend sat16(10000+10000) = 20000 (>= 0, so the
@@ -791,8 +985,10 @@ async def test_fuzz_dist_chain(dut):
     # shaper magnitude reading fuzz_shaped (10000) instead of the
     # blended output would emit 14788 — pins the octave-into-dist
     # path on the direct saturating |s2| (en[1]=1, octave-on case).
-    await resettle(dut, 0b1000_1100)  # octave on (ui[7])
-    assert await chain_once(10000) == 17288    # blend 20000; w 80000
+    await start(dut, 0b1000_1100, clock=False)  # octave on (ui[7]), fresh run
+    hist = Hist(0x06, 1)
+    await prime_gate(dut, hist, amp=10000)
+    assert await chain_once(10000, first=True) in (None, 17288)  # blend 20000; w 80000
 
 
 def _probe(dut, *path):
@@ -816,7 +1012,9 @@ async def test_knob_reader(dut):
     uio_oe[2] = 1, then charge until the pin reads 1; raw = cnt >> 6.
     Port level: every charge phase lasts exactly 64*v + 33 clk (the pin
     model's N = 64v + 32 - SYNC_LAT, + SYNC_LAT synchronizer, + the
-    detect edge), so uio_oe[2] toggles at the measurement rate. Probe
+    detect edge), so uio_oe[2] toggles at the measurement rate; that
+    length is set by the tb pin model, so it does NOT prove raw == v
+    (only the RTL probe below does). Probe
     (RTL only): the first measurement loads value = raw = v (fast
     startup), and after 20 measurements value == knob_steady(v) with
     present = 1. Then the knob is pulled (pin held low): one timeout
@@ -911,7 +1109,9 @@ async def test_trem_rate_change(dut):
     accumulating (no reset/jump), so the output stays smooth across the
     change. Before the change the output equals golden_model (k1 = 128);
     across it max |dout| <= TREM_MAX_STEP_16384; probe (RTL only): the
-    knob value has moved to within the hysteresis of 250."""
+    knob value has moved to within the hysteresis of 250. Port level
+    (GL-visible): the post-change output must DIFFER from the golden
+    render that keeps k1 = 128 (the rate really changed)."""
     kp = knob_pin(dut, 0, 128)
     await start(dut, 0x10 << 1)
     pre = (await fast_frames(dut, [16384] * 201))[1:]
@@ -922,6 +1122,9 @@ async def test_trem_rate_change(dut):
     seq = pre + post[1:]
     step = max(abs(a - b) for a, b in zip(seq, seq[1:]))
     assert step <= TREM_MAX_STEP_16384, f"max |dout| across the change {step}"
+    keep = golden_model.render([0] * START_FRAME + [16384] * 800, 0x10, k1=128)[START_FRAME + 200:]
+    ndiff = sum(1 for a, b in zip(post, keep) if a != b)
+    assert ndiff > 200, f"post-change output tracks the k1=128 render ({ndiff} diffs): rate did not change"
     k1 = _probe(dut, "k1")
     if k1 is not None:
         kv = int(k1["value"].value)
@@ -942,7 +1145,9 @@ async def test_chain_enables(dut):
     nothing (comp is live from task 3; phaser/delay are Rev B). Fuzz +
     dist stacked: the task-4 asym fuzz feeds the shaper mag(s2) (both
     fuzz clip points sit above the dist knees; dist is the v3 diode
-    knee, octave off)."""
+    knee, octave off). Since task 11 the fuzz/dist-on pins are the stage
+    output (RTL s3_r probe, guarded) because the port word is then
+    tone-filtered and gated; the dirt-off stacks still pin the port."""
     # trem first, on a fresh reset (K1 absent -> inc 437): the expected
     # words come from golden_model.render of the whole frame history
     await start(dut, 0b0010_0000)             # en[4] trem only (ui[5])
@@ -956,47 +1161,72 @@ async def test_chain_enables(dut):
 
     # every other stage on a fresh reset (env = 0 after the silent
     # settle) so the env-dependent pins can be derived from the golden
-    # model's Env: ref_env mirrors every frame driven (x, then the 0
+    # model's Env: ref (golden Chain) mirrors every frame driven (x, then the 0
     # capture frame) and the silent settle after each enable change.
     await start(dut, 0b0000_0100, clock=False)   # en[1] fuzz only (ui[2])
-    ref_env = golden_model.Env()
-    ref_comp = golden_model.Comp()               # comp state runs whatever en is
+    # ref = golden_model.Chain driven frame-by-frame (every frame sent,
+    # and the silent settle after each enable change): its env/comp/tone/
+    # gate state yields the env-dependent pins AND the golden port word
+    # of every probe (silent frames output 0 in any enable setting, so
+    # the en split inside a settle run is immaterial).
+    ref = golden_model.Chain()
     for _ in range(START_FRAME):
-        ref_comp.step(0)
-    state = {"en": 0x02, "e": 0, "g": ref_comp.g}
+        ref.step(0, 0)
+    state = {"en": 0x02, "e": 0, "g": ref.cst.g}
 
-    async def stage_once(en_val, word16):
+    async def stage_once(en_val, word16, stage=False):
+        """Drive word16, capture the next frame's port word, and assert
+        it equals golden's output for the frame (Chain history: tone,
+        gate, comp, every stage). stage=True (a dirt-on stack, task 11:
+        the port word is tone/gate filtered and gated) returns instead
+        the RTL s3_r probe — the fuzz/dist stage output the tone filter
+        sees, read 40 clk after the valid edge — or None where the probe
+        is absent (flat GL netlist; there the golden port assertion is
+        the check — the gate is cold on these single frames, so the port
+        word is golden's, mostly 0: the port-level tone/gate coverage is
+        test_tone_lpf / test_gate_hysteresis / test_chain_latency and the
+        DC-hold probes of test_dist_diode / test_fuzz_asym /
+        test_drive_*)."""
         if en_val != state["en"]:
             await resettle(dut, en_val << 1)     # ui[6:1] = en; debounced
             for _ in range(SETTLE_FRAMES):
-                ref_env.step(0)
-                ref_comp.step(0)
+                ref.step(0, en_val)
             state["en"] = en_val
         await _wait_left_start(dut)
         await i2s_send_and_capture(dut, (word16 & 0xFFFF) << 8)
-        state["e"] = ref_env.step(word16)        # env after the x frame
-        state["g"] = ref_comp.step(word16)       # comp gain for the x frame
+        probe = None
+        if stage:
+            await ClockCycles(dut.clk, 40)
+            p = _probe(dut, "s3_r")
+            probe = None if p is None else _signed(int(p.value))
+        want, s3 = ref.step(word16, en_val)      # the x frame
+        state["e"] = ref.env.v                   # env after the x frame
+        state["g"] = ref.cst.g                   # comp gain for the x frame
         await _wait_left_start(dut)
         bits = await i2s_send_and_capture(dut, 0)
-        ref_env.step(0)                          # the capture frame
-        ref_comp.step(0)
+        ref.step(0, en_val)                      # the capture frame
         out = tx_data_bits(bits)
-        return out - 0x10000 if out & 0x8000 else out
+        out = out - 0x10000 if out & 0x8000 else out
+        assert out == want, f"en {en_val:#x} word {word16}: port {out} != golden {want}"
+        assert probe in (None, s3), f"en {en_val:#x} word {word16}: s3_r {probe} != golden {s3}"
+        return probe if stage else out
 
     # fuzz ON: the task-4 asym clip — -32768 sat-mags to 32767 and
     # clips at the env-biased negative point (env from the golden
     # model: 16383 after the first attack -> t_neg 17202); 5000 passes
     # below both clip points at unity
-    got = await stage_once(0x2, -32768)
-    assert got == golden_model.fuzz(-32768, state["e"], 0) == -17202
-    got = await stage_once(0x2, 5000)
-    assert got == golden_model.fuzz(5000, state["e"], 0) == 5000
+    got = await stage_once(0x2, -32768, stage=True)
+    assert golden_model.fuzz(-32768, state["e"], 0) == -17202
+    assert got in (None, -17202)
+    got = await stage_once(0x2, 5000, stage=True)
+    assert golden_model.fuzz(5000, state["e"], 0) == 5000
+    assert got in (None, 5000)
 
     # dist ON: diode-knee PWL, fixed drive x4 (expected values from
     # golden_model.dist); 1234 the linear piece, 20000 the top piece
-    assert await stage_once(0x4, -32768) == golden_model.dist(-32768) == -20479
-    assert await stage_once(0x4, 1234) == golden_model.dist(1234) == 4936
-    assert await stage_once(0x4, 20000) == golden_model.dist(20000) == 17288
+    for x, want in ((-32768, -20479), (1234, 4936), (20000, 17288)):
+        assert golden_model.dist(x) == want
+        assert await stage_once(0x4, x, stage=True) in (None, want)
 
     # phaser en[3] and delay en[5] (Rev A identity stubs) must pass
     # +-full-scale bit-exact when enabled, through the slot AND every
@@ -1021,10 +1251,10 @@ async def test_chain_enables(dut):
     # literal cross-checked against golden fuzz, so the clip intent is
     # asserted; the RTL must equal golden dist of that value.
     for x, fuzzed in ((-20000, -15891), (5000, 5000), (20000, 19660)):
-        got = await stage_once(0x6, x)
+        got = await stage_once(0x6, x, stage=True)
         assert golden_model.fuzz(x, state["e"], 0) == fuzzed
         want = golden_model.dist(fuzzed)
-        assert got == want, f"fuzz+dist({x}): {got} != {want}"
+        assert got in (None, want), f"fuzz+dist({x}): {got} != {want}"
 
     # all stages OFF: bit-exact identity, +-full-scale through
     assert await stage_once(0x0, 32767) == 32767
@@ -1036,18 +1266,27 @@ async def test_enable_bounce(dut):
     """Switch debounce (v3 task 7): a burst of contact bounce on an
     enable followed by a stable level must produce exactly ONE clean
     transition on the output — never a glitch back. Fuzz (ui[2]) on a
-    constant 20000 input: off -> 20000 (identity), on ->
-    golden fuzz(20000) = 19660 (positive clip point, env-free). The
-    debounce samples every 256 frames and needs two agreeing ticks, so
-    the switch toggles every 5 frames for 200 frames (at most one tick
-    inside the burst), then holds; the output must change exactly once
-    and within 600 frames of the hold. The release repeats the burst
-    toward 0: exactly one 19660 -> 20000 transition."""
+    constant 20000 input: off -> 20000 (identity), on -> the tone
+    low-pass of golden fuzz(20000) = 19660 (positive clip point,
+    env-free), which settles from ~20000 down to golden's steady value
+    over a few frames (task 11; the gate is open on the loud constant).
+    The debounce samples every 256 frames and needs two agreeing ticks,
+    so the switch toggles every 5 frames for 200 frames (at most one
+    tick inside the burst), then holds; the engage output must start at
+    20000, only ever fall (a bounce glitch back would rise), and end at
+    the steady value, its first change within 600 frames of the hold.
+    The release repeats the burst toward 0: exactly one steady -> 20000
+    transition (dirt off is identity at once)."""
     await start(dut, 0)
 
     off_val = 20000
-    on_val = golden_model.fuzz(20000, 0, 0)
-    assert on_val == 19660
+    assert golden_model.fuzz(20000, 0, 0) == 19660
+    tg = golden_model.ToneGate()         # tone: settled on 20000, then 19660
+    for _ in range(300):
+        tg.tone(20000)
+    for _ in range(300):
+        on_val = tg.tone(19660)
+    assert on_val == 19660               # approached from above: exact
 
     async def frame(ui):
         dut.ui_in.value = ui                       # between frames: bit0 low
@@ -1071,12 +1310,12 @@ async def test_enable_bounce(dut):
 
     # engage: bounce (toggle every 5 frames, 200 frames), then hold on
     outs, hold_start = await bounce_then_hold(1)
-    assert set(outs) <= {off_val, on_val}, f"unexpected output values {set(outs)}"
     trans = [i for i in range(1, len(outs)) if outs[i] != outs[i - 1]]
     assert outs[0] == off_val, "must start un-fuzzed"
-    assert len(trans) == 1, f"engage must switch exactly once, transitions at {trans}"
-    assert outs[trans[0]] == on_val and outs[-1] == on_val
-    assert trans[0] - hold_start <= 600, f"engage settled {trans[0] - hold_start} frames after the hold"
+    assert all(b <= a for a, b in zip(outs, outs[1:])), "engage output rose again (glitch back)"
+    assert trans and outs[-1] == on_val, f"engage must settle at {on_val}, got {outs[-1]}"
+    assert trans[0] - hold_start <= 600, f"engage began {trans[0] - hold_start} frames after the hold"
+    assert all(outs[i] == on_val for i in range(trans[0] + 20, len(outs))), "engage must settle within 20 frames"
 
     # release: bounce toward 0 starting from level 1, then hold 0
     outs = []
@@ -1252,3 +1491,151 @@ async def test_chain_latency(dut):
     await ClockCycles(dut.clk, 16)
     await Timer(1, unit="ns")
     assert int(dut.uo_out[7].value) == 1, "LED must light within 16 clk of the valid edge"
+
+
+@cocotb.test()
+async def test_tone_lpf(dut):
+    """Post-dirt tone (v3 task 11), dist on, K2 absent (kt = 2): the
+    one-pole low-pass ytone += ((s3 << 4) - ytone) >>> 2. An alternating
+    +-8000 input (Nyquist; dist maps it to +-14144) is attenuated to
+    |out| < 3000 (golden: 2021 once the gate is open), and a DC input of
+    8000 settles to golden's 14143 (the floor leaves the 16.4 state a
+    few LSB under dist's 14144). Each run is exact against golden for
+    every frame, from a fresh reset (the gate opens within ~60 frames)."""
+    n = 300
+    for i, (name, xs) in enumerate((
+            ("nyquist", [8000 if j % 2 == 0 else -8000 for j in range(n)]),
+            ("dc", [8000] * n))):
+        await start(dut, 0b0000_1000, clock=(i == 0))   # en[2] dist only
+        got = await fast_frames(dut, xs + [0])
+        want = golden_model.render([0] * START_FRAME + xs, 0x04)[START_FRAME:]
+        assert got[1:] == want, f"{name}: first mismatch at " \
+            f"{next(j for j in range(n) if got[1 + j] != want[j])}"
+        if name == "nyquist":
+            assert max(abs(v) for v in got[-50:]) < 3000, f"nyquist {got[-6:]}"
+            assert got[-1] == -2021
+        else:
+            assert len(set(got[-10:])) == 1 and got[-1] == 14143, f"dc {got[-10:]}"
+
+
+@cocotb.test()
+async def test_gate_hysteresis(dut):
+    """Noise gate (v3 task 11), dist on, K2 absent. Key L = cenv >> 8 of
+    the compressor: opens at L >= 256, closes at L < 128. Steps (frame
+    counts from golden's ToneGate, the probe on `gate_open` is RTL-only and
+    guarded; the output carries the GL coverage):
+      1. DC 300 until the gate opens: closed after 61 frames, open after
+         the 62nd (L reaches 256 on the pre-edge cenv).
+      2. DC 192 for 1000 frames: L decays from 258 to 200 but never
+         below 128, so `open` stays 1 (the hysteresis; DC 192 from reset
+         would never open the gate at all).
+      3. Silence until the close event (1747 frames): open = 1 one frame
+         before, 0 at it.
+      4. From the close event, DC 100 for 300 frames: gg falls 256 -> 0
+         one per frame, so the output (tone * gg >> 8, tone -> 400) is
+         still 1 at post-close frame 254 and exactly 0 from frame 255
+         on, i.e. after exactly 256 frames (golden); the whole run is
+         exact against golden."""
+    await start(dut, 0b0000_1000)                     # en[2] dist only
+    probe = _probe(dut, "gate_open")
+    assert probe is not None or _probe(dut, "step") is None, "RTL has no gate_open"
+
+    def is_open():
+        return None if probe is None else int(probe.value)
+
+    ref = golden_model.ToneGate()
+    cs = golden_model.Comp()
+    hist = [0] * START_FRAME
+
+    def drive(x, k):
+        for _ in range(k):
+            ref.gate(cs.cenv)
+            cs.step(x)
+        hist.extend([x] * k)
+
+    assert is_open() in (None, 0)
+
+    # 1. open
+    drive(300, 61)
+    assert ref.open == 0
+    got = await fast_frames(dut, [300] * 61)
+    assert is_open() in (None, 0), "gate open one frame early"
+    drive(300, 1)
+    assert ref.open == 1
+    got += await fast_frames(dut, [300])
+    assert is_open() in (None, 1), "gate did not open at L >= 256"
+    # 2. hysteresis hold
+    drive(192, 1000)
+    assert ref.open == 1 and 128 <= cs.cenv >> 8 == 200
+    got += await fast_frames(dut, [192] * 1000)
+    assert is_open() in (None, 1), "gate closed during the L ~ 200 hold"
+    # 3. silence until the close event
+    n_close = 0
+    while ref.open:
+        drive(0, 1)
+        n_close += 1
+    assert n_close == 1747
+    await ClockCycles(dut.clk, 512 * (n_close - 1))
+    assert is_open() in (None, 1), "gate closed a frame early"
+    await ClockCycles(dut.clk, 512)
+    assert is_open() in (None, 0), "gate did not close at L < 128"
+    # 4. gg decay, observed on the output
+    drive(100, 300)
+    got_dc = await fast_frames(dut, [100] * 300 + [0])
+    want = golden_model.render(hist, 0x04)
+    tail = want[-300:]
+    assert tail[254] > 0 and tail[255] == 0 and not any(tail[255:]), "golden gg decay"
+    assert got_dc[1:] == tail, "decay run differs from golden at " \
+        f"{next(j for j in range(300) if got_dc[1 + j] != tail[j])}"
+    # the loud phases' captures agree with golden too (capture j = frame j-1)
+    assert got[1:] == want[START_FRAME:START_FRAME + len(got) - 1]
+
+
+@cocotb.test()
+async def test_dirt_off_identity(dut):
+    """Tone/gate act only when fuzz or dist is on (v3 task 11). With trem
+    only (en[4]) the chain output equals golden render bit-exactly,
+    +-full-scale and -32768 included, and equals the render with the
+    tone/gate stage skipped (tgb): the 16.4 tone state runs every frame
+    but never reaches the output. With phaser only (identity stub) the
+    words come through unchanged."""
+    xs = [32767, -32768, 1000, -1, 0, -32768, 12345, 0]
+    await start(dut, 0b0010_0000)                     # en[4] trem only
+    got = await fast_frames(dut, xs + [0])
+    want = golden_model.render([0] * START_FRAME + xs, 0x10)[START_FRAME:]
+    assert want == golden_model.render([0] * START_FRAME + xs, 0x10, tgb=True)[START_FRAME:]
+    assert got[1:] == want, f"trem only: {got[1:]} != {want}"
+    await start(dut, 0b0001_0000, clock=False)        # en[3] phaser stub only
+    got = await fast_frames(dut, xs + [0])
+    assert got[1:] == xs, f"phaser stub only: {got[1:]} != {xs}"
+
+
+@cocotb.test()
+async def test_env_decay(dut):
+    """Fast envelope release (routed from task 10's review, RTL-only
+    guarded probe): 100 full-scale frames attack env to 32766, then
+    1388 silent frames bring it to exactly 0 (the 1-LSB release floor,
+    golden Env): still non-zero one frame earlier, 0 at frame 1388."""
+    await start(dut, 0b0000_0010)                     # en[0] comp only
+    probe = _probe(dut, "env")
+    assert probe is not None or _probe(dut, "step") is None, "RTL has no env"
+    ref = golden_model.Env()
+    for _ in range(START_FRAME):
+        ref.step(0)
+    for _ in range(100):
+        ref.step(0x7FFF)
+    assert ref.v == 32766
+    n = 0
+    while ref.v:
+        ref.step(0)
+        n += 1
+    assert n == 1388
+    await fast_frames(dut, [0x7FFF] * 100)
+    if probe is not None:
+        assert int(probe.value) == 32766
+    await ClockCycles(dut.clk, 512 * (n - 1))
+    if probe is not None:
+        assert int(probe.value) == 1, f"env one frame before the floor: {int(probe.value)}"
+    await ClockCycles(dut.clk, 512)
+    if probe is not None:
+        assert int(probe.value) == 0, f"env after {n} silent frames: {int(probe.value)}"

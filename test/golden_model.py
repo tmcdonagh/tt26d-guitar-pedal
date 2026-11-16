@@ -5,8 +5,8 @@ formulas, not by executing the RTL). One output per input frame, signed
 16-bit ints. wav_tool.py `check` compares the Verilator sim against it
 bit-exactly; `model` renders listening WAVs from it.
 
-Chain order: comp -> fuzz (+octave) -> dist -> phaser (stub) -> trem ->
-delay (stub). en bit i enables stage i (en[0]=comp .. en[5]=delay).
+Chain order: comp -> fuzz (+octave) -> dist -> tone -> gate -> phaser
+(stub) -> trem -> delay (stub); tone + gate act only when fuzz or dist is on. en bit i enables stage i (en[0]=comp .. en[5]=delay).
 """
 
 
@@ -164,10 +164,23 @@ def fuzz(s, env, oct):
     return -shaped if s < 0 else shaped
 
 
-def dist(s):
-    """Diode-knee PWL on w = 4*sat_mag(s), no intermediate saturation:
-    slope 1 to 8192, 1/4 to 32768, 1/16 above (max 20479)."""
-    w = smag(s) << 2
+DRIVE_ABSENT = 1024   # K3 absent: x4 (Q4.8)
+
+
+def drive_q8(k3):
+    """Dist drive (Q4.8) from the K3 knob value (None = absent):
+    256 + 7*v (x1 .. x7.97), x4 when absent."""
+    if k3 is None:
+        return DRIVE_ABSENT
+    v = knob_steady(k3)
+    return 256 + (v << 3) - v
+
+
+def dist(s, drive_q8=DRIVE_ABSENT):
+    """Diode-knee PWL on w = (sat_mag(s) * drive_q8) >> 8 (Q4.8 drive, no
+    intermediate saturation; w < 2^18): slope 1 to 8192, 1/4 to 32768, 1/16
+    above (max 28.6k at drive x7.97; 20479 at the default x4)."""
+    w = (smag(s) * drive_q8) >> 8
     if w <= 8192:
         o = w
     elif w <= 32768:
@@ -175,6 +188,55 @@ def dist(s):
     else:
         o = 14336 + ((w - 32768) >> 4)
     return -o if s < 0 else o
+
+
+# Post-dirt tone + noise gate (v3 task 11). Tone: ytone (16.4) one-pole
+# low-pass of the dist-stage output s3, every frame whatever the enables
+# are: ytone += ((s3 << 4) - ytone) >> kt, kt = 4 - value2[7:6] (K2 max =
+# bright, kt 1), 2 with K2 absent. Gate: frame state on the sample_valid
+# edge from pre-edge values, keyed by L = cenv >> 8 of the compressor's
+# pre-edge cenv: open needs L >= 256 to open, L < 128 to close (hysteresis);
+# gg ramps 0..256 (open: gg + ((256 - gg) >> 2) + 1 capped at 256, closed:
+# gg - 1 down to 0). With fuzz or dist on, out = (tone * gg) >> 8.
+GATE_OPEN_L, GATE_CLOSE_L, GATE_MAX = 256, 128, 256
+TONE_KT_ABSENT = 2
+
+
+def tone_kt(k2):
+    """Tone shift from the K2 knob value (None = absent)."""
+    if k2 is None:
+        return TONE_KT_ABSENT
+    return 4 - (knob_steady(k2) >> 6)
+
+
+class ToneGate:
+    """Tone filter + gate state. gate() runs on the valid edge with the
+    pre-edge cenv (call it before Comp.step); tone() is the chain's step 4
+    (every frame), apply() step 5."""
+
+    def __init__(self, kt=TONE_KT_ABSENT):
+        self.kt = kt
+        self.y = 0
+        self.open = 0
+        self.gg = 0
+
+    def gate(self, cenv):
+        L = cenv >> 8
+        if self.open:
+            self.gg = min(GATE_MAX, self.gg + ((GATE_MAX - self.gg) >> 2) + 1)
+            if L < GATE_CLOSE_L:
+                self.open = 0
+        else:
+            self.gg -= 1 if self.gg else 0
+            if L >= GATE_OPEN_L:
+                self.open = 1
+
+    def tone(self, s3):
+        self.y += ((s3 << 4) - self.y) >> self.kt
+        return self.y >> 4
+
+    def apply(self, t):
+        return (t * self.gg) >> 8
 
 
 def trem(s, p):
@@ -194,33 +256,73 @@ def trem(s, p):
 EN_SETTLE = 511
 
 
-def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False):
-    """k1 (0..255 or None = absent) sets the trem rate; k2/k3 and tgb
-    (tone/gate bypass, model-only) are reserved for later voicing stages.
-    en/oct are the switch values held from reset: they take effect at
-    frame EN_SETTLE (debounce). The knob value is knob_steady(k1) from
-    frame 0: valid because trem only reads it from EN_SETTLE on, long
-    after the reader's first measurement (fast startup, ~34 frames)."""
-    env = Env()
-    cst = Comp()
-    inc = trem_inc(k1)
-    p = 0
-    out = []
-    for i, x in enumerate(xs):
-        e = env.step(x)
-        g = cst.step(x)
+class Chain:
+    """Whole-chain frame state (env, comp, tone/gate, trem phase) with a
+    per-frame step(); render() is this driven by the settled switches.
+    Tests that change the enables mid-run drive it directly: silent
+    frames leave every stage's output 0, so the enable split inside a
+    settle run does not matter."""
+
+    def __init__(self, k1=None, k2=None, k3=None, tgb=False):
+        self.env = Env()
+        self.cst = Comp()
+        self.tg = ToneGate(tone_kt(k2))
+        self.inc = trem_inc(k1)
+        self.dq = drive_q8(k3)
+        self.tgb = tgb
+        self.p = 0
+
+    def step(self, x, en_i, oct_i=0):
+        """One frame with switches en_i/oct_i in force. Returns
+        (out, s3): the output word and the dist-stage output s3."""
+        e = self.env.step(x)
+        self.tg.gate(self.cst.cenv)          # from the pre-edge cenv
+        g = self.cst.step(x)
         s = x
-        en_i, oct_i = (en, oct) if i >= EN_SETTLE else (0, 0)
         # trem phase: steps on sample_valid while enabled, else held at 0
-        p = (p + inc) & 0x3FFFFF if en_i & 16 else 0
+        self.p = (self.p + self.inc) & 0x3FFFFF if en_i & 16 else 0
         if en_i & 1:
             s = comp(s, g)
         if en_i & 2:
             s = fuzz(s, e, oct_i)
         if en_i & 4:
-            s = dist(s)
+            s = dist(s, self.dq)
+        s3 = s
+        t = self.tg.tone(s)                  # every frame, dirt or not
+        if (en_i & 6) and not self.tgb:
+            s = self.tg.apply(t)
         if en_i & 16:
-            s = trem(s, p)
+            s = trem(s, self.p)
+        return s, s3
+
+
+def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False, tap=None):
+    """k1 (0..255 or None = absent) sets the trem rate; k2 (None = absent)
+    the tone shift; k3 the dist drive (drive_q8); tgb (tone/gate bypass,
+    model-only) is the fuzz regression hash.
+    en/oct are the switch values held from reset: they take effect at
+    frame EN_SETTLE (debounce). The knob value is knob_steady(k1) from
+    frame 0: valid because trem only reads it from EN_SETTLE on, long
+    after the reader's first measurement (fast startup, ~34 frames).
+    K2 timing approximation: golden applies K2's tone shift from frame 0,
+    while the RTL uses the absent default (kt 2) for the first ~34 frames
+    until the reader's first measurement. ytone is a state, but the two
+    trajectories merge by frame <= 173 on the excerpt, and `check` is
+    bit-exact, so a future non-merge would fail loudly.
+    K3 is likewise steady from frame 0, and that is exact: the dist stage
+    reads K3 only once en[2] takes effect (EN_SETTLE, reader settled by
+    then), and dist has no state of its own (unlike ytone, whose
+    pre-EN_SETTLE history is a state), so frames before EN_SETTLE never
+    see the drive.
+    tap (a list) collects each frame's dist-stage output s3, the value
+    the tone filter sees (the RTL s3_r probe)."""
+    ch = Chain(k1, k2, k3, tgb)
+    out = []
+    for i, x in enumerate(xs):
+        en_i, oct_i = (en, oct) if i >= EN_SETTLE else (0, 0)
+        s, s3 = ch.step(x, en_i, oct_i)
+        if tap is not None:
+            tap.append(s3)
         out.append(s)
     return out
 
