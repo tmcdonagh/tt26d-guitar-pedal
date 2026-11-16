@@ -147,8 +147,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   //             combinational-into-TX timing as comp, so frame N+1's
   //             output is fuzz(x_N, env_N). env <= 32766 -> env>>>2
   //             <= 8191 -> the sum <= 21298 < 32767: the sat16 clamp
-  //             below is unreachable, kept per the saturating-
-  //             arithmetic convention (dist_neg pattern))
+  //             below is unreachable, kept as a guard for by-ear
+  //             retunes; it tests bits [16:15] because the sum fits a
+  //             positive 16-bit value iff both are clear)
   //   shaped = a > t ? t : a              (asym clip on the magnitude)
   //   fuzz_core = x[15] ? (-shaped) : shaped (sat16 negate; shaped <=
   //             21298 -> -shaped >= -21298 > -32768: that clamp is
@@ -158,8 +159,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   // shaped + a >= 0 always (both non-negative), so the blend's sat16
   // clamps UPPER only (max 21298 + 32767 -> 0x7FFF): under P0=1
   // fuzz_out is non-negative in every reachable state; under P0=0 it
-  // is signed (the plain asym fuzz) — dist's magnitude sharing below
-  // handles both cases.
+  // is signed (the plain asym fuzz); dist below takes |s2| either way.
   // ------------------------------------------------------------------
   wire [15:0] fuzz_mag = (s1 == 16'h8000) ? 16'h7FFF   // saturating |s1|
                        : s1[15] ? (~s1 + 16'd1) : s1;
@@ -168,12 +168,12 @@ module tt_um_tmcdonagh_guitar_pedal (
 
   // negative clip point sat16(13107 + (env >>> 2))
   wire [16:0] fuzz_tn_sum = 17'd13107 + {3'b000, env[15:2]};
-  wire [15:0] fuzz_tneg = fuzz_tn_sum[16] ? 16'h7FFF : fuzz_tn_sum[15:0];
+  wire [15:0] fuzz_tneg = |fuzz_tn_sum[16:15] ? 16'h7FFF : fuzz_tn_sum[15:0];
   wire [15:0] fuzz_t = s1[15] ? fuzz_tneg : 16'd19660;
 
   wire [15:0] fuzz_shaped = (fuzz_mag > fuzz_t) ? fuzz_t : fuzz_mag;
 
-  // sat16 negate (dist_neg pattern; clamp unreachable, kept per convention)
+  // sat16 negate (clamp unreachable, kept per convention)
   wire [16:0] fuzz_neg = 17'd0 - {1'b0, fuzz_shaped};
   wire        fuzz_neg_ovf = (fuzz_neg[16] != fuzz_neg[15]);
   wire [15:0] fuzz_core = s1[15] ? (fuzz_neg_ovf ? 16'h8000 : fuzz_neg[15:0])
@@ -193,40 +193,28 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] s2 = en[1] ? fuzz_out : s1;
 
   // ------------------------------------------------------------------
-  // Stage 3 — distortion (v2.2 task 4, kept until v3 task 5's diode
-  // knee): soft-knee piecewise-linear shaper on the stage input's
-  // magnitude — unity below the knee, slope 1/2 above it (a soft
-  // ceiling in place of the interim hard clip). Knee FIXED at T = 8192
-  // (soft ceiling 20479), below BOTH task-4 fuzz clip points (19660
-  // positive, 13107..21298 negative), so a stacked fuzz that clips
-  // always feeds the shaped region. No multipliers — subtract + shift
-  // only. Param note: the v2.2 P0 character bit (uio[2], knee
-  // 4096/8192) is retired — uio[2] is the fuzz octave blend (live from
-  // task 4), and task 5 replaces this block with the param-free diode
-  // PWL.
+  // Stage 3 — distortion (v3 task 5): fixed drive x4 into a 3-piece
+  // diode-knee PWL on the stage input's magnitude. a = sat_mag(s2);
+  // w = 4a (18-bit, NO intermediate saturation — keeps the top soft):
+  //   w <= 8192   : out = w                        (slope 1)
+  //   w <= 32768  : out = 8192 + ((w - 8192) >> 2) (slope 1/4, 14336 at K2)
+  //   else        : out = 14336 + ((w - 32768) >> 4) (slope 1/16)
+  // Max out = 20479 (a = 32767), so the sign negate below never overflows.
+  // Drive is the constant 4 (the <<2); a retune is that shift plus the
+  // knee constants. Shift-add only, no multipliers.
   // ------------------------------------------------------------------
-  // Shaper input magnitude: a DIRECT saturating |x| on the actual
-  // stage input s2 (the output sign stays s2[15] below). The v2.2 area
-  // trim — sharing this magnitude with the fuzz/pre-chain wires via a
-  // conditional — is DELETED (controller ruling, task-4 fix round):
-  // every conditional form is wrong in some case (the plan's literal
-  // `en[1] ? fuzz_out : mag(s1)` feeds fuzz's SIGNED core output onto
-  // this unsigned magnitude path under P0=0, shaping 65536-|fuzz_out|;
-  // per-case "value-equal to |s2|" patches survive only with a case
-  // proof to maintain). v3 has the headroom for the direct block,
-  // which is obviously correct for every enable/P0 combination. Costs
-  // a third |x| (env's mag below and fuzz's fuzz_mag are the other
-  // two) — comparator + negater + 2 muxes.
+  // Direct saturating |x| on the actual stage input s2 (sign stays
+  // s2[15] below). Correct for every enable/P0 combination, including
+  // fuzz's signed core output under P0=0.
   wire [15:0] dist_mag = (s2 == 16'h8000) ? 16'h7FFF   // saturating |s2|
                        : s2[15] ? (~s2 + 16'd1) : s2;
 
-  wire [15:0] dist_t = 16'd8192;
-
-  // a <= T: out = a (slope 1);  a > T: out = T + ((a - T) >> 1)
-  // (a - T >= 1 in the shaped branch, so the shift is exact)
-  wire [15:0] dist_over = dist_mag - dist_t;
-  wire [15:0] dist_pw = (dist_mag > dist_t) ? (dist_t + (dist_over >> 1))
-                                            : dist_mag;
+  wire [17:0] dist_w = {dist_mag, 2'b00};
+  wire [17:0] dist_o1 = 18'd8192 + ((dist_w - 18'd8192) >> 2);
+  wire [17:0] dist_o2 = 18'd14336 + ((dist_w - 18'd32768) >> 4);
+  wire [15:0] dist_pw = (dist_w <= 18'd8192)  ? dist_w[15:0]
+                      : (dist_w <= 18'd32768) ? dist_o1[15:0]
+                                              : dist_o2[15:0];
 
   // sign reapplied through a sat16 clamp (unreachable: out <= 20479,
   // kept per the saturating-arithmetic convention)

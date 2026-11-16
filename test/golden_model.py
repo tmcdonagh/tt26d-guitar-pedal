@@ -65,9 +65,15 @@ def fuzz(s, env, oct):
 
 
 def dist(s):
-    """Soft-knee PWL, T=8192, slope 1/2."""
-    a = smag(s)
-    o = 8192 + ((a - 8192) >> 1) if a > 8192 else a
+    """Diode-knee PWL on w = 4*sat_mag(s), no intermediate saturation:
+    slope 1 to 8192, 1/4 to 32768, 1/16 above (max 20479)."""
+    w = smag(s) << 2
+    if w <= 8192:
+        o = w
+    elif w <= 32768:
+        o = 8192 + ((w - 8192) >> 2)
+    else:
+        o = 14336 + ((w - 32768) >> 4)
     return -o if s < 0 else o
 
 

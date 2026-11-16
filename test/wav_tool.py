@@ -58,13 +58,13 @@ FUZZ_BASELINE_SHA256 = "daadb2a3c1a6f891dd9cb47bd24bdfe0381babf752e514d2ed75e448
 # P1=bit1=uio[3], P2=bit2=uio[4]; +PARAMS range 0..7)
 MODES = [
     ("bypass",   0x0,  0x0),  # all stages off — digital clean identity
-    ("comp",     0x01, 0x0),  # comp slot (identity stub until task 3)
-    ("fuzz",     0x02, 0x0),  # fixed clip 16384
-    ("fuzzoct",  0x02, 0x1),  # fuzz + P0=1 octave blend (no-op until task 4)
-    ("dist",     0x04, 0x0),  # soft-knee PWL, P0=0 (T=8192)
+    ("comp",     0x01, 0x0),  # comp: env-driven gain steps
+    ("fuzz",     0x02, 0x0),  # asym clip, env-biased negative point
+    ("fuzzoct",  0x02, 0x1),  # fuzz + P0=1 octave blend
+    ("dist",     0x04, 0x0),  # diode-knee PWL, fixed drive x4
     ("trem",     0x10, 0x0),  # k=0 (~2.93 Hz), fixed span (4 steps)
     ("tremF",    0x10, 0x6),  # k=3 fast rate (~23.44 Hz) — by-ear chop comparison
-    ("fuzzdist", 0x06, 0x0),  # rectify + clip 16384, then soft knee
+    ("fuzzdist", 0x06, 0x0),  # fuzz clip, then diode knee
     ("all4",     0x17, 0x0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
 ]
 CHECK_MODES = list(MODES)

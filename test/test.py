@@ -5,6 +5,7 @@
 # in the flat GL netlist); port-level assertions carry the GL coverage.
 
 import cocotb
+import golden_model
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles, Timer
 
@@ -486,18 +487,15 @@ async def test_comp_decay(dut):
 
 
 @cocotb.test()
-async def test_dist_softknee(dut):
-    """Dist stage (en[2]), v2.2 task 4 (kept until v3 task 5's diode knee):
-    soft-knee piecewise-linear shaper on the stage input's magnitude —
-    unity below the knee, slope 1/2 above it (a soft ceiling in place of
-    the interim hard clip). Knee FIXED at T=8192 (soft ceiling 20479),
-    below both task-4 fuzz clip points, so a stacked fuzz that clips
-    always feeds the shaped region — param-free: the v2.2 P0 character
-    bit (uio[2]) is retired (P0 is the fuzz octave blend from task 4 —
-    uio[2] live). Fuzz is off here, so the shaper input is the raw
-    sample — sign kept, no rectify. Pinned exact points on the 8192
-    knee, both signs, plus -32768 (mag saturates to 32767, then shapes
-    and keeps its sign)."""
+async def test_dist_diode(dut):
+    """Dist stage (en[2]), v3 task 5: fixed drive x4 into a 3-piece diode
+    knee. a = sat_mag(x); w = 4a (18-bit, no intermediate saturation);
+    w <= 8192: out = w; w <= 32768: out = 8192 + ((w-8192) >> 2) (slope
+    1/4, 14336 at w = 32768); else out = 14336 + ((w-32768) >> 4)
+    (slope 1/16, max 20479 — sat16 never reached). Sign reapplied from
+    x[15]. Fuzz is off, so the input is the raw sample. Exact points
+    pin both seams (K1 at a=2048, K2 at a=8192, both sides) and the
+    extremes; each is also asserted against golden_model.dist."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -515,12 +513,24 @@ async def test_dist_softknee(dut):
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
-    # T=8192: sub-knee unity; above it T + (a-T)>>1
-    assert await dist_once(4096) == 4096, "sub-knee must pass at unity"
-    assert await dist_once(16384) == 12288    # 8192 + 8192/2
-    assert await dist_once(32767) == 20479    # 8192 + 24575/2 = soft ceiling
-    assert await dist_once(-16384) == -12288  # sign reapplied
-    assert await dist_once(-32768) == -20479  # mag sat 32767 -> shape -> negate
+    points = [
+        (1000, 4000),      # linear x4 below K1
+        (4096, 10240),     # w = 16384 -> 8192 + 8192/4
+        (2047, 8188),      # just below K1
+        (2048, 8192),      # K1 (w = 8192)
+        (2049, 8193),      # just above K1: slope 1/4 (8192 + 4/4)
+        (8191, 14335),     # w = 32764 -> 8192 + 24572/4
+        (8192, 14336),     # K2 (w = 32768)
+        (8193, 14336),     # w = 32772 -> 14336 + 4/16 (floor)
+        (32767, 20479),    # w = 131068 -> 14336 + 98300/16
+        (-32768, -20479),  # mag sat 32767, sign kept
+        (-1000, -4000),    # sign reapplied, linear region
+        (-16384, -16384),  # w = 65536 -> 14336 + 32768/16 = 16384
+    ]
+    for x, want in points:
+        assert want == golden_model.dist(x), f"pin {x}: {want} != golden"
+        got = await dist_once(x)
+        assert got == want, f"dist({x}) = {got}, expected {want}"
 
 
 @cocotb.test()
@@ -569,9 +579,8 @@ async def test_fuzz_asym(dut):
         the COMPED amplitude. PRE-FIX value: 4096 (fuzz read
         mag(sample_in); comp masked) — this assert fails there;
         en=0x05 (frame 514, env 15299): dist's fallback branch is
-        mag(s1) now -> comp x4 -> 16384 -> shaper knee 8192 + 4096 ->
-        +12288 (pre-fix: the pre-chain 4096 passed below the knee ->
-        4096)."""
+        mag(s1) now -> comp x4 -> 16384 -> diode knee dist(16384) =
+        +16384 (pre-fix: the pre-chain 4096 -> dist(4096) = 10240)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -653,11 +662,11 @@ async def test_fuzz_asym(dut):
         f"comp->fuzz re-coupling: {got} != 16384 (pre-fix value 4096)"
 
     # re-coupling probe 2: comp+dist (fuzz off) — dist's fallback is
-    # mag(s1): comp x4 -> 16384 -> knee branch 8192 + 4096 -> +12288
-    # (pre-fix: the pre-chain 4096 passed below the knee -> 4096)
+    # mag(s1): comp x4 -> 16384 -> dist(16384) = +16384
+    # (pre-fix: the pre-chain 4096 -> dist(4096) = 10240)
     got = await fuzz_once(0x1000, en_val=0x05)
-    assert got == 12288, \
-        f"comp->dist re-coupling: {got} != 12288 (pre-fix value 4096)"
+    assert got == golden_model.dist(16384) == 16384, \
+        f"comp->dist re-coupling: {got} != 16384 (pre-fix value 10240)"
 
 
 @cocotb.test()
@@ -666,8 +675,7 @@ async def test_fuzz_octave(dut):
     fuzz_out = P0 ? sat16(shaped + mag(s1)) : fuzz_core, the 50/50
     blend with the full-wave-rectified copy. sat16 clamps UPPER only
     (shaped >= 0 and mag(s1) >= 0, so the blend is >= 0 under P0=1 in
-    every reachable state — the property dist's magnitude sharing
-    relies on). Every pinned value here is env-free by construction:
+    every reachable state). Every pinned value here is env-free by construction:
     sub-clip inputs shape to a (< both clip points for any env — the
     negative t_neg >= 13107), and the saturating pins saturate for any
     env (shaped >= 13107 -> shaped + 32767 > 32767). P0 = 1:
@@ -718,20 +726,19 @@ async def test_fuzz_octave(dut):
 @cocotb.test()
 async def test_fuzz_dist_chain(dut):
     """Fuzz + dist stacked (en = 0x6, P0=0): the task-4 asym fuzz feeds
-    the v2.2 soft-knee shaper (T=8192) on the CHAIN value — dist
-    consumes mag(s2) with s2 = fuzz_out (signed under P0=0; the shaper
-    magnitude sharing handles the sign, see the RTL comment). Env
+    the v3 diode-knee shaper on the CHAIN value — dist consumes
+    mag(s2) with s2 = fuzz_out (signed under P0=0; sign from s2[15]).
+    Every expected value is golden_model.dist of the fuzz output. Env
     values are the probe frames' post-update env, model-derived from
     reset 0 (the first probe attacks to half its mag, then the capture
     frames release): -20000 frames the env-biased negative clip
-    (env_0 = 10000 -> t_neg = 15607 -> fuzz -15607 -> 8192 + 3707 ->
-    -11899); 5000 below both the clip and the knee; 10000 pins the
-    shaped branch reached WITHOUT the fuzz clip (fuzz passes it at
-    sub-t_pos unity); 20000 clips at t_pos 19660 -> 8192 + 5734 ->
-    13926; and a P0=1 stacking probe (task-4 fix round) pins the
+    (env_0 = 10000 -> t_neg = 15607 -> fuzz -15607 -> dist -16189);
+    5000 is below the fuzz clip (-> 11144); 10000 is shaped WITHOUT the
+    fuzz clip (fuzz passes it at sub-t_pos unity -> 14788); 20000 clips
+    at t_pos 19660 -> 17203; and a P0=1 stacking probe pins the
     octave-into-dist path on the direct |s2| shaper input: +10000 ->
     blend sat16(10000+10000) = 20000 (non-negative, so dist's sign
-    input s2[15] reads 0) -> 8192 + 5904 -> +14096."""
+    input s2[15] reads 0) -> +17288."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -749,19 +756,19 @@ async def test_fuzz_dist_chain(dut):
         out = tx_data_bits(bits)
         return out - 0x10000 if out & 0x8000 else out
 
-    assert await chain_once(-20000) == -11899  # env 10000, t_neg 15607
-    assert await chain_once(5000) == 5000      # below both clip and knee
-    assert await chain_once(10000) == 9096     # 10000 -> 8192 + 1808/2
-    assert await chain_once(20000) == 13926    # clip 19660 -> 8192+5734
+    assert await chain_once(-20000) == -16189  # env 10000, t_neg 15607 -> w 62428
+    assert await chain_once(5000) == 11144     # below the fuzz clip: w 20000
+    assert await chain_once(10000) == 14788    # fuzz passes 10000; w 40000
+    assert await chain_once(20000) == 17203    # clip 19660; w 78640
 
     # P0=1 stacking probe (fix round): the octave blend INTO dist —
     # +10000 -> fuzz blend sat16(10000+10000) = 20000 (>= 0, so the
-    # shaper's sign input s2[15] = 0) -> 8192 + (20000-8192)/2 =
-    # +14096. A shaper magnitude reading fuzz_shaped (10000) instead
-    # of the blended output would emit 9096 — pins the octave-into-dist
+    # shaper's sign input s2[15] = 0) -> dist(20000) = +17288. A
+    # shaper magnitude reading fuzz_shaped (10000) instead of the
+    # blended output would emit 14788 — pins the octave-into-dist
     # path on the direct saturating |s2| (en[1]=1, P0=1 case).
     dut.uio_in.value = 0b0000_0100  # P0 = 1 (uio[2]); trem rate bits 0
-    assert await chain_once(10000) == 14096
+    assert await chain_once(10000) == 17288    # blend 20000; w 80000
 
 
 @cocotb.test()
@@ -856,8 +863,8 @@ async def test_chain_enables(dut):
     +-full-scale bit-exact when enabled — the enable itself corrupts
     nothing (comp is live from task 3; phaser/delay are Rev B). Fuzz +
     dist stacked: the task-4 asym fuzz feeds the shaper mag(s2) (both
-    fuzz clip points sit above the 8192 knee; dist is the v2.2 soft
-    knee — v3 task 5 replaces it — P0=0)."""
+    fuzz clip points sit above the dist knees; dist is the v3 diode
+    knee, P0=0)."""
     clock = Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2)
     cocotb.start_soon(clock.start())
     dut.ena.value = 1
@@ -895,18 +902,18 @@ async def test_chain_enables(dut):
     assert await stage_once(0x2, -32768) == -20643
     assert await stage_once(0x2, 5000) == 5000
 
-    # dist ON: soft-knee PWL (P0=0, T=8192); 1234 pins the fuzz-off
-    # pass-through exact (sub-knee unity), 20000 the shaped branch
+    # dist ON: diode-knee PWL, fixed drive x4 (expected values from
+    # golden_model.dist); 1234 the linear piece, 20000 the top piece
     assert await stage_once(0x4, -32768) == -20479
-    assert await stage_once(0x4, 1234) == 1234
-    assert await stage_once(0x4, 20000) == 14096
+    assert await stage_once(0x4, 1234) == 4936
+    assert await stage_once(0x4, 20000) == 17288
 
-    # stub slots ON (comp en[0], phaser en[3], delay en[5] — Rev A
-    # identity stubs): each must pass its input bit-exact when enabled,
-    # through the stub slot AND every disabled stage (the old crush
-    # vectors' role in the matrix; the crush slot itself is gone). All
-    # three stubs stacked is identity too.
-    assert await stage_once(0x1, -32768) == -32768    # comp stub
+    # phaser en[3] and delay en[5] (Rev A identity stubs) must pass
+    # +-full-scale bit-exact when enabled, through the slot AND every
+    # disabled stage; comp en[0] is live, but +-full-scale saturates
+    # through its gain, so it reads identity here. All three stacked
+    # is identity too.
+    assert await stage_once(0x1, -32768) == -32768    # comp (sat16 gain)
     assert await stage_once(0x1, 32767) == 32767
     assert await stage_once(0x8, -32768) == -32768    # phaser stub
     assert await stage_once(0x8, 32767) == 32767
@@ -917,11 +924,11 @@ async def test_chain_enables(dut):
 
     # fuzz + dist stacked: the task-4 asym fuzz feeds the shaper
     # mag(s2) — -20000 passes the negative clip point UNCLIPPED at this
-    # env (32376 -> t_neg = 21201 > 20000) and the knee halves it;
-    # 20000 clips at t_pos 19660 then shapes
-    assert await stage_once(0x6, -20000) == -14096
-    assert await stage_once(0x6, 5000) == 5000
-    assert await stage_once(0x6, 20000) == 13926
+    # env (32376 -> t_neg = 21201 > 20000) and dist(-20000) = -17288;
+    # 20000 clips at t_pos 19660 then shapes: dist(19660) = 17203
+    assert await stage_once(0x6, -20000) == golden_model.dist(-20000) == -17288
+    assert await stage_once(0x6, 5000) == golden_model.dist(5000) == 11144
+    assert await stage_once(0x6, 20000) == golden_model.dist(19660) == 17203
 
     # all stages OFF: bit-exact identity, +-full-scale through
     assert await stage_once(0x0, 32767) == 32767
