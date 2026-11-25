@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = tt_um_tmcdonagh_guitar_pedal.v mult.v knob_rc.v
+PROJECT_SOURCES = tt_um_tmcdonagh_guitar_pedal.v mult.v knob_rc4.v
 
 ifneq ($(GATES),yes)
 

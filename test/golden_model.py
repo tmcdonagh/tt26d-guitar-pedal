@@ -6,7 +6,7 @@ formulas, not by executing the RTL). One output per input frame, signed
 bit-exactly; `model` renders listening WAVs from it.
 
 Chain order: comp -> fuzz (+octave) -> dist -> tone -> gate -> phaser
-(stub) -> trem -> delay (stub); tone + gate act only when fuzz or dist is on. en bit i enables stage i (en[0]=comp .. en[5]=delay).
+-> trem -> delay (stub); tone + gate act only when fuzz or dist is on. en bit i enables stage i (en[0]=comp .. en[5]=delay).
 """
 
 
@@ -36,7 +36,7 @@ class Env:
 
 
 class KnobRC:
-    """RC knob reader smoothing (RTL knob_rc.v), one call per measurement.
+    """RC knob reader smoothing (RTL knob_rc4.v), one call per measurement.
     A completed measurement of raw (0..255) while not present loads
     acc = raw << 2 and value = raw directly (fast startup); later ones run
     the IIR acc <= acc - (acc >> 2) + raw, s = acc >> 2, and move value to
@@ -239,6 +239,53 @@ class ToneGate:
         return (t * self.gg) >> 8
 
 
+# Phaser (Rev B1, Task 16): Phase 90-style, 4 first-order allpass stages,
+# no feedback, 50/50 dry mix. Its own 22-bit phase pp steps on the
+# sample_valid edge while en[3] is on (else held at 0), at the trem rate
+# from K1 (shared knob) or PHASER_INC_ABSENT (~1.0 Hz) with K1 absent.
+# The stage states run every frame whatever en[3] is (warm on switch-on).
+PHASER_INC_ABSENT = 87   # prov: 2^22 / 87 = 48210 frames ~ 1.0 Hz
+
+
+def phaser_inc(k1):
+    """Phaser phase increment: trem_inc(k1) with K1 present, else 87."""
+    return PHASER_INC_ABSENT if k1 is None else trem_inc(k1)
+
+
+def phaser_coef(p):
+    """22-bit phase -> allpass coefficient c (Q12, 2049..3840): 12-bit
+    triangle t = p[20:9] (inverted when p[21]), v = (3 t) >> 2 (0..3071),
+    d = ((1024 + v[9:0]) << v[11:10]) >> 2 (256..2047, exponential in v),
+    c = 4096 - d."""
+    t = (p >> 9) & 0xFFF
+    if (p >> 21) & 1:
+        t ^= 0xFFF
+    v = (t * 3) >> 2
+    d = ((1024 + (v & 1023)) << (v >> 10)) >> 2
+    return 4096 - d
+
+
+class Phaser:
+    """Four allpass stages y = sat16(x1 + (((y1 - s) * c) >>> 12)) with
+    16-bit states x1[k] (last input) and y1[k] (last output), reset 0;
+    the shared multiplier forms (y1 - s) * c at chain steps 6..9."""
+
+    def __init__(self):
+        self.x1 = [0] * 4
+        self.y1 = [0] * 4
+
+    def step(self, s4, p):
+        """One frame on input s4 at phase p: updates every stage state and
+        returns the mix (s4 + y3) >> 1 (17-bit sum, floor)."""
+        c = phaser_coef(p)
+        s = s4
+        for k in range(4):
+            y = sat16(self.x1[k] + (((self.y1[k] - s) * c) >> 12))
+            self.x1[k], self.y1[k] = s, y
+            s = y
+        return (s4 + s) >> 1
+
+
 def trem(s, p):
     """(s * gain) >>> 8 (the shared multiplier); |out| <= |s|, no clamp."""
     return (s * trem_gain(p)) >> 8
@@ -268,6 +315,9 @@ class Chain:
         self.cst = Comp()
         self.tg = ToneGate(tone_kt(k2))
         self.inc = trem_inc(k1)
+        self.pinc = phaser_inc(k1)
+        self.ph = Phaser()
+        self.pp = 0
         self.dq = drive_q8(k3)
         self.tgb = tgb
         self.p = 0
@@ -281,6 +331,8 @@ class Chain:
         s = x
         # trem phase: steps on sample_valid while enabled, else held at 0
         self.p = (self.p + self.inc) & 0x3FFFFF if en_i & 16 else 0
+        # phaser phase: the same rule on en[3]
+        self.pp = (self.pp + self.pinc) & 0x3FFFFF if en_i & 8 else 0
         if en_i & 1:
             s = comp(s, g)
         if en_i & 2:
@@ -291,14 +343,18 @@ class Chain:
         t = self.tg.tone(s)                  # every frame, dirt or not
         if (en_i & 6) and not self.tgb:
             s = self.tg.apply(t)
+        ph = self.ph.step(s, self.pp)        # every frame, warm when off
+        if en_i & 8:
+            s = ph
         if en_i & 16:
             s = trem(s, self.p)
         return s, s3
 
 
-def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False, tap=None):
-    """k1 (0..255 or None = absent) sets the trem rate; k2 (None = absent)
-    the tone shift; k3 the dist drive (drive_q8); tgb (tone/gate bypass,
+def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False, tap=None, k4=None):
+    """k1 (0..255 or None = absent) sets the trem and phaser rate; k2 (None = absent)
+    the tone shift; k3 the dist drive (drive_q8); k4 (delay time) is
+    accepted but unused until the delay lands (Rev B3); tgb (tone/gate bypass,
     model-only) is the fuzz regression hash.
     en/oct are the switch values held from reset: they take effect at
     frame EN_SETTLE (debounce). The knob value is knob_steady(k1) from
@@ -315,7 +371,7 @@ def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False, tap=None):
     pre-EN_SETTLE history is a state), so frames before EN_SETTLE never
     see the drive.
     tap (a list) collects each frame's dist-stage output s3, the value
-    the tone filter sees (the RTL s3_r probe)."""
+    the tone filter sees (the RTL cs value held at step 4, sampled by test.py _s3_monitor)."""
     ch = Chain(k1, k2, k3, tgb)
     out = []
     for i, x in enumerate(xs):

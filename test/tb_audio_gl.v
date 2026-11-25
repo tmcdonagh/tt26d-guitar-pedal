@@ -32,15 +32,15 @@
 //       $PDK_ROOT/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_fd_sc_hd.v \
 //       gate_level_netlist.v
 // Run (per mode, same plusargs as the RTL build):
-//   vvp sim_audio_gl.vvp +EN=2 +OCT=1 +N=2818048 +K1=-1 +K2=-1 +K3=-1 > audio_out_gl/fuzzoct.log
+//   vvp sim_audio_gl.vvp +EN=2 +OCT=1 +N=2818048 +K1=-1 +K2=-1 +K3=-1 +K4=-1 > audio_out_gl/fuzzoct.log
 // Input:  audio_in.hex, or +IN=<file> (one 16-bit sample per line)
 // Output: one "S:xxxx" line per frame on stdout (captured per-mode by the
 //         .log file in audio_out_gl/), converted to .wav by wav_tool.py
 //
-// +EN/+OCT/+N/+IN/+K1/+K2/+K3 interface and ui/uio byte layout: identical to
+// +EN/+OCT/+N/+IN/+K1/+K2/+K3/+K4 interface and ui/uio byte layout: identical to
 // tb_audio.v (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=fuzz octave
-// via +OCT=, ui[0]=ADC data; knob pins uio[4:2] follow the same RC pin
-// model, -1 = absent = held low; uio[5] MISO idles low). The K1 settle
+// via +OCT=, ui[0]=ADC data; knob pins uio[5:2] follow the same RC pin
+// model, -1 = absent = held low; ui[6] (PSRAM MISO) idles low). The K1 settle
 // probe is RTL-only (tb_audio.v).
 // Samples are printed as prefixed "S:xxxx" lines, as in tb_audio.v.
 
@@ -92,12 +92,12 @@ module tb_audio_gl;
   // later (set at the falling clk edge closing clk N), so the reader's
   // charge count lands mid-bin at 64*v + 32 and raw == v. SYNC_LAT = 2
   // (the reader's 2-flop synchronizer). v = -1 (+Kn absent, the
-  // default) holds the pin at 0 (knob absent). uio[5] (MISO) idles 0.
+  // default) holds the pin at 0 (knob absent). ui[6] (MISO) idles 0.
   localparam integer SYNC_LAT = 2;
-  integer k1v = -1, k2v = -1, k3v = -1;   // knob plusargs, -1 = absent (declared before use)
-  reg k1_pin = 1'b0, k2_pin = 1'b0, k3_pin = 1'b0;
-  integer k1c = 0, k2c = 0, k3c = 0;
-  assign uio_in = {3'b000, k3_pin, k2_pin, k1_pin, 2'b00};
+  integer k1v = -1, k2v = -1, k3v = -1, k4v = -1;   // knob plusargs, -1 = absent (declared before use)
+  reg k1_pin = 1'b0, k2_pin = 1'b0, k3_pin = 1'b0, k4_pin = 1'b0;
+  integer k1c = 0, k2c = 0, k3c = 0, k4c = 0;
+  assign uio_in = {2'b00, k4_pin, k3_pin, k2_pin, k1_pin, 2'b00};
 
   always @(negedge clk) begin
     if (k1v < 0 || uio_oe[2] !== 1'b0) begin k1_pin = 1'b0; k1c = 0; end
@@ -120,6 +120,13 @@ module tb_audio_gl;
       k3c = k3c + 1;
     end
   end
+  always @(negedge clk) begin
+    if (k4v < 0 || uio_oe[5] !== 1'b0) begin k4_pin = 1'b0; k4c = 0; end
+    else begin
+      if (k4c == 64 * k4v + 32 - SYNC_LAT) k4_pin = 1'b1;
+      k4c = k4c + 1;
+    end
+  end
 
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
@@ -138,6 +145,7 @@ module tb_audio_gl;
     dummy = $value$plusargs("K1=%d", k1v);
     dummy = $value$plusargs("K2=%d", k2v);
     dummy = $value$plusargs("K3=%d", k3v);
+    dummy = $value$plusargs("K4=%d", k4v);
     ui_in[7:1] = {oct_sw[0], en_dip[5:0]};      // ui[6:1]=enables en[5:0], ui[7]=fuzz octave
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
@@ -145,8 +153,8 @@ module tb_audio_gl;
 
     $readmemh(in_file, mem);
     n_samples = n_in;
-    $display("loaded %0d samples, EN=%0d OCT=%0d K1=%0d K2=%0d K3=%0d",
-             n_samples, en_dip, oct_sw, k1v, k2v, k3v);
+    $display("loaded %0d samples, EN=%0d OCT=%0d K1=%0d K2=%0d K3=%0d K4=%0d",
+             n_samples, en_dip, oct_sw, k1v, k2v, k3v, k4v);
 
     // reset
     rst_n = 1'b0;

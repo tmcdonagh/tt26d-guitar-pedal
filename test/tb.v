@@ -46,4 +46,16 @@ module tb ();
       .rst_n  (rst_n)     // not reset
   );
 
+`ifndef GL_TEST
+  // Testbench-only standalone shared multiplier (Task 16, test_mult_corners):
+  // drives src/mult.v in isolation against a * b. Not part of the design.
+  reg               mt_start;
+  reg  signed [16:0] mt_a;
+  reg         [11:0] mt_b;
+  wire signed [28:0] mt_p;
+  wire               mt_done;
+  mult mult_tb (.clk(clk), .rst_n(rst_n), .start(mt_start), .a(mt_a), .b(mt_b),
+                .p(mt_p), .done(mt_done));
+`endif
+
 endmodule

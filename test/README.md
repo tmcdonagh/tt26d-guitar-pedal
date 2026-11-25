@@ -1,4 +1,23 @@
-# Sample testbench for a Tiny Tapeout project
+# Tests for the Silicon Guitar Pedal
+
+- `test.py` — cocotb suite (38 tests): I2S framing, every effect stage (phaser
+  included), the enable matrix, debounce, the K1..K4 knob reader, serial
+  multiplier, clip LED. `make -B` (RTL) or
+  `make -B GATES=yes` (gate-level, needs `gate_level_netlist.v`).
+- `golden_model.py` — independent Python model of the whole chain.
+- `wav_tool.py` — listening/regression renders of the guitar riff
+  (`audio_in.wav`, git-ignored): `check` (~1 min, 6 s excerpt, RTL vs golden
+  model, all 21 modes: the Rev A set, `all5` (comp+fuzz+dist+phaser+trem),
+  `phaser`, `phaser_k1lo/hi`, `phasertrem`, `fuzzphaser`), `run` (full riff through the RTL → `audio_out/`),
+  `model` (golden renders → `audio_model/`), `model-parity`. See the
+  docstring at the top of the file and `gl_wav_tool.md` for the gate-level
+  variant.
+
+The rest of this file is the Tiny Tapeout template's generic testbench guide.
+
+---
+
+## Sample testbench for a Tiny Tapeout project
 
 This is a sample testbench for a Tiny Tapeout project. It uses [cocotb](https://docs.cocotb.org/en/stable/) to drive the DUT and check the outputs.
 See below to get started or for more information, check the [website](https://tinytapeout.com/hdl/testing/).

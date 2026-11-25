@@ -17,6 +17,8 @@ Usage (from test/):
                                      # (SIM=glvl: same, on the gate-level netlist)
     python3 wav_tool.py model        # full-riff golden renders -> audio_model/
     python3 wav_tool.py model-parity # bit-exact audio_out/ (run) vs audio_model/ (model)
+    python3 wav_tool.py render <label>  # RTL full riff, every mode -> ../renders/YYYY-MM-DD-<label>/
+                                     # (<mode>.wav + README.md; refuses an existing folder)
 Modes = MODES (= CHECK_MODES: listening modes plus the K1/K2/K3 knob modes).
 """
 import array
@@ -67,26 +69,33 @@ LISTEN_MODES = [
     ("dist",     0x04, 0),  # diode-knee PWL, fixed drive x4
     ("trem",     0x10, 0),  # smooth trem, K1 absent (inc 437, ~5 Hz)
     ("fuzzdist", 0x06, 0),  # fuzz clip, then diode knee
-    ("all4",     0x17, 0),  # comp+fuzz+dist+trem (phaser/delay excluded — Rev B stubs)
+    ("all4",     0x17, 0),  # comp+fuzz+dist+trem (the Rev A stack, unchanged)
+    ("all5",     0x1F, 0),  # comp+fuzz+dist+phaser+trem (Rev B1)
 ]
-# check modes: name, en, oct, k1, k2, k3 (knob K1..K3 values 0..255 for the
+# check modes: name, en, oct, k1, k2, k3, k4 (knob K1..K4 values 0..255 for the
 # tb's RC pin model, None = absent). Every listening mode runs both
-# knobs absent; the K1 modes pin the trem rate path (inc = (64 +
+# knobs absent; the K1 modes pin the trem/phaser rate path (inc = (64 +
 # k1[5:0]) << k1[7:6]), the K2 modes the tone shift (kt = 4 - k2[7:6]:
 # k2=0 -> kt 4 dark, k2=255 -> kt 1 bright).
-CHECK_MODES = [(name, en, oct_sw, None, None, None) for name, en, oct_sw in LISTEN_MODES] + [
-    ("trem_k1lo",  0x10, 0, 8, None, None),    # inc 72  (~0.82 Hz)
-    ("trem_k1mid", 0x10, 0, 128, None, None),  # inc 256 (~2.93 Hz)
-    ("trem_k1hi",  0x10, 0, 250, None, None),  # inc 976 (~11.2 Hz)
-    ("fuzz_k2dark",   0x02, 0, None, 0, None),    # fuzz + tone kt 4 (darkest)
-    ("fuzz_k2bright", 0x02, 0, None, 255, None),  # fuzz + tone kt 1 (brightest)
-    ("dist_k3lo",  0x04, 0, None, None, 0),    # dist drive x1 (256)
-    ("dist_k3hi",  0x04, 0, None, None, 255),  # dist drive x7.97 (2041)
+CHECK_MODES = [(name, en, oct_sw, None, None, None, None) for name, en, oct_sw in LISTEN_MODES] + [
+    ("trem_k1lo",  0x10, 0, 8, None, None, None),    # inc 72  (~0.82 Hz)
+    ("trem_k1mid", 0x10, 0, 128, None, None, None),  # inc 256 (~2.93 Hz)
+    ("trem_k1hi",  0x10, 0, 250, None, None, None),  # inc 976 (~11.2 Hz)
+    ("fuzz_k2dark",   0x02, 0, None, 0, None, None),    # fuzz + tone kt 4 (darkest)
+    ("fuzz_k2bright", 0x02, 0, None, 255, None, None),  # fuzz + tone kt 1 (brightest)
+    ("dist_k3lo",  0x04, 0, None, None, 0, None),    # dist drive x1 (256)
+    ("dist_k3hi",  0x04, 0, None, None, 255, None),  # dist drive x7.97 (2041)
+    ("phaser",      0x08, 0, None, None, None, None),  # 4-stage allpass, K1 absent (inc 87, ~1.0 Hz)
+    ("phaser_k1lo", 0x08, 0, 8, None, None, None),     # inc 72  (~0.82 Hz)
+    ("phaser_k1hi", 0x08, 0, 250, None, None, None),   # inc 976 (~11.2 Hz)
+    ("phasertrem",  0x18, 0, None, None, None, None),  # phaser into trem
+    ("fuzzphaser",  0x0A, 0, None, None, None, None),  # fuzz (+ tone/gate) into the phaser
 ]
 MODES = CHECK_MODES   # `run`/`model`/parity cover every mode, knob modes included
 K1_RE = re.compile(r"^K1:(\d+) (\d+) (\d+)$")
 K2_RE = re.compile(r"^K2:(\d+) (\d+) (\d+)$")
 K3_RE = re.compile(r"^K3:(\d+) (\d+) (\d+)$")
+K4_RE = re.compile(r"^K4:(\d+) (\d+) (\d+)$")
 
 
 def wav2hex():
@@ -265,10 +274,11 @@ def vl_build():
         cwd=HERE, stdout=subprocess.DEVNULL)
 
 
-def probes_ok(log_path, k1, k2, k3, name):
-    """RTL-only K1/K2/K3 settle probes (the model applies knob_steady(k)
+def probes_ok(log_path, k1, k2, k3, k4, name):
+    """RTL-only K1..K4 settle probes (the model applies knob_steady(k)
     from frame 0: exact only if the RTL reading is settled and unmoved)."""
-    for tag, regex, k in (("K1", K1_RE, k1), ("K2", K2_RE, k2), ("K3", K3_RE, k3)):
+    for tag, regex, k in (("K1", K1_RE, k1), ("K2", K2_RE, k2), ("K3", K3_RE, k3),
+                           ("K4", K4_RE, k4)):
         probe = parse_k1_probe(log_path, regex)
         want = (0 if k is None else golden_model.knob_steady(k),
                 0 if k is None else 1, 0)
@@ -297,17 +307,18 @@ def check():
         if gl:
             tmp = OUT_DIR_GL   # netlist logs land in audio_out_gl/<mode>.log
         procs = {}
-        for name, en, oct_sw, k1, k2, k3 in CHECK_MODES:
+        for name, en, oct_sw, k1, k2, k3, k4 in CHECK_MODES:
             with open(os.path.join(tmp, f"{name}.log"), "w") as log:
                 procs[name] = subprocess.Popen(
                     [exe, f"+EN={en}", f"+OCT={oct_sw}", f"+N={EXCERPT_FRAMES}",
                      f"+IN={EXCERPT_HEX}", f"+K1={-1 if k1 is None else k1}",
                      f"+K2={-1 if k2 is None else k2}",
-                     f"+K3={-1 if k3 is None else k3}"],
+                     f"+K3={-1 if k3 is None else k3}",
+                     f"+K4={-1 if k4 is None else k4}"],
                     stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
         rcs = {name: p.wait() for name, p in procs.items()}
         bad = False
-        for name, en, oct_sw, k1, k2, k3 in CHECK_MODES:
+        for name, en, oct_sw, k1, k2, k3, k4 in CHECK_MODES:
             if rcs[name] != 0:
                 bad = True
                 print(f"{name}: FAIL (sim exited with return code {rcs[name]})")
@@ -317,10 +328,10 @@ def check():
             # print them. The RTL `check` proves them and the netlist is
             # meant to be equivalent, so GL mode makes only the bit-exact
             # sample comparison below.
-            if not gl and not probes_ok(log_path, k1, k2, k3, name):
+            if not gl and not probes_ok(log_path, k1, k2, k3, k4, name):
                 bad = True
                 continue
-            want = golden_model.render(ex, en, oct=oct_sw, k1=k1, k2=k2, k3=k3)
+            want = golden_model.render(ex, en, oct=oct_sw, k1=k1, k2=k2, k3=k3, k4=k4)
             got = parse_samples(log_path)
             first = next((i for i in range(min(len(got), len(want))) if got[i] != want[i]), None)
             if first is None and len(got) != len(want):
@@ -355,8 +366,8 @@ def model():
     """Full-riff golden renders to audio_model/<mode>.wav (for listening)."""
     os.makedirs(MODEL_DIR, exist_ok=True)
     full = read_wav(IN_WAV)
-    for name, en, oct_sw, k1, k2, k3 in MODES:
-        out = golden_model.render(full, en, oct=oct_sw, k1=k1, k2=k2, k3=k3)
+    for name, en, oct_sw, k1, k2, k3, k4 in MODES:
+        out = golden_model.render(full, en, oct=oct_sw, k1=k1, k2=k2, k3=k3, k4=k4)
         path = os.path.join(MODEL_DIR, f"{name}.wav")
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
@@ -385,11 +396,12 @@ def model_parity():
         raise SystemExit(f"model-parity FAIL: {bad}")
 
 
-def run_mode(name, en, oct_sw, k1, k2, k3, n, sim):
+def run_mode(name, en, oct_sw, k1, k2, k3, k4, n, sim):
     out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
     args = [f"+EN={en}", f"+OCT={oct_sw}", f"+N={n}",
             f"+K1={-1 if k1 is None else k1}", f"+K2={-1 if k2 is None else k2}",
-            f"+K3={-1 if k3 is None else k3}"]
+            f"+K3={-1 if k3 is None else k3}",
+            f"+K4={-1 if k4 is None else k4}"]
     if sim == "gl":
         cmd = ["vvp", GL_VVP] + args
     elif sim == "glvl":
@@ -400,6 +412,82 @@ def run_mode(name, en, oct_sw, k1, k2, k3, n, sim):
         cmd = ["vvp", "sim_audio.vvp"] + args
     with open(os.path.join(out_dir, f"{name}.log"), "w") as log:
         return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
+
+
+RENDER_JOBS = 16   # max parallel simulator processes for `render`
+
+
+def render(label):
+    """Dated full-riff RTL renders: ../renders/YYYY-MM-DD-<label>/<mode>.wav
+    for every MODES entry, plus a README.md (modes, base commit, git diff
+    --stat, command). Refuses to overwrite an existing folder."""
+    import datetime
+    import shutil
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", label):
+        raise SystemExit("render: label must match [A-Za-z0-9._-]+")
+    repo = os.path.abspath(os.path.join(HERE, ".."))
+    today = datetime.date.today().isoformat()   # once: the folder and README must agree
+    out = os.path.join(repo, "renders", f"{today}-{label}")
+    if os.path.exists(out):
+        raise SystemExit(f"render: {out} already exists; refusing to overwrite")
+
+    def git(*a):
+        r = subprocess.run(["git", "-C", repo] + list(a), capture_output=True, text=True)
+        return r.stdout.strip() if r.returncode == 0 else f"(git {a[0]} failed)"
+
+    vl_build()
+    n = wav2hex()
+    os.makedirs(out)
+    logs = tempfile.mkdtemp(prefix="render_")
+    try:
+        pending, running, failed = list(MODES), [], []
+        while pending or running:
+            while pending and len(running) < RENDER_JOBS:
+                name, en, oct_sw, *knobs = pending.pop(0)
+                args = [f"+EN={en}", f"+OCT={oct_sw}", f"+N={n}"] + [
+                    f"+K{i + 1}={-1 if k is None else k}" for i, k in enumerate(knobs)]
+                lf = open(os.path.join(logs, f"{name}.log"), "w")
+                running.append((name, lf, subprocess.Popen(
+                    [VL_EXE] + args, stdout=lf, stderr=subprocess.STDOUT, cwd=HERE)))
+            name, lf, p = running.pop(0)
+            rc = p.wait()
+            lf.close()
+            if rc != 0:
+                failed.append((name, rc))
+        if failed:
+            raise SystemExit("render FAIL: simulator exited non-zero: "
+                             + ", ".join(f"{m} (rc {rc})" for m, rc in failed))
+        rows = []
+        for name, en, oct_sw, *knobs in MODES:
+            samples = array.array("h", parse_samples(os.path.join(logs, f"{name}.log")))
+            if len(samples) != n:
+                raise SystemExit(f"render FAIL: {name}: {len(samples)} samples, expected {n}")
+            with wave.open(os.path.join(out, f"{name}.wav"), "wb") as w:
+                w.setnchannels(1)
+                w.setsampwidth(2)
+                w.setframerate(SR)
+                w.writeframes(samples.tobytes())
+            kn = ", ".join(f"K{i + 1}=" + ("absent" if k is None else str(k))
+                           for i, k in enumerate(knobs)) or "-"
+            rows.append(f"| {name} | 0x{en:02X} | {oct_sw} | {kn} |")
+            print(f"{os.path.join(out, name + '.wav')}: {len(samples)} samples")
+    except BaseException:
+        shutil.rmtree(out, ignore_errors=True)   # never leave a partial dated folder
+        raise
+    finally:
+        shutil.rmtree(logs, ignore_errors=True)
+    cmd = "python3 -I wav_tool.py render " + label
+    with open(os.path.join(out, "README.md"), "w") as f:
+        f.write(f"# Render {os.path.basename(out)}\n\n"
+                f"RTL (Verilator) full riff, {n} samples ({n / SR:.1f} s) per mode.\n\n"
+                f"- Base commit: `{git('rev-parse', 'HEAD')}`\n"
+                f"- Command (from `test/`): `{cmd}`\n"
+                f"- Date: {today}\n\n"
+                "## Modes\n\n| name | en (ui[6:1]) | oct (ui[7]) | knobs |\n|---|---|---|---|\n"
+                + "\n".join(rows)
+                + "\n\n## git diff --stat HEAD (working tree vs base commit)\n\n```\n"
+                + git("diff", "--stat", "HEAD") + "\n```\n")
+    print(f"render: {len(MODES)} modes -> {out}")
 
 
 def main():
@@ -428,6 +516,10 @@ def main():
         model()
     elif what == "model-parity":
         model_parity()
+    elif what == "render":
+        if len(sys.argv) != 3:
+            raise SystemExit("usage: wav_tool.py render <label>")
+        render(sys.argv[2])
     elif what == "run":
         out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
         os.makedirs(out_dir, exist_ok=True)
@@ -436,8 +528,8 @@ def main():
         elif sim == "glvl":
             glvl_build()
         n = wav2hex()
-        procs = [run_mode(name, en, oct_sw, k1, k2, k3, n, sim)
-                 for name, en, oct_sw, k1, k2, k3 in MODES]
+        procs = [run_mode(name, en, oct_sw, k1, k2, k3, k4, n, sim)
+                 for name, en, oct_sw, k1, k2, k3, k4 in MODES]
         rcs = [p.wait() for p in procs]
         failed = [(m[0], rc) for m, rc in zip(MODES, rcs) if rc != 0]
         if failed:

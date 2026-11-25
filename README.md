@@ -10,24 +10,25 @@ difficult to implement so that's what I went with.
 The design is the I2S master (MCLK 24.576 MHz, BCLK 3.072 MHz, LRCLK 48 kHz,
 all on `uio`) and runs a serial effect chain over the digitized audio:
 
-**compressor -> fuzz (with octave switch) -> distortion -> tone + noise gate -> phaser (stub) -> tremolo**
+**compressor -> fuzz (with octave switch) -> distortion -> tone + noise gate -> phaser -> tremolo**
 
 - **Compressor**: smoothed envelope, 1.5 dB gain table, slewed gain.
 - **Fuzz**: asymmetric clip; an octave switch on `ui[7]`.
 - **Distortion**: diode knee, drive x4 by default.
 - **Tone + gate**: a low-pass and a noise gate, active automatically when
   fuzz or distortion is on.
-- **Phaser**: an empty slot for now (the enable does nothing).
+- **Phaser**: Phase 90-style, four allpass stages mixed 50/50 with the dry
+  signal (two sweeping notches), rate from K1 (shared with the tremolo).
 - **Tremolo**: smooth, 75% depth, about 5 Hz by default.
 
 The effects are switched by plain switches on `ui[1]`-`ui[5]` (comp, fuzz,
 dist, phaser, trem), debounced on chip, so an effect engages within about
 5-11 ms. They need external pull-downs, with the switch commons to 3V3.
-Three optional knobs sit on `uio[2]`-`uio[4]`, read by RC timing (a pot and a
-capacitor per pin, no ADC chip): K1 tremolo rate (about 0.73-11.6 Hz), K2
-post-dirt tone, K3 distortion drive. With no knobs fitted the defaults
+Four optional knobs sit on `uio[2]`-`uio[5]`, read by RC timing (a pot and a
+capacitor per pin, no ADC chip): K1 tremolo + phaser rate (about 0.73-11.6 Hz), K2
+post-dirt tone, K3 distortion drive, K4 delay time (read, not used yet). With no knobs fitted the defaults
 apply (tie unused knob pins to GND). `ui[6]` and the SPI pins are
-reserved (CS idles high). The decimal point on `uo[7]` is a clip LED. True
+reserved (CE# idles high). The decimal point on `uo[7]` is a clip LED. True
 bypass is an external 3PDT footswitch; the ASIC has no bypass role.
 
 The clock can be any integer-divided clock near 24.576 MHz; the sample rate is
