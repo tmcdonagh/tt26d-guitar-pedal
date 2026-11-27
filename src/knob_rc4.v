@@ -89,7 +89,7 @@ module knob_rc4 (
         sel       <= sel_nx;
         cnt       <= 16'd0;
         for (k = 0; k < 4; k = k + 1)            // only knob sel's state
-          if (sel == k) begin
+          if ({30'd0, sel} == k) begin
             present[k] <= 1'b1;
             // !present: fast startup (acc = raw << 2, value = raw);
             // else IIR, value moves only past the hysteresis
@@ -101,7 +101,7 @@ module knob_rc4 (
         sel          <= sel_nx;
         cnt          <= 16'd0;
         for (k = 0; k < 4; k = k + 1)
-          if (sel == k) present[k] <= 1'b0;
+          if ({30'd0, sel} == k) present[k] <= 1'b0;
       end else begin
         cnt <= cnt + 16'd1;
       end

@@ -4,10 +4,13 @@
 # Internal-state probes are RTL-only (guarded getattr — names may vanish
 # in the flat GL netlist); port-level assertions carry the GL coverage.
 
+import math
 import cocotb
+from cocotb.handle import Force, Release
 import golden_model
+from golden_model import EN_COMP, EN_DIST, EN_PHASER, EN_TREM, EN_DELAY, EN_FREEZE  # noqa: F401
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles, ReadOnly, Timer, ValueChange, with_timeout
+from cocotb.triggers import ClockCycles, Edge, ReadOnly, RisingEdge, Timer, ValueChange, with_timeout
 from cocotb.utils import get_sim_time
 
 
@@ -16,23 +19,25 @@ async def test_skeleton_baseline(dut):
     """Task 1 baseline: reset state, pin wiring, and running frame clock."""
     dut._log.info("Start")
 
-    # DIP enables all on (en = 0x3F, ui[6:1]), ui[7] = 0 (octave off),
-    # zero input: every stage maps 0 to 0 (the stub slots are identity),
-    # so DAC data stays low even after the switches settle.
-    await start(dut, 0b0111_1110)
+    # every DIP on (ui_in = 0xFF: ui[5:0] enables, ui[7:6] unused),
+    # zero input: every stage maps 0 to 0, so DAC data stays low even
+    # after the switches settle.
+    await start(dut, 0xFF)
 
-    # Reset state: DAC data low, uo idle — dp clip LED (uo[7]) low, SPI
-    # idle (uo[1] = CS high), uo[6:3] and uo[2], uo[0] driven 0
-    assert dut.uio_out[1].value == 0, "DAC data not low after reset"
-    assert int(dut.uo_out.value) == 0x02, \
-        "uo must read 0x02 at idle (dp dark, SPI CS idle high, rest 0)"
+    # Reset state: DAC data low, uo idle — dp clip LED (uo[7]) low, flash
+    # CS0 hold uo[6] = 1, uo[5] = 0, SPI idle (uo[1] = CS high, uo[2],
+    # uo[0] = 0); uo[4] = LRCLK is masked (it runs)
+    assert dut.uo_out[3].value == 0, "DAC data not low after reset"
+    assert int(dut.uo_out.value) & 0xEF == 0x42, \
+        "uo must read 0x42 at idle, LRCLK masked (dp dark, CS0 hold high, SPI CS idle high, rest 0)"
 
     # MCLK output enabled on uio[0] and following clk.
     # Sample away from clock edges (comb outputs need settle time).
-    # fixed bits: uio[7:6] + uio[1:0] outputs, uio[5] input; uio[4:2] are
-    # the knob readers' discharge drives (toggle; see test_pin_map)
-    assert int(dut.uio_oe.value) & 0b1110_0011 == 0b1100_0011, \
-        "uio_oe must enable uio[7:6] and uio[1:0], uio[5] an input"
+    # fixed bits: uio[6] (BCLK) + uio[0] (MCLK) outputs, uio[7] (MISO)
+    # + uio[1] (ADC data) inputs; uio[5:2] are the knob readers'
+    # discharge drives (toggle; see test_pin_map)
+    assert int(dut.uio_oe.value) & 0b1100_0011 == 0b0100_0001, \
+        "uio_oe must enable uio[6] and uio[0] only (uio[7], uio[1] are inputs)"
     assert int(dut.uio_out.value) & 0b0011_1100 == 0, "uio_out[5:2] must be 0"
     vals = []
     toggles = 0
@@ -46,19 +51,19 @@ async def test_skeleton_baseline(dut):
         vals.append(v)
     assert toggles >= 2, f"MCLK must follow clk (sampled {vals})"
 
-    # Frame clock is running: LRCLK (uio[7]) must toggle within one frame (512 clk)
-    lr0 = dut.uio_out[7].value
+    # Frame clock is running: LRCLK (uo[4]) must toggle within one frame (512 clk)
+    lr0 = dut.uo_out[4].value
     toggled = False
     for _ in range(600):
         await ClockCycles(dut.clk, 1)
-        if dut.uio_out[7].value != lr0:
+        if dut.uo_out[4].value != lr0:
             toggled = True
             break
     assert toggled, "LRCLK never toggled — frame counter not running"
 
     # all enables on, zero input: DAC data still low
     await ClockCycles(dut.clk, 1)
-    assert dut.uio_out[1].value == 0, "unexpected DAC output with zero input"
+    assert dut.uo_out[3].value == 0, "unexpected DAC output with zero input"
 
 
 # ---------------------------------------------------------------------
@@ -90,21 +95,21 @@ async def _bclk_edge(dut, want_rising, settle_ns=1):
 
 
 async def _wait_left_start(dut):
-    """Wait for the next WS falling edge (LRCLK 1->0) = start of a left
+    """Wait for the next WS falling edge (LRCLK uo[4] 1->0) = start of a left
     (data) half-frame."""
-    prev = int(dut.uio_out[7].value)
+    prev = int(dut.uo_out[4].value)
     while True:
         await ClockCycles(dut.clk, 1)
         await Timer(1, unit="ns")
-        cur = int(dut.uio_out[7].value)
+        cur = int(dut.uo_out[4].value)
         if prev == 1 and cur == 0:
             return
         prev = cur
 
 
 async def i2s_send_and_capture(dut, word24):
-    """Drive one left-channel frame on ui[0] (24-bit word, slots 1..24)
-    and capture the 32-slot left half of the same frame from uio[1].
+    """Drive one left-channel frame on uio[1] (tb adc_din; 24-bit word,
+    slots 1..24) and capture the 32-slot left half from uo[3] (DAC).
 
     Returns the 32 captured bits (index = slot). Called right after a WS
     edge (start of left half)."""
@@ -115,9 +120,9 @@ async def i2s_send_and_capture(dut, word24):
             bit = (word24 >> (24 - slot)) & 1
         else:
             bit = 0
-        dut.ui_in[0].value = bit
+        dut.adc_din.value = bit
         await _bclk_edge(dut, True)  # mid-slot: master samples here
-        bits.append(int(dut.uio_out[1].value))
+        bits.append(int(dut.uo_out[3].value))
         await _bclk_edge(dut, False)  # slot boundary
     return bits
 
@@ -131,7 +136,7 @@ def tx_data_bits(bits):
     return v
 
 
-# Switch debounce (v3 task 7): the enables and octave (ui[7:1]) are 2-flop
+# Switch debounce (v3 task 7): the enables (ui[5:0]) are 2-flop
 # synchronised and only reach the chain after two agreeing 256-frame ticks
 # (sw updates at strobe 512 from reset), so every test lets the switches
 # settle before it probes.
@@ -199,7 +204,7 @@ async def start(dut, ui_in, uio_in=0, clock=True):
 async def resettle(dut, ui_in):
     """Change the switches mid-test (no reset): from a left-half start
     +/- the previous capture, advance exactly SETTLE_FRAMES silent frames
-    (ui[0] low; the last drive left rx_shift at 0 — callers drove a zero
+    (ADC data low; the last drive left rx_shift at 0 — callers drove a zero
     capture frame) and return at a left-half start."""
     await _wait_left_start(dut)
     dut.ui_in.value = ui_in
@@ -210,8 +215,8 @@ async def resettle(dut, ui_in):
 async def fast_frames(dut, words):
     """Low-overhead I2S driver for long runs: from a left-half start (as
     start()/_wait_left_start return, 1 ns after the WS-fall clk edge)
-    drive one frame per 16-bit word on ui[0] and capture each frame's
-    TX word from uio[1], using sim-time Timers instead of per-clk
+    drive one frame per 16-bit word on uio[1] (adc_din) and capture each
+    frame's TX word from uo[3], using sim-time Timers instead of per-clk
     polling (~65 awaits/frame). Capture j is the result of input frame
     j-1 (one-frame TX latency). Returns signed captures, ending at the
     next left start (+1 ns)."""
@@ -220,10 +225,10 @@ async def fast_frames(dut, words):
         w &= 0xFFFF
         v = 0
         for slot in range(32):
-            dut.ui_in[0].value = (w >> (16 - slot)) & 1 if 1 <= slot <= 16 else 0
+            dut.adc_din.value = (w >> (16 - slot)) & 1 if 1 <= slot <= 16 else 0
             await Timer(4 * CLK_PERIOD_PS, unit="ps")   # mid-slot
             if 1 <= slot <= 16:
-                v = (v << 1) | int(dut.uio_out[1].value)
+                v = (v << 1) | int(dut.uo_out[3].value)
             await Timer(4 * CLK_PERIOD_PS, unit="ps")
         await Timer(256 * CLK_PERIOD_PS, unit="ps")     # right half
         outs.append(v - 0x10000 if v & 0x8000 else v)
@@ -314,11 +319,11 @@ async def test_bclk_lrclk_ratios(dut):
     bclk_rises = 0
     lr_toggles = 0
     prev_b = int(dut.uio_out[6].value)
-    prev_l = int(dut.uio_out[7].value)
+    prev_l = int(dut.uo_out[4].value)
     for _ in range(1620):
         await Timer(10134, unit="ps")
         b = int(dut.uio_out[6].value)
-        l = int(dut.uio_out[7].value)
+        l = int(dut.uo_out[4].value)
         if b == 1 and prev_b == 0:
             bclk_rises += 1
         if l != prev_l:
@@ -363,15 +368,15 @@ async def test_stereo_halves_match(dut):
         call's right-half loop ends exactly there)."""
         lhalf = []
         for slot in range(32):
-            dut.ui_in[0].value = (1 <= slot <= 16) and ((word16 >> (16 - slot)) & 1) or 0
+            dut.adc_din.value = (1 <= slot <= 16) and ((word16 >> (16 - slot)) & 1) or 0
             await _bclk_edge(dut, True)
-            lhalf.append(int(dut.uio_out[1].value))
+            lhalf.append(int(dut.uo_out[3].value))
             await _bclk_edge(dut, False)
         # right half: no drive needed, just capture slots 33..48
         rhalf = []
         for slot in range(32):
             await _bclk_edge(dut, True)
-            rhalf.append(int(dut.uio_out[1].value))
+            rhalf.append(int(dut.uo_out[3].value))
             await _bclk_edge(dut, False)
         return lhalf, rhalf
 
@@ -413,14 +418,14 @@ async def test_reset_state(dut):
     through for exactly one frame (reset releases mid-frame); the next
     frame with a clean (zero) input must be silent, uo dark."""
     # bare reset (no switch settle: the I2S RX path doesn't need it) with
-    # junk (ui[0] = 1) on the data line during reset
+    # junk (ADC data uio[1] = 1) on the data line during reset
     cocotb.start_soon(
         Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2).start())
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
     dut.rst_n.value = 0
-    dut.ui_in[0].value = 1  # junk on the data line during reset
+    dut.adc_din.value = 1  # junk on the data line during reset
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
 
@@ -430,15 +435,15 @@ async def test_reset_state(dut):
     bits = await i2s_send_and_capture(dut, 0)   # frame B: must be silent
     assert tx_data_bits(bits) == 0, \
         f"second frame after reset must be silent, got {tx_data_bits(bits):#06x}"
-    assert int(dut.uo_out.value) == 0x02, \
-        "uo must read 0x02 after reset (dp dark, SPI CS idle high, rest 0)"
+    assert int(dut.uo_out.value) & 0xE7 == 0x42, \
+        "uo must read 0x42 after reset, LRCLK/DAC masked (dp dark, CS0 hold high, SPI CS idle high)"
 
 
 
-# ui byte layout (v3 task 7): ui[0]=I2S data (driven by the helper),
-# ui[5:1]=DIP effect enables en[4:0] (en[0]=comp .. en[4]=trem, bit
-# order = chain order), ui[6] = delay enable + PSRAM MISO (the delay slot
-# is an identity stub), ui[7] = fuzz octave. All of ui[7:1] are debounced (see start()).
+# ui byte layout (Rev B3 final): ui[5:0] = DIP enables en[5:0] in chain
+# order (comp, dist, phaser, trem, delay, freeze = golden_model.EN_*),
+# debounced (see start()); ui[7:6] unused. No external data source is
+# on any ui pin: the ADC data is uio[1] (tb adc_din), the PSRAM MISO uio[7].
 # uio[5:2] are the RC knob pins K1..K4 (tests drive 0 = absent unless a
 # knob_pin model runs).
 
@@ -459,7 +464,7 @@ async def test_comp_ratio(dut):
     n = 200
     steady = []
     for i, amp in enumerate((2048, 16384)):
-        await start(dut, 0b0000_0010, clock=(i == 0))   # en[0] comp only
+        await start(dut, EN_COMP, clock=(i == 0))   # comp only (ui[0])
         got = await fast_frames(dut, [amp] * n + [0])
         want = golden_model.render([0] * START_FRAME + [amp] * n, 0x01)[START_FRAME:]
         # capture j carries input frame j-1's result
@@ -482,7 +487,7 @@ async def test_comp_slew(dut):
     (|target - g| >> 3) + 1 per frame (the slew bound; the +1 is the
     arithmetic-shift rounding of a negative gap)."""
     pre, n = 100, 200
-    await start(dut, 0b0000_0010)                     # en[0] comp only
+    await start(dut, EN_COMP)                     # comp only (ui[0])
     xs = [2048] * pre + [16384] * n
     got = await fast_frames(dut, xs + [0])
     want = golden_model.render([0] * START_FRAME + xs, 0x01)[START_FRAME:]
@@ -509,7 +514,7 @@ async def test_comp_rails(dut):
     next frame's capture is that rail value. (b) +32767 and -32768,
     each after 400 silent frames, give exactly 32767 / -32768 on the
     first loud frame (golden)."""
-    await start(dut, 0b0000_0010)                     # en[0] comp only
+    await start(dut, EN_COMP)                     # comp only (ui[0])
 
     def dp():
         return int(dut.uo_out[7].value)
@@ -552,7 +557,7 @@ async def test_cenv_decay(dut):
     100 silent frames. Release = cenv - (cenv >> 12) - (cenv != 0);
     termination at exactly 0 (~34k frames from full scale, too long
     here) is proven by `golden_model.py --selftest` (wav_tool check)."""
-    await start(dut, 0b0000_0010)                     # en[0] comp only
+    await start(dut, EN_COMP)                     # comp only (ui[0])
     probe = _probe(dut, "cenv")
     # RTL (where the chain's step reg is visible) must expose cenv
     assert probe is not None or _probe(dut, "step") is None, "RTL has no cenv"
@@ -579,15 +584,15 @@ async def test_cenv_decay(dut):
 
 
 class Hist:
-    """Frame history of a dirt-stage test (v3 task 11): fuzz/dist outputs
+    """Frame history of a dirt-stage test (v3 task 11): dist outputs
     pass through the tone low-pass and the noise gate, which carry state
     across frames, so every probe is checked against golden_model.render
     of the whole history ([0] * START_FRAME + the driven frames) instead
     of an isolated-frame literal. The gate is opened beforehand by a
     loud priming run (L >= 256) so the outputs are non-zero."""
 
-    def __init__(self, en, oct_sw=0, k3=None):
-        self.en, self.oct, self.k3 = en, oct_sw, k3
+    def __init__(self, en, k3=None):
+        self.en, self.k3 = en, k3
         self.xs = [0] * START_FRAME
 
     def add(self, x, n=1):
@@ -596,7 +601,7 @@ class Hist:
     def render(self, en=None):
         tap = []
         out = golden_model.render(self.xs, self.en if en is None else en,
-                                  oct=self.oct, k3=self.k3, tap=tap)
+                                  k3=self.k3, tap=tap)
         return out, tap
 
 
@@ -673,15 +678,15 @@ async def test_dist_diode(dut):
     w <= 8192: out = w; w <= 32768: out = 8192 + ((w-8192) >> 2) (slope
     1/4, 14336 at w = 32768); else out = 14336 + ((w-32768) >> 4)
     (slope 1/16, max 20479 — sat16 never reached). Sign reapplied from
-    x[15]. Fuzz is off, so the input is the raw sample. Exact points
+    x[15]. Comp is off, so the input is the raw sample. Exact points
     pin both seams (K1 at a=2048, K2 at a=8192, both sides) and the
     extremes; each is also asserted against golden_model.dist. Since
     task 11 the pins read the RTL s3 tap probe (the dist-stage output,
     before tone + gate; guarded, GL carries the port check) and the port
     output is checked against golden after a loud run that opens the
     gate (Hist/dirt_frame)."""
-    await start(dut, 0b0000_1000)  # en[2] dist only (ui[3]); octave off
-    hist = Hist(0x04)
+    await start(dut, EN_DIST)  # dist only (ui[1])
+    hist = Hist(EN_DIST)
     await prime_gate(dut, hist)
 
     async def dist_once(word16, first=False):
@@ -729,7 +734,7 @@ async def test_dist_diode(dut):
     assert settled[8191] != settled[8192], settled
 
 
-async def _drive_points(dut, k3, points, en=0x04):
+async def _drive_points(dut, k3, points, en=EN_DIST):
     """Fresh run with K3 = k3 (None = absent): prime the gate, then for
     each x hold it and require the dist-stage output (RTL s3 tap probe,
     None on GL) and the settled port word to equal golden at the K3
@@ -737,7 +742,7 @@ async def _drive_points(dut, k3, points, en=0x04):
     list of (x, settled port, golden dist)."""
     if k3 is not None:
         knob_pin(dut, 2, k3)
-    await start(dut, en << 1)
+    await start(dut, en)
     kval, kpres = _probe(dut, "k3_value"), _probe(dut, "k3_present")
     if kval is not None:
         assert int(kpres.value) == (0 if k3 is None else 1)
@@ -789,249 +794,6 @@ async def test_drive_mid(dut):
     assert golden_model.drive_q8(128) == 1152
     res = await _drive_points(dut, 128, (1000, 8000, -20000))
     assert [d for _, _, d in res] == [4500, 14538, -17913]
-
-
-@cocotb.test()
-async def test_fuzz_asym(dut):
-    """Fuzz stage (en[1]), v3 task 4: asymmetric clip + env bias on the
-    stage's CHAIN input s1 — the mandatory task-3 routed re-coupling
-    (v2.2's cell-saving trim read the PRE-CHAIN sample_in here, masking
-    comp in every fuzz-on stack; fuzz now consumes comp's output, and
-    dist below consumes fuzz's). Input x = s1, signed; provisional
-    constants:
-      a = sat_mag(x); t = x[15] ? sat16(13107 + (env >>> 2)) : 19660
-      (the negative clip point relaxes with the input envelope —
-      bias-starve dynamics; env is the shared PRE-CHAIN envelope, read
-      post-update: the output captured in frame N+1 is fuzz(x_N, env_N));
-      shaped = a > t ? t : a; fuzz_core = x[15] ? -shaped : shaped.
-    octave off throughout (the plain asym fuzz; the octave blend is
-    test_fuzz_octave). Env-dependence is Review Focus 4: the SAME
-    negative input under loud vs quiet env gives two distinct pinned
-    values (t_neg moves with env). Phases (frames from the first
-    _wait_left_start; env values model-derived from the task-3 env
-    recursion — the model reproduces task-3's pinned 32766/32638/6721/
-    6694 trajectory exactly):
-      - 100 loud frames 0x7FFF (0..99): env 32766, sticky from frame 15;
-      - corner -32768 (frame 100): env_100 = 32766 (attack from the
-        sticky point with sat-mag 32767: (32766+32767)>>1 = 32766) ->
-        t_neg = 13107 + 8191 = 21298, the MAX negative clip point ->
-        -21298. sat-mag 32767 -> clip -> negate; shaped <= 21298, so
-        the sat16 negate can never wrap: no +32768 anomaly;
-      - loud -24576 (frame 102): env_102 = 32510 (releases 32766 ->
-        32638 over the corner's capture frame, -> 32510 at the probe)
-        -> t_neg = 13107 + 8127 = 21234 -> -21234;
-      - +24576 (frame 104): +19660 — the positive clip point, env-free;
-      - +1000 / -1000 (frames 106/108): sub-clip unity BOTH signs —
-        the negative passes through NEGATIVE (the v2.2 rectifier this
-        test replaces mapped -1000 -> +1000);
-      - 401 silent frames (109..509): env releases to 6510;
-      - quiet -24576 (frame 510, driven directly after the bulk advance
-        — a _wait_left_start called exactly at a WS fall races its
-        first lrclk read): env_510 = attack (6510+24576)>>1 = 15543
-        -> t_neg = 13107 + 3885 = 16992 -> -16992 (vs -21234 loud on
-        the same input — Review Focus 4's two distinct pins);
-      - re-coupling probes on 0x1000, each from a fresh reset (comp
-        gain golden g = 717 after the silent settle; task 10's slewed
-        compressor): en=0x03: s1 = 11472 -> fuzz passes it -> +11472
-        — the fuzz stage receives the COMPED amplitude (PRE-FIX value
-        4096: fuzz read mag(sample_in); comp masked); en=0x05: dist
-        reads a direct saturating |s2| (= s1 with fuzz off) ->
-        dist(11472) = +15156 (pre-fix: dist(4096) = 10240).
-    Since task 11 every pinned value is the fuzz/dist STAGE output read
-    from the RTL s3 tap probe (before tone + gate; guarded, None on GL),
-    and the port output is checked against golden_model.render of the
-    whole frame history (Hist/dirt_frame); the 100 loud frames open
-    the gate for the main run, the fresh-reset probes (gate closed)
-    pin the stage only."""
-    # en[1] fuzz only (ui[2]); octave off (ui[7] = 0): the plain asym fuzz
-    await start(dut, 0b0000_0100)              # at the start of frame 0 (env 0)
-
-    # 100 loud frames (0x7FFF): env attacks to 32766, sticky from frame 15
-    hist = Hist(0x02)                          # tone + gate follow the fuzz
-    for _ in range(100):
-        await i2s_send_and_capture(dut, 0x7FFF << 8)
-        await ClockCycles(dut.clk, 256)
-    hist.add(0x7FFF, 100)
-
-    # corner probe (inline — the sim is at frame 100's start): -32768
-    # with env 32766 -> t_neg 21298 (max) -> -21298
-    got, _, _ = await dirt_frame(dut, hist, -32768, direct=True)  # frames 100, 101
-    assert got in (None, -21298), f"corner -32768: {got} != -21298 (env 32766)"
-
-    async def fuzz_once(word16):
-        # drive word16 in the next frame, capture the frame after; the
-        # pinned value is the fuzz-stage output (RTL s3 tap probe, None on
-        # GL), the port output through tone + gate is golden-checked
-        # (the switches are set by start() — debounced)
-        return (await dirt_frame(dut, hist, word16))[0]
-
-    # loud -24576 (frame 102): env 32510 -> t_neg 21234 -> -21234
-    got = await fuzz_once(-24576)
-    assert got in (None, -21234), f"loud -24576: {got} != -21234 (env 32510)"
-
-    # +24576 (frame 104): positive clip point 19660 (env-free path)
-    got = await fuzz_once(24576)
-    assert got in (None, 19660), f"+24576: {got} != 19660 (t_pos)"
-
-    # sub-clip unity, both signs — the negative KEEPS its sign (the
-    # v2.2 rectifier mapped -1000 -> +1000)
-    got = await fuzz_once(1000)
-    assert got in (None, 1000), f"+1000: {got} != 1000 (sub-clip unity)"
-    got = await fuzz_once(-1000)
-    assert got in (None, -1000), f"-1000: {got} != -1000 (sign kept, no rectify)"
-
-    # 401 silent frames (capture frame 109 + 400 bulk frames 110..509):
-    # env releases to 6510. The quiet probe drives DIRECTLY after the
-    # bulk advance (task-3's pattern) — fuzz_once's leading
-    # _wait_left_start, called exactly at a WS fall, races its first
-    # lrclk read and can return a clk later, shifting the word a frame
-    # (observed: -16992 via frame 510 either way, but only the direct
-    # drive is deterministic).
-    await ClockCycles(dut.clk, 256)             # rest of frame 109
-    await ClockCycles(dut.clk, 512 * 400)       # frames 110..509
-    hist.add(0, 400)
-
-    # quiet -24576 (frame 510): env_510 = attack (6510 + 24576)>>1 =
-    # 15543 -> t_neg = 13107 + 3885 = 16992 -> -16992. Same input as
-    # the loud probe, distinct pin (Review Focus 4)
-    got, _, _ = await dirt_frame(dut, hist, -24576, direct=True)  # frames 510, 511
-    assert got in (None, -16992), f"quiet -24576: {got} != -16992 (env 15543)"
-
-    # re-coupling probes (the mandatory fix): each on a fresh reset, so
-    # the comp gain is golden's post-settle g = 717 (cenv 0). comp+fuzz:
-    # s1 = sat16(4096 * 717 >>> 8) = 11472 (sub-t_pos) -> +11472. PRE-FIX:
-    # 4096 (fuzz read the pre-chain mag) — the probe's purpose
-    async def chain_fresh(en_val, word16):
-        # the gate is still closed on a fresh reset, so the pinned value
-        # is the stage output (RTL s3 tap; None on GL), not the port word
-        await start(dut, en_val << 1, clock=False)
-        h = Hist(en_val)
-        stage, _, _ = await dirt_frame(dut, h, word16, direct=True)
-        return stage, h
-
-    async def recoupled_at_port(h, pre_fix_en):
-        # Gate-level-visible follow-up on the same run: a loud DC pre-roll
-        # opens the gate, then a DC hold of 0x1000 settles the tone, and
-        # the port word is asserted against golden on every frame. The
-        # re-coupling is visible at the port: the same history rendered
-        # with comp OFF (pre_fix_en: what a stage reading the pre-chain
-        # sample would produce) settles to a different word.
-        await _wait_left_start(dut)
-        await prime_gate(dut, h)
-        port, _, i, want, _ = await hold_frames(dut, h, 0x1000)
-        alt, _ = h.render(pre_fix_en)
-        assert port == want[i] != alt[i], f"re-coupling at port: {port} vs pre-fix {alt[i]}"
-
-    got, h = await chain_fresh(0x03, 0x1000)
-    assert got in (None, 11472), \
-        f"comp->fuzz re-coupling: {got} != 11472 (pre-fix value 4096)"
-    await recoupled_at_port(h, 0x02)
-
-    # re-coupling probe 2: comp+dist (fuzz off) — dist reads |s2| = |s1|:
-    # 11472 -> dist(11472) = +15156 (pre-fix: dist(4096) = 10240)
-    got, h = await chain_fresh(0x05, 0x1000)
-    assert got in (None, 15156) and golden_model.dist(11472) == 15156, \
-        f"comp->dist re-coupling: {got} != 15156 (pre-fix value 10240)"
-    await recoupled_at_port(h, 0x04)
-
-
-@cocotb.test()
-async def test_fuzz_octave(dut):
-    """Fuzz octave blend (en[1], v3 task 4; octave switch on ui[7] since
-    task 7): fuzz_out = oct ? sat16(shaped + mag(s1)) : fuzz_core, the
-    50/50 blend with the full-wave-rectified copy. sat16 clamps UPPER
-    only (shaped >= 0 and mag(s1) >= 0, so the blend is >= 0 with the
-    octave on in every reachable state). Every pinned value here is
-    env-free by construction: sub-clip inputs shape to a (< both clip
-    points for any env, since the negative t_neg >= 13107), and the
-    saturating pins saturate for any env (shaped >= 13107 ->
-    shaped + 32767 > 32767). Octave on (ui[7] = 1):
-      +10000 -> sat16(10000 + 10000) = 20000;
-      -10000 -> 20000 — the octave signature: the blend erases the
-        sign (the plain core in test_fuzz_asym keeps it: -10000 ->
-        -10000 octave off);
-      +24576 -> sat16(19660 + 24576) = 32767 (upper rail);
-      -32768 -> 32767 (shaped = t_neg(env) >= 13107, sat-mag 32767 ->
-        saturated for any env).
-    Octave-off contrast on the same words (a fresh run): -10000 ->
-    -10000 (core), +24576 -> 19660. Pins read the RTL s3 tap probe (the
-    fuzz output before tone + gate, guarded); ports are golden-checked."""
-    # en[1] fuzz only (ui[2]) + octave on (ui[7])
-    await start(dut, 0b1000_0100)
-    hist = Hist(0x02, 1)
-    await prime_gate(dut, hist)
-
-    async def oct_once(word16, first=False):
-        # stage value = fuzz output (RTL s3 tap probe, None on GL); the
-        # port word is golden-checked through tone + gate in dirt_frame
-        return (await dirt_frame(dut, hist, word16, direct=first))[0]
-
-    # octave on (ui[7]): the octave blend
-    got = await oct_once(10000, first=True)
-    assert got in (None, 20000), f"oct +10000: {got} != 20000 (blend 2a)"
-    got = await oct_once(-10000)
-    assert got in (None, 20000), f"oct -10000: {got} != 20000 (blend erases sign)"
-    got = await oct_once(24576)
-    assert got in (None, 32767), f"oct +24576: {got} != 32767 (sat16 upper rail)"
-    got = await oct_once(-32768)
-    assert got in (None, 32767), f"oct -32768: {got} != 32767 (sat for any env)"
-
-    # octave off contrast on the same words: the core values (a fresh
-    # run: the golden history carries one constant switch setting)
-    await start(dut, 0b0000_0100, clock=False)
-    hist = Hist(0x02, 0)
-    await prime_gate(dut, hist)
-    got = await oct_once(-10000, first=True)
-    assert got in (None, -10000), f"core -10000: {got} != -10000 (core keeps sign)"
-    got = await oct_once(24576)
-    assert got in (None, 19660), f"core +24576: {got} != 19660 (core clip)"
-
-
-@cocotb.test()
-async def test_fuzz_dist_chain(dut):
-    """Fuzz + dist stacked (en = 0x6, octave off): the task-4 asym fuzz feeds
-    the v3 diode-knee shaper on the CHAIN value — dist consumes
-    mag(s2) with s2 = fuzz_out (signed, octave off; sign from s2[15]).
-    Every expected value is golden_model.dist of the fuzz output; the
-    pins are the RTL s3 tap stage output (guarded), ports golden-checked
-    after a priming run that opens the gate (task 11). Env values are
-    the probe frames' post-update env, model-derived: -20000 frames the env-biased negative clip
-    (after the priming env 9999 attacks to 14999 -> t_neg = 16856 ->
-    fuzz -16856 -> dist -16502);
-    5000 is below the fuzz clip (-> 11144); 10000 is shaped WITHOUT the
-    fuzz clip (fuzz passes it at sub-t_pos unity -> 14788); 20000 clips
-    at t_pos 19660 -> 17203; and an octave-on stacking probe pins the
-    octave-into-dist path on the direct |s2| shaper input: +10000 ->
-    blend sat16(10000+10000) = 20000 (non-negative, so dist's sign
-    input s2[15] reads 0) -> +17288."""
-    await start(dut, 0b0000_1100)  # en[2:1] fuzz + dist, octave off
-    hist = Hist(0x06)
-    await prime_gate(dut, hist, amp=10000)   # env 10000, gate open
-
-    async def chain_once(word16, first=False):
-        # the dist-stage output (RTL s3 tap probe, None on GL); the port
-        # word is golden-checked through tone + gate in dirt_frame
-        return (await dirt_frame(dut, hist, word16, direct=first))[0]
-
-    # -20000 frames the env-biased negative clip: env 9999 after the
-    # priming (the sticky point under a constant 10000), attack to 14999
-    # -> t_neg 16856 -> fuzz -16856 -> dist -16502
-    assert golden_model.dist(golden_model.fuzz(-20000, 14999, 0)) == -16502
-    assert await chain_once(-20000, first=True) in (None, -16502)
-    assert await chain_once(5000) in (None, 11144)    # below the fuzz clip: w 20000
-    assert await chain_once(10000) in (None, 14788)   # fuzz passes 10000; w 40000
-    assert await chain_once(20000) in (None, 17203)   # clip 19660; w 78640
-
-    # octave-on stacking probe (fix round): the octave blend INTO dist —
-    # +10000 -> fuzz blend sat16(10000+10000) = 20000 (>= 0, so the
-    # shaper's sign input s2[15] = 0) -> dist(20000) = +17288. A
-    # shaper magnitude reading fuzz_shaped (10000) instead of the
-    # blended output would emit 14788 — pins the octave-into-dist
-    # path on the direct saturating |s2| (en[1]=1, octave-on case).
-    await start(dut, 0b1000_1100, clock=False)  # octave on (ui[7]), fresh run
-    hist = Hist(0x06, 1)
-    await prime_gate(dut, hist, amp=10000)
-    assert await chain_once(10000, first=True) in (None, 17288)  # blend 20000; w 80000
 
 
 def _probe(dut, *path):
@@ -1182,7 +944,7 @@ async def test_knob_absent_default(dut):
     frame over 5 consecutive frames (and equals 437 * frames since the
     enable reached the chain at EN_SETTLE). Port level: 20 consecutive
     TX words on a constant 16384 equal golden_model (k1 = None)."""
-    await start(dut, 0x10 << 1)               # en[4] trem only, uio_in = 0
+    await start(dut, EN_TREM)                 # trem only (ui[3]), uio_in = 0
     p = _probe(dut, "trem_p")
     if p is not None:
         ps = []
@@ -1194,7 +956,7 @@ async def test_knob_absent_default(dut):
         d = [(b - a) & 0x3FFFFF for a, b in zip(ps, ps[1:])]
         assert d == [437] * 5, f"phase steps {d}"
     f0 = START_FRAME + (6 if p is not None else 0)
-    want = golden_model.render([0] * f0 + [16384] * 21, 0x10)
+    want = golden_model.render([0] * f0 + [16384] * 21, EN_TREM)
     got = await fast_frames(dut, [16384] * 21)
     assert got[1:] == want[f0:f0 + 20], f"got {got[1:]} want {want[f0:f0 + 20]}"
 
@@ -1212,10 +974,10 @@ async def test_trem_smooth(dut):
     frames; the output equals golden_model frame-for-frame and never
     steps by more than TREM_MAX_STEP_16384."""
     knob_pin(dut, 0, 128)
-    await start(dut, 0x10 << 1)
+    await start(dut, EN_TREM)
     n = 2000
     got = (await fast_frames(dut, [16384] * (n + 1)))[1:]
-    want = golden_model.render([0] * START_FRAME + [16384] * n, 0x10, k1=128)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + [16384] * n, EN_TREM, k1=128)[START_FRAME:]
     first = next((i for i in range(n) if got[i] != want[i]), None)
     assert first is None, f"frame {first}: got {got[first]} want {want[first]}"
     step = max(abs(a - b) for a, b in zip(got, got[1:]))
@@ -1238,16 +1000,16 @@ async def test_trem_rate_change(dut):
     run is 900 frames."""
     kp = knob_pin(dut, 0, 128)
     fast_knobs(dut, 1, 2, 3)
-    await start(dut, 0x10 << 1)
+    await start(dut, EN_TREM)
     pre = (await fast_frames(dut, [16384] * 201))[1:]
-    want = golden_model.render([0] * START_FRAME + [16384] * 200, 0x10, k1=128)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + [16384] * 200, EN_TREM, k1=128)[START_FRAME:]
     assert pre == want, "pre-change output must equal golden (k1=128)"
     kp.v = 250
     post = await fast_frames(dut, [16384] * 900)
     seq = pre + post[1:]
     step = max(abs(a - b) for a, b in zip(seq, seq[1:]))
     assert step <= TREM_MAX_STEP_16384, f"max |dout| across the change {step}"
-    keep = golden_model.render([0] * START_FRAME + [16384] * 1100, 0x10, k1=128)[START_FRAME + 200:]
+    keep = golden_model.render([0] * START_FRAME + [16384] * 1100, EN_TREM, k1=128)[START_FRAME + 200:]
     ndiff = sum(1 for a, b in zip(post, keep) if a != b)
     assert ndiff > 200, f"post-change output tracks the k1=128 render ({ndiff} diffs): rate did not change"
     kval, kpres = _probe(dut, "k1_value"), _probe(dut, "k1_present")
@@ -1264,21 +1026,18 @@ async def test_chain_enables(dut):
     ON applies its effect to known vectors (incl. -32768 — the output
     also proves every DOWNSTREAM stage passes bit-exact when disabled);
     with all en=0 the chain is bit-exact identity and +-32768 round-trip
-    (Review Focus 3: no disabled stage may corrupt the sample). The Rev A
-    identity-stub slot (delay en[5]) must pass +-full-scale bit-exact
+    (Review Focus 3: no disabled stage may corrupt the sample). The delay
+    (no PSRAM fitted in this test: dry) must pass +-full-scale bit-exact
     when enabled — the enable itself corrupts nothing (comp is live from
-    task 3; the phaser en[3] from Task 16, golden-checked). Fuzz +
-    dist stacked: the task-4 asym fuzz feeds the shaper mag(s2) (both
-    fuzz clip points sit above the dist knees; dist is the v3 diode
-    knee, octave off). Since task 11 the fuzz/dist-on pins are the stage
-    output (RTL s3 tap probe, guarded) because the port word is then
+    task 3; the phaser from Task 16, golden-checked). Since task 11 the
+    dist-on pins are the stage output (RTL s3 tap probe, guarded) because the port word is then
     tone-filtered and gated; the dirt-off stacks still pin the port."""
     # trem first, on a fresh reset (K1 absent -> inc 437): the expected
     # words come from golden_model.render of the whole frame history
-    await start(dut, 0b0010_0000)             # en[4] trem only (ui[5])
+    await start(dut, EN_TREM)                 # trem only (ui[3])
     xs = [16384, -32768, 0]
     got = await fast_frames(dut, xs)
-    want = golden_model.render([0] * START_FRAME + xs, 0x10)
+    want = golden_model.render([0] * START_FRAME + xs, EN_TREM)
     assert got[1] == want[START_FRAME] == (16384 * golden_model.trem_gain(
         437 * (START_FRAME + 1 - golden_model.EN_SETTLE))) >> 8, f"trem ON 16384: {got[1]}"
     assert got[2] == want[START_FRAME + 1], f"trem ON -32768: {got[2]} != {want[START_FRAME + 1]}"
@@ -1292,43 +1051,41 @@ async def test_chain_enables(dut):
     # +-full-scale words equal golden render and are not identity (the
     # 50/50 dry/allpass mix).
     xs = [-32768, 32767, -32768, 0]
-    for en_val in (0x08, 0x29):
-        await start(dut, en_val << 1, clock=False)
+    for en_val in (EN_PHASER, EN_COMP | EN_PHASER | EN_DELAY):
+        await start(dut, en_val, clock=False)
         got = await fast_frames(dut, xs)
         want = golden_model.render([0] * START_FRAME + xs, en_val)[START_FRAME:]
         assert got[1:] == want[:3], f"en {en_val:#x}: {got[1:]} != golden {want[:3]}"
         assert got[1:] != xs[:3], f"en {en_val:#x}: phaser must not be identity"
 
-    # every other stage on a fresh reset (env = 0 after the silent
-    # settle) so the env-dependent pins can be derived from the golden
-    # model's Env: ref (golden Chain) mirrors every frame driven (x, then the 0
-    # capture frame) and the silent settle after each enable change.
-    await start(dut, 0b0000_0100, clock=False)   # en[1] fuzz only (ui[2])
+    # every other stage on a fresh reset: ref (golden Chain) mirrors
+    # every frame driven (x, then the 0 capture frame) and the silent
+    # settle after each enable change.
+    await start(dut, EN_DIST, clock=False)       # dist only (ui[1])
     # ref = golden_model.Chain driven frame-by-frame (every frame sent,
-    # and the silent settle after each enable change): its env/comp/tone/
-    # gate state yields the env-dependent pins AND the golden port word
-    # of every probe (silent frames output 0 in any enable setting, so
-    # the en split inside a settle run is immaterial).
+    # and the silent settle after each enable change): its comp/tone/
+    # gate state yields the golden port word of every probe (silent
+    # frames output 0 in any enable setting, so the en split inside a
+    # settle run is immaterial).
     ref = golden_model.Chain()
     for _ in range(START_FRAME):
         ref.step(0, 0)
-    state = {"en": 0x02, "e": 0, "g": ref.cst.g}
+    state = {"en": EN_DIST, "g": ref.cst.g}
 
     async def stage_once(en_val, word16, stage=False):
         """Drive word16, capture the next frame's port word, and assert
         it equals golden's output for the frame (Chain history: tone,
         gate, comp, every stage). stage=True (a dirt-on stack, task 11:
         the port word is tone/gate filtered and gated) returns instead
-        the RTL s3 tap probe — the fuzz/dist stage output the tone filter
+        the RTL s3 tap probe — the dist stage output the tone filter
         sees (cs sampled at step 4 by _s3_monitor, after CHAIN_MAX_CLK clk) — or None where the probe
         is absent (flat GL netlist; there the golden port assertion is
         the check — the gate is cold on these single frames, so the port
         word is golden's, mostly 0: the port-level tone/gate coverage is
         test_tone_lpf / test_gate_hysteresis / test_chain_latency and the
-        DC-hold probes of test_dist_diode / test_fuzz_asym /
-        test_drive_*)."""
+        DC-hold probes of test_dist_diode / test_drive_*)."""
         if en_val != state["en"]:
-            await resettle(dut, en_val << 1)     # ui[6:1] = en; debounced
+            await resettle(dut, en_val)          # ui[5:0] = en; debounced
             for _ in range(SETTLE_FRAMES):
                 ref.step(0, en_val)
             state["en"] = en_val
@@ -1340,7 +1097,6 @@ async def test_chain_enables(dut):
             p = _s3_probe()
             probe = None if p is None else _signed(p)
         want, s3 = ref.step(word16, en_val)      # the x frame
-        state["e"] = ref.env.v                   # env after the x frame
         state["g"] = ref.cst.g                   # comp gain for the x frame
         await _wait_left_start(dut)
         bits = await i2s_send_and_capture(dut, 0)
@@ -1351,45 +1107,22 @@ async def test_chain_enables(dut):
         assert probe in (None, s3), f"en {en_val:#x} word {word16}: s3 tap {probe} != golden {s3}"
         return probe if stage else out
 
-    # fuzz ON: the task-4 asym clip — -32768 sat-mags to 32767 and
-    # clips at the env-biased negative point (env from the golden
-    # model: 16383 after the first attack -> t_neg 17202); 5000 passes
-    # below both clip points at unity
-    got = await stage_once(0x2, -32768, stage=True)
-    assert golden_model.fuzz(-32768, state["e"], 0) == -17202
-    assert got in (None, -17202)
-    got = await stage_once(0x2, 5000, stage=True)
-    assert golden_model.fuzz(5000, state["e"], 0) == 5000
-    assert got in (None, 5000)
-
     # dist ON: diode-knee PWL, fixed drive x4 (expected values from
     # golden_model.dist); 1234 the linear piece, 20000 the top piece
     for x, want in ((-32768, -20479), (1234, 4936), (20000, 17288)):
         assert golden_model.dist(x) == want
-        assert await stage_once(0x4, x, stage=True) in (None, want)
+        assert await stage_once(EN_DIST, x, stage=True) in (None, want)
 
-    # delay en[5] (identity stub until Task 22) must pass +-full-scale
+    # delay (no PSRAM fitted here: dry) must pass +-full-scale
     # bit-exact when enabled, through the slot AND every disabled stage;
     # comp en[0] is live: its value is golden comp at the frame's gain g
     # (after the silences here g >= 256, so +-full-scale saturates and
     # reads identity). (The phaser is pinned above, from reset.)
     for x in (-32768, 32767):                         # comp (sat16 gain)
-        got = await stage_once(0x1, x)
+        got = await stage_once(EN_COMP, x)
         assert got == golden_model.comp(x, state["g"]) == x, f"comp {x}: {got} (g {state['g']})"
-    assert await stage_once(0x20, -32768) == -32768   # delay stub
-    assert await stage_once(0x20, 32767) == 32767
-
-    # fuzz + dist stacked: the task-4 asym fuzz feeds the shaper mag(s2).
-    # (input, fuzz-stage output): -20000 clips at the env-biased negative
-    # point (t_neg = 15891 at this env, below 20000); 5000 is below both
-    # clip points (unity); 20000 clips at t_pos 19660. The fuzz column is a
-    # literal cross-checked against golden fuzz, so the clip intent is
-    # asserted; the RTL must equal golden dist of that value.
-    for x, fuzzed in ((-20000, -15891), (5000, 5000), (20000, 19660)):
-        got = await stage_once(0x6, x, stage=True)
-        assert golden_model.fuzz(x, state["e"], 0) == fuzzed
-        want = golden_model.dist(fuzzed)
-        assert got in (None, want), f"fuzz+dist({x}): {got} != {want}"
+    assert await stage_once(EN_DELAY, -32768) == -32768   # delay, no PSRAM: dry
+    assert await stage_once(EN_DELAY, 32767) == 32767
 
     # all stages OFF: bit-exact identity, +-full-scale through
     assert await stage_once(0x0, 32767) == 32767
@@ -1400,31 +1133,32 @@ async def test_chain_enables(dut):
 async def test_enable_bounce(dut):
     """Switch debounce (v3 task 7): a burst of contact bounce on an
     enable followed by a stable level must produce exactly ONE clean
-    transition on the output — never a glitch back. Fuzz (ui[2]) on a
+    transition on the output — never a glitch back. Dist (ui[1]) on a
     constant 20000 input: off -> 20000 (identity), on -> the tone
-    low-pass of golden fuzz(20000) = 19660 (positive clip point,
-    env-free), which settles from ~20000 down to golden's steady value
-    over a few frames (task 11; the gate is open on the loud constant).
+    low-pass of golden dist(20000) = 17288 (top knee piece, drive x4),
+    which settles from 20000 down to golden's steady value over a few
+    frames (task 11; the gate is open on the loud constant).
     The debounce samples every 256 frames and needs two agreeing ticks,
     so the switch toggles every 5 frames for 200 frames (at most one
     tick inside the burst), then holds; the engage output must start at
-    20000, only ever fall (a bounce glitch back would rise), and end at
+    20000, only ever FALL (a bounce glitch back would rise), and end at
     the steady value, its first change within 600 frames of the hold.
     The release repeats the burst toward 0: exactly one steady -> 20000
     transition (dirt off is identity at once)."""
     await start(dut, 0)
 
     off_val = 20000
-    assert golden_model.fuzz(20000, 0, 0) == 19660
-    tg = golden_model.ToneGate()         # tone: settled on 20000, then 19660
+    assert golden_model.dist(20000) == 17288
+    tg = golden_model.ToneGate()         # tone: settled on 20000, then the dist output
     for _ in range(300):
         tg.tone(20000)
     for _ in range(300):
-        on_val = tg.tone(19660)
-    assert on_val == 19660               # approached from above: exact
+        on_val = tg.tone(golden_model.dist(20000))
+    assert on_val in (17288, 17289)      # approached from above (1-LSB floor possible)
+    sw_on = EN_DIST
 
     async def frame(ui):
-        dut.ui_in.value = ui                       # between frames: bit0 low
+        dut.ui_in.value = ui                       # between frames
         bits = await i2s_send_and_capture(dut, off_val << 8)
         await ClockCycles(dut.clk, 256)
         out = tx_data_bits(bits)
@@ -1433,10 +1167,10 @@ async def test_enable_bounce(dut):
     async def bounce_then_hold(level):
         outs = []
         for i in range(200):                       # the burst: toggle every 5 frames
-            outs.append(await frame(0b100 if ((i // 5) & 1) == 0 else 0))
+            outs.append(await frame(sw_on if ((i // 5) & 1) == 0 else 0))
         hold_start = len(outs)
         for _ in range(600):                       # held at its final level
-            outs.append(await frame(0b100 if level else 0))
+            outs.append(await frame(sw_on if level else 0))
         return outs, hold_start
 
     # prime: let the constant input reach the output
@@ -1446,22 +1180,23 @@ async def test_enable_bounce(dut):
     # engage: bounce (toggle every 5 frames, 200 frames), then hold on
     outs, hold_start = await bounce_then_hold(1)
     trans = [i for i in range(1, len(outs)) if outs[i] != outs[i - 1]]
-    assert outs[0] == off_val, "must start un-fuzzed"
-    assert all(b <= a for a, b in zip(outs, outs[1:])), "engage output rose again (glitch back)"
+    assert outs[0] == off_val, "must start clean"
+    assert all(a >= b for a, b in zip(outs, outs[1:])), "engage output rose again (glitch back)"
     assert trans and outs[-1] == on_val, f"engage must settle at {on_val}, got {outs[-1]}"
     assert trans[0] - hold_start <= 600, f"engage began {trans[0] - hold_start} frames after the hold"
-    assert all(outs[i] == on_val for i in range(trans[0] + 20, len(outs))), "engage must settle within 20 frames"
+    # the tone one-pole (kt 2) crosses the 20000 -> 17288 gap within 40 frames
+    assert all(outs[i] == on_val for i in range(trans[0] + 40, len(outs))), "engage must settle within 40 frames"
 
     # release: bounce toward 0 starting from level 1, then hold 0
     outs = []
     for i in range(200):
-        outs.append(await frame(0 if ((i // 5) & 1) == 0 else 0b100))
+        outs.append(await frame(0 if ((i // 5) & 1) == 0 else sw_on))
     hold_start = len(outs)
     for _ in range(600):
         outs.append(await frame(0))
     assert set(outs) <= {off_val, on_val}, f"unexpected output values {set(outs)}"
     trans = [i for i in range(1, len(outs)) if outs[i] != outs[i - 1]]
-    assert outs[0] == on_val, "release phase must start fuzzed"
+    assert outs[0] == on_val, "release phase must start distorted"
     assert len(trans) == 1, f"release must switch exactly once, transitions at {trans}"
     assert outs[trans[0]] == off_val and outs[-1] == off_val
     assert trans[0] - hold_start <= 600, f"release settled {trans[0] - hold_start} frames after the hold"
@@ -1469,13 +1204,14 @@ async def test_enable_bounce(dut):
 
 @cocotb.test()
 async def test_pin_map(dut):
-    """Rev B pin map at reset and idle: uio_oe = {1,1,k4,k3,k2,k1,1,1}
-    (uio[7:6] + uio[1:0] outputs; uio[5:2] are the knob pins K4..K1,
-    driven low only while the round-robin reader discharges that pin:
-    K1 alone in reset and for the first 1024 clk after it, the others
-    released), uio_out[5:2] = 0,
-    uo[3:0] = 0b0010 (SPI SCK low, CS high, MOSI low, 595 RCLK low)
-    with the dp LED and uo[6:4] dark."""
+    """Rev B3 final pin map (DIP-safe): uio_oe = {0,1,k4,k3,k2,k1,0,1}
+    (uio[6] BCLK + uio[0] MCLK outputs; uio[7] PSRAM MISO and uio[1] ADC
+    data are inputs at EVERY clk — Review Focus 4: an input pin driven
+    into the ADC/PSRAM output would fight it; uio[5:2] are the knob pins
+    K4..K1, driven low only while the round-robin reader discharges that
+    pin: K1 alone in reset and for the first 1024 clk after it),
+    uio_out[5:2] = 0, uo = {dp 0, CS0 hold 1, 0, LRCLK, DAC, MOSI 0,
+    CE# 1, SCK 0} at idle."""
     cocotb.start_soon(
         Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2).start())
     dut.ena.value = 1
@@ -1485,23 +1221,29 @@ async def test_pin_map(dut):
     await ClockCycles(dut.clk, 10)
     # asserted straight away in reset too — the idle level must not depend on state
     await Timer(1, unit="ns")
-    assert dut.uio_oe.value == 0b1100_0111, f"uio_oe in reset: {dut.uio_oe.value}"
+    assert dut.uio_oe.value == 0b0100_0101, f"uio_oe in reset: {dut.uio_oe.value}"
     assert int(dut.uio_out.value) & 0b0011_1100 == 0, "uio_out[5:2] must be 0 in reset"
-    assert int(dut.uo_out.value) & 0x07 == 0b010, "uo[2:0] must idle SCK=0 CS=1 MOSI=0 in reset"
+    assert int(dut.uo_out.value) & 0xE7 == 0x42, "uo must idle dp=0 CS0=1 uo5=0 SCK=0 CS=1 MOSI=0 in reset"
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 1020)
     await Timer(1, unit="ns")
-    assert dut.uio_oe.value == 0b1100_0111, "K1 alone must discharge for 1024 clk"
+    assert dut.uio_oe.value == 0b0100_0101, "K1 alone must discharge for 1024 clk"
     await ClockCycles(dut.clk, 10)
     await Timer(1, unit="ns")
-    assert dut.uio_oe.value == 0b1100_0011, "K1 must release after the discharge"
+    assert dut.uio_oe.value == 0b0100_0001, "K1 must release after the discharge"
     assert int(dut.uio_out.value) & 0b0011_1100 == 0, "uio_out[5:2] must be 0"
+    # every knob phase (4 discharges + charges, all knobs absent: the
+    # 65536-clk timeout each), sampled every 64 clk: uio[7] and uio[1]
+    # never driven, uio[6] and uio[0] always driven
+    for _ in range(4 * 67000 // 64):
+        await ClockCycles(dut.clk, 64)
+        oe = int(dut.uio_oe.value)
+        assert oe & 0b1000_0010 == 0, f"uio[7]/uio[1] driven: uio_oe {oe:08b}"
+        assert oe & 0b0100_0001 == 0b0100_0001, f"uio[6]/uio[0] not driven: uio_oe {oe:08b}"
     await start(dut, 0, clock=False)
-    assert int(dut.uio_oe.value) & 0b1100_0011 == 0b1100_0011, f"uio_oe: {dut.uio_oe.value}"
-    assert int(dut.uo_out.value) & 0x07 == 0b010, \
-        f"uo[2:0] must idle SCK=0 CS=1 MOSI=0, got {int(dut.uo_out.value) & 7:03b}"
-    assert int(dut.uo_out.value) == 0x02, "uo[7:3] must be 0 at idle (dp dark, 595 RCLK low)"
-    assert (int(dut.uo_out.value) >> 3) & 1 == 0, "uo[3] (595 RCLK) must idle low"
+    assert int(dut.uio_oe.value) & 0b1100_0011 == 0b0100_0001, f"uio_oe: {dut.uio_oe.value}"
+    assert int(dut.uo_out.value) & 0xE7 == 0x42, \
+        f"uo must idle 0x42 (LRCLK/DAC masked), got {int(dut.uo_out.value):08b}"
 
 
 @cocotb.test()
@@ -1518,17 +1260,15 @@ async def test_clip_dp(dut):
     to 2047 (~2048 frames ~ 43 ms at 48 kHz) and clears dp_q on the
     wrap edge; a new hit mid-hold restarts it (peak-hold).
     Full-scale is driven with en=0 (DIP all-off — digital clean): dist never
-    emits full-scale (soft ceiling 20479) and the plain fuzz clips below
-    the rails (only the octave blend saturates, and fuzz is off here
-    anyway), but the identity chain passes sample_in = 0x7FFF exactly. Phases, DIP all-off
+    emits full-scale (soft ceiling 20479), but the identity chain passes sample_in = 0x7FFF exactly. Phases, DIP all-off
     throughout:
       - 100 mid-level (0x1000) frames: dp stays dark (the LED is
         sticky for ~2048 frames, so one end-of-phase probe covers all
         100 frames);
       - ONE 0x7FFF frame: dp still dark right after the drive (the hit
         clocks at the frame's sample_valid edge, early in the right
-        half), lit by the end of that frame; uo[6:0] (reserved, idle:
-        SPI CS high on uo[1], rest 0) stay 0x02;
+        half), lit by the end of that frame; uo[6:5] and the SPI
+        pins (idle: CS0 hold 1, uo[5] 0, CS high, SCK/MOSI 0) stay idle;
       - input returns to 0x1000: dp holds on its own — still lit 1000
         frames later, and at hold-frame 2040 (a half-length hold would
         already be dark; the clear comes at 2048);
@@ -1541,9 +1281,10 @@ async def test_clip_dp(dut):
         return int(dut.uo_out[7].value)
 
     def seg_ok():
-        # uo[6:0] are reserved and idle (SPI CS high on uo[1], rest 0):
-        # the dp must never disturb them — PORT-level assert, active in GL too
-        return (int(dut.uo_out.value) & 0x7F) == 0x02
+        # uo[6:5] (CS0 hold 1, 0) and the SPI idle (CS high on uo[1],
+        # SCK/MOSI 0) — LRCLK/DAC (uo[4:3]) masked: the dp must never
+        # disturb them — PORT-level assert, active in GL too
+        return (int(dut.uo_out.value) & 0x67) == 0x42
 
     # 100 mid-level frames (frames 0..99): dp never lights
     for _ in range(100):
@@ -1551,7 +1292,7 @@ async def test_clip_dp(dut):
         await ClockCycles(dut.clk, 256)
     await Timer(1, unit="ns")
     assert dp() == 0, "mid-level frames must never light the dp"
-    assert seg_ok(), "uo[6:0] must stay idle (0x02) with the dp dark"
+    assert seg_ok(), "uo idle bits must stay 0x42 with the dp dark"
 
     # frame 100: ONE full-scale frame. The helper returns at the start
     # of the right half, before the strobe edge, so dp is still dark
@@ -1563,7 +1304,7 @@ async def test_clip_dp(dut):
     await ClockCycles(dut.clk, 256)              # rest of the clip frame
     await Timer(1, unit="ns")
     assert dp() == 1, "one full-scale frame must light the dp (uo[7])"
-    assert seg_ok(), "uo[6:0] must stay idle (0x02) during the clip"
+    assert seg_ok(), "uo idle bits must stay 0x42 during the clip"
 
     # frame 101: input returns to mid-level — from here the dp must
     # hold with no full-scale anywhere in the input
@@ -1588,27 +1329,28 @@ async def test_clip_dp(dut):
     await ClockCycles(dut.clk, 512 * 172)
     await Timer(1, unit="ns")
     assert dp() == 0, "dp must clear within 2048+64 frames of the clip frame"
-    assert seg_ok(), "uo[6:0] must still read idle (0x02) after the dp clears"
+    assert seg_ok(), "uo idle bits must still read 0x42 after the dp clears"
 
 
 @cocotb.test()
 async def test_chain_latency(dut):
     """Task 8 (sequenced chain): pins the chain's frame-level latency
     and the clip-LED timing across the combinational -> 6-step refactor.
-    (a) en = 0x17 (comp + fuzz + dist + trem; ui_in = 0x2E): three known frames then a zero frame; each
+    (a) en = comp + dist + trem: three known frames then a zero frame; each
     TX value (captured one frame after its input, mono contract) equals
     golden_model.render of the same input history — the silent settle
     frames are rendered too so env and the trem LFO line up. (b) en = 0:
     a 0x7FFF frame lights uo[7] within CHAIN_MAX_CLK clk of the frame's
     strobe (not before it), well before the frame's TX load of the
     NEXT frame, and a mid-level frame in the same position does not.
-    (c) RTL probe, every effect on (en = 0x3F, octave on): chain_done
+    (c) RTL probe, every DIP on (ui_in = 0xFF): chain_done
     pulses once per frame, at most CHAIN_MAX_CLK clk after sample_valid
     (Task 15a: the multiplier steps wait for the serial multiplier)."""
     ins = [12000, -20000, 30000, 0]
-    await start(dut, 0x17 << 1)
+    en = EN_COMP | EN_DIST | EN_TREM
+    await start(dut, en)
     xs = [0] * START_FRAME + ins
-    want = golden_model.render(xs, 0x17)
+    want = golden_model.render(xs, en)
     for j, x in enumerate(ins):
         bits = await i2s_send_and_capture(dut, (x & 0xFFFF) << 8)
         await _wait_left_start(dut)
@@ -1636,7 +1378,7 @@ async def test_chain_latency(dut):
     # (c) chain_done bound, every effect on (RTL probe)
     sv, cd = _probe(dut, "sample_valid"), _probe(dut, "chain_done")
     if sv is not None:
-        await start(dut, 0xFE, clock=False)     # en = 0x3F, octave on
+        await start(dut, 0xFF, clock=False)     # every DIP on
         for _ in range(3):
             while int(sv.value) != 1:
                 await ClockCycles(dut.clk, 1)
@@ -1663,9 +1405,9 @@ async def test_tone_lpf(dut):
     for i, (name, xs) in enumerate((
             ("nyquist", [8000 if j % 2 == 0 else -8000 for j in range(n)]),
             ("dc", [8000] * n))):
-        await start(dut, 0b0000_1000, clock=(i == 0))   # en[2] dist only
+        await start(dut, EN_DIST, clock=(i == 0))   # dist only
         got = await fast_frames(dut, xs + [0])
-        want = golden_model.render([0] * START_FRAME + xs, 0x04)[START_FRAME:]
+        want = golden_model.render([0] * START_FRAME + xs, EN_DIST)[START_FRAME:]
         assert got[1:] == want, f"{name}: first mismatch at " \
             f"{next(j for j in range(n) if got[1 + j] != want[j])}"
         if name == "nyquist":
@@ -1693,7 +1435,7 @@ async def test_gate_hysteresis(dut):
          still 1 at post-close frame 254 and exactly 0 from frame 255
          on, i.e. after exactly 256 frames (golden); the whole run is
          exact against golden."""
-    await start(dut, 0b0000_1000)                     # en[2] dist only
+    await start(dut, EN_DIST)                     # dist only
     probe = _probe(dut, "gate_open")
     assert probe is not None or _probe(dut, "step") is None, "RTL has no gate_open"
 
@@ -1739,7 +1481,7 @@ async def test_gate_hysteresis(dut):
     # 4. gg decay, observed on the output
     drive(100, 300)
     got_dc = await fast_frames(dut, [100] * 300 + [0])
-    want = golden_model.render(hist, 0x04)
+    want = golden_model.render(hist, EN_DIST)
     tail = want[-300:]
     assert tail[254] > 0 and tail[255] == 0 and not any(tail[255:]), "golden gg decay"
     assert got_dc[1:] == tail, "decay run differs from golden at " \
@@ -1750,61 +1492,24 @@ async def test_gate_hysteresis(dut):
 
 @cocotb.test()
 async def test_dirt_off_identity(dut):
-    """Tone/gate act only when fuzz or dist is on (v3 task 11). With trem
+    """Tone/gate act only when dist is on (v3 task 11). With trem
     only (en[4]) the chain output equals golden render bit-exactly,
     +-full-scale and -32768 included, and equals the render with the
     tone/gate stage skipped (tgb): the 16.4 tone state runs every frame
     but never reaches the output. With phaser only (Task 16) the words
     equal golden render (the stub's old identity no longer holds)."""
     xs = [32767, -32768, 1000, -1, 0, -32768, 12345, 0]
-    await start(dut, 0b0010_0000)                     # en[4] trem only
+    await start(dut, EN_TREM)                     # trem only
     got = await fast_frames(dut, xs + [0])
-    want = golden_model.render([0] * START_FRAME + xs, 0x10)[START_FRAME:]
-    assert want == golden_model.render([0] * START_FRAME + xs, 0x10, tgb=True)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + xs, EN_TREM)[START_FRAME:]
+    assert want == golden_model.render([0] * START_FRAME + xs, EN_TREM, tgb=True)[START_FRAME:]
     assert got[1:] == want, f"trem only: {got[1:]} != {want}"
-    await start(dut, 0b0001_0000, clock=False)        # en[3] phaser only
+    await start(dut, EN_PHASER, clock=False)        # phaser only
     got = await fast_frames(dut, xs + [0])
-    want = golden_model.render([0] * START_FRAME + xs, 0x08)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + xs, EN_PHASER)[START_FRAME:]
     assert got[1:] == want, f"phaser only: {got[1:]} != {want}"
 
 
-@cocotb.test()
-async def test_env_decay(dut):
-    """Fast envelope release (routed from task 10's review, RTL-only
-    guarded probe): 100 full-scale frames attack env to 32766, then
-    1388 silent frames bring it to exactly 0 (the 1-LSB release floor,
-    golden Env): still non-zero one frame earlier, 0 at frame 1388."""
-    await start(dut, 0b0000_0010)                     # en[0] comp only
-    probe = _probe(dut, "env")
-    assert probe is not None or _probe(dut, "step") is None, "RTL has no env"
-    ref = golden_model.Env()
-    for _ in range(START_FRAME):
-        ref.step(0)
-    for _ in range(100):
-        ref.step(0x7FFF)
-    assert ref.v == 32766
-    n = 0
-    while ref.v:
-        ref.step(0)
-        n += 1
-    assert n == 1388
-    await fast_frames(dut, [0x7FFF] * 100)
-    if probe is not None:
-        assert int(probe.value) == 32766
-    await ClockCycles(dut.clk, 512 * (n - 1))
-    if probe is not None:
-        assert int(probe.value) == 1, f"env one frame before the floor: {int(probe.value)}"
-    await ClockCycles(dut.clk, 512)
-    if probe is not None:
-        assert int(probe.value) == 0, f"env after {n} silent frames: {int(probe.value)}"
-
-
-# ---------------------------------------------------------------------
-# Phaser (Rev B1, Task 16): 4 first-order allpass stages on the shared
-# multiplier (chain steps 6..9), 50/50 mix at step 10, own 22-bit phase
-# (RTL phaser_p, golden Chain.pp) at the K1 rate (shared with trem; 87
-# with K1 absent). Expected values come from golden_model.
-# ---------------------------------------------------------------------
 def _sweep(n, f0, f1, amp):
     """Exponential sine sweep f0 -> f1 Hz over n frames at amplitude amp."""
     import math
@@ -1825,8 +1530,8 @@ async def test_phaser_identity_off(dut):
     """en[3] = 0: the phaser slot passes s4 bit-exactly. (a) en = 0: a
     sweep plus +-full-scale words come out unchanged (s4 = the input),
     while the stage states still run (RTL probe ph_y3: the last stage's
-    output state is non-zero, the phaser is warm). (b) en = 0x02 (fuzz,
-    the gate in): the port words equal golden render, i.e. s4."""
+    output state is non-zero, the phaser is warm). (b) dist on (the
+    tone/gate in): the port words equal golden render, i.e. s4."""
     xs = _sweep(300, 200, 4000, 8000) + [32767, -32768, 32767, -32768, 0]
     await start(dut, 0)
     got = await fast_frames(dut, xs + [0])
@@ -1840,11 +1545,11 @@ async def test_phaser_identity_off(dut):
         assert ref.ph.y1[3] != 0
         assert _signed(int(y3.value)) == ref.ph.y1[3], \
             f"ph_y3 {_signed(int(y3.value))} != golden {ref.ph.y1[3]}"
-    await start(dut, 0x02 << 1, clock=False)
+    await start(dut, EN_DIST, clock=False)
     xs2 = _sweep(200, 200, 4000, 8000)
     got = await fast_frames(dut, xs2 + [0])
-    want = golden_model.render([0] * START_FRAME + xs2, 0x02)[START_FRAME:]
-    assert got[1:] == want, f"fuzz, phaser off: frame {_first_diff(got[1:], want)}"
+    want = golden_model.render([0] * START_FRAME + xs2, EN_DIST)[START_FRAME:]
+    assert got[1:] == want, f"dist, phaser off: frame {_first_diff(got[1:], want)}"
 
 
 @cocotb.test()
@@ -1857,7 +1562,7 @@ async def test_phaser_coef(dut):
     assert golden_model.phaser_coef(1 << 20) == 3328
     assert golden_model.phaser_coef((1 << 21) - 1) == 2049
     assert golden_model.phaser_coef(1 << 21 | 0x1FF) == golden_model.phaser_coef((1 << 21) - 1)
-    await start(dut, 0x08 << 1)                       # en[3], K1 absent
+    await start(dut, EN_PHASER)                       # phaser, K1 absent
     pp, pc, sv = _probe(dut, "phaser_p"), _probe(dut, "phaser_c"), _probe(dut, "sample_valid")
     if pp is None:
         return
@@ -1882,10 +1587,10 @@ async def test_phaser_sweep(dut):
     """Phaser on, K1 = 250 (inc 976): a 200 Hz - 4 kHz exponential sweep at
     amplitude 8000 for 4000 frames; every port word equals golden."""
     knob_pin(dut, 0, 250)
-    await start(dut, 0x08 << 1)
+    await start(dut, EN_PHASER)
     xs = _sweep(4000, 200, 4000, 8000)
     got = (await fast_frames(dut, xs + [0]))[1:]
-    want = golden_model.render([0] * START_FRAME + xs, 0x08, k1=250)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + xs, EN_PHASER, k1=250)[START_FRAME:]
     first = _first_diff(got, want)
     assert first is None, f"frame {first}: got {got[first]} want {want[first]}"
     assert got != xs and len(set(got)) > 1000, "phaser must change the signal"
@@ -1897,10 +1602,10 @@ async def test_phaser_rails(dut):
     half) for 2000 frames equals golden every frame, and never wraps sign
     against it (the sat16 stage sums). RTL probe: the phase steps by
     PHASER_INC_ABSENT = 87 per frame."""
-    await start(dut, 0x08 << 1)
+    await start(dut, EN_PHASER)
     xs = [32767 if (i // 240) % 2 == 0 else -32767 for i in range(2000)]
     got = (await fast_frames(dut, xs + [0]))[1:]
-    want = golden_model.render([0] * START_FRAME + xs, 0x08)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + xs, EN_PHASER)[START_FRAME:]
     wraps = [i for i, (g, w) in enumerate(zip(got, want)) if (g < 0) != (w < 0) and g and w]
     assert not wraps, f"sign wraps vs golden at frames {wraps[:5]}"
     first = _first_diff(got, want)
@@ -1925,7 +1630,7 @@ async def test_phaser_rate_k1(dut):
     assert golden_model.phaser_inc(250) == golden_model.trem_inc(250) == 976
     assert golden_model.phaser_inc(None) == golden_model.PHASER_INC_ABSENT == 87
     knob_pin(dut, 0, 250)
-    await start(dut, 0x08 << 1)
+    await start(dut, EN_PHASER)
     pp = _probe(dut, "phaser_p")
     nf = 0
     if pp is not None:
@@ -1940,7 +1645,7 @@ async def test_phaser_rate_k1(dut):
         assert d == [976] * 5, f"phase steps {d}"
     f0 = START_FRAME + nf
     xs = _sweep(20, 500, 600, 12000)
-    want = golden_model.render([0] * f0 + xs, 0x08, k1=250)[f0:]
+    want = golden_model.render([0] * f0 + xs, EN_PHASER, k1=250)[f0:]
     got = (await fast_frames(dut, xs + [0]))[1:]
     assert got == want, f"got {got} want {want}"
 
@@ -1986,3 +1691,614 @@ async def test_mult_corners(dut):
             assert int(dut.mt_done.value) == 0, "done must be a 1-clk pulse"
             v2 = int(dut.mt_p.value)
             assert (v2 - (1 << 29) if v2 & (1 << 28) else v2) == a * b, "p must hold after done"
+
+
+
+# ---------------------------------------------------------------------
+# PSRAM SPI engine (Rev B3, Task 21, src/psram_spi.v) against the
+# behavioral APS6404L model test/psram_model.v (tb: psram_en = fitted,
+# psram_so_dly_ps = SO delay, psram_err = protocol error). Bus: uo[0] SCK
+# = clk/2, uo[1] CE#, uo[2] MOSI, MISO on the dedicated uio[7] (tb: SO
+# while the model drives it, else ui_in[7]). SpiMon decodes
+# every CE# low window at the pins (RTL and GL): MOSI and MISO are taken at
+# each SCK rise (MISO is exact there for so_dly 0: the model launches on
+# the fall). Internal probes (ok, phase, rdata, dly_widx, sw) are RTL-only.
+# ---------------------------------------------------------------------
+
+PSRAM_TCE_MAX_CLK = 49 * 2 + 2          # CE# low per transaction <= 49 SCK + 2 clk
+PSRAM_PU_PS = 150_000_000               # >= 150 us after power-up before the first command
+PROBE_W = [(0x010000, 0xA5C3), (0x010002, 0x5A3C)]
+
+
+class SpiMon:
+    def __init__(self, dut):
+        self.dut = dut
+        self.txns = []
+        self.cur = None
+        self.t_rise = None
+        self.min_gap_clk = None
+        cocotb.start_soon(self._run())
+
+    async def _run(self):
+        # prev starts at the idle bus level (CE# high, SCK/MOSI low), not
+        # None: the monitor may be created while the first transaction is
+        # already falling CE#, and a None prev would swallow it (the
+        # 0x66 reset-enable would be missing from txns).
+        prev = 0b10
+        while True:
+            await ValueChange(self.dut.uo_out)
+            v = self.dut.uo_out.value
+            if not v.is_resolvable:
+                continue
+            v = int(v)
+            now = get_sim_time(unit="ps")
+            if prev is not None:
+                if prev & 2 and not v & 2:            # CE# fall
+                    if self.t_rise is not None:
+                        g = (now - self.t_rise) / CLK_PERIOD_PS
+                        self.min_gap_clk = g if self.min_gap_clk is None else min(self.min_gap_clk, g)
+                    self.cur = {"t0": now, "mosi": [], "miso": []}
+                elif not prev & 2 and v & 2 and self.cur is not None:   # CE# rise
+                    c = self.cur
+                    c["clk"] = round((now - c["t0"]) / CLK_PERIOD_PS)
+                    r = _probe(self.dut, "psram", "rdata")
+                    c["rdata"] = int(r.value) if r is not None else None
+                    self.txns.append(self._decode(c))
+                    self.cur = None
+                    self.t_rise = now
+                elif not v & 2 and v & 1 and not prev & 1 and self.cur is not None:  # SCK rise
+                    self.cur["mosi"].append(prev >> 2 & 1)
+                    m = self.dut.miso_pin.value
+                    self.cur["miso"].append(int(m) if m.is_resolvable else 0)
+            prev = v
+
+    @staticmethod
+    def _decode(c):
+        b, q = c["mosi"], c["miso"]
+        word = lambda bits: int("".join(map(str, bits)), 2) if bits else None
+        c["n"] = len(b)
+        c["cmd"] = word(b[:8])
+        c["addr"] = word(b[8:32])
+        c["data"] = word((b if c["cmd"] == 0x02 else q)[32:48])
+        return c
+
+    def summary(self, txns=None):
+        return [(f"{t['cmd']:02x}", t["n"], None if t["addr"] is None else f"{t['addr']:06x}",
+                 None if t["data"] is None else f"{t['data']:04x}", t["clk"])
+                for t in (self.txns if txns is None else txns)]
+
+
+def _probe_seq(phases):
+    """Expected (cmd, nbits, addr, data) of the power-up probe: reset
+    enable, reset, the two pattern writes, then one read pair per tried
+    sample phase."""
+    seq = [(0x66, 8, None, None), (0x99, 8, None, None)]
+    seq += [(0x02, 48, a, d) for a, d in PROBE_W]
+    seq += [(0x03, 48, a, d) for a, d in PROBE_W] * phases
+    return seq
+
+
+def _key(t, data=True):
+    return (t["cmd"], t["n"], t["addr"], t["data"] if data else None)
+
+
+async def psram_start(dut, ui=0, present=True, so_dly_ps=0, uio=0):
+    """Clock + bare reset with the PSRAM model fitted or not; returns
+    (SpiMon, reset-release time ps)."""
+    cocotb.start_soon(
+        Clock(dut.clk, CLK_PERIOD_PS, unit="ps", period_high=CLK_PERIOD_PS // 2).start())
+    dut.psram_en.value = int(present)
+    dut.psram_so_dly_ps.value = so_dly_ps
+    dut.ena.value = 1
+    dut.ui_in.value = ui
+    dut.uio_in.value = uio
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 10)
+    mon = SpiMon(dut)
+    dut.rst_n.value = 1
+    return mon, get_sim_time(unit="ps")
+
+
+def psram_off(dut):
+    dut.psram_en.value = 0
+    dut.psram_so_dly_ps.value = 0
+
+
+def _check_bus(dut, mon):
+    """Every transaction: 8 or 48 SCK, CE# low <= 49 SCK + 2 clk, CE# high
+    >= 2 clk between transactions, no model protocol error."""
+    for t in mon.txns:
+        assert t["n"] in (8, 48), f"transaction of {t['n']} SCK: {mon.summary([t])}"
+        assert t["clk"] <= PSRAM_TCE_MAX_CLK, f"CE# low {t['clk']} clk > {PSRAM_TCE_MAX_CLK}"
+    assert mon.min_gap_clk is None or mon.min_gap_clk >= 2, f"CE# high gap {mon.min_gap_clk} clk"
+    assert int(dut.psram_err.value) == 0, f"model protocol error code {int(dut.psram_err_code.value)}"
+
+
+def _go_pairs(txns):
+    """(write, read) pairs of the go traffic (non-probe addresses)."""
+    t = [x for x in txns if x["n"] == 48 and x["addr"] < 0x010000]
+    pairs = []
+    for i, w in enumerate(t):
+        if w["cmd"] != 0x02:
+            continue                 # a read whose write fell before this window
+        if i + 1 < len(t):
+            assert t[i + 1]["cmd"] == 0x03, "go write not followed by its read"
+            pairs.append((w, t[i + 1]))
+    return pairs
+
+
+def _ok(dut, mon=None):
+    o = _probe(dut, "psram", "ok")
+    return int(o.value) if o is not None else None
+
+
+@cocotb.test()
+async def test_psram_probe_ok(dut):
+    """Model fitted, SO delay 0: >= 150 us after reset the engine sends
+    0x66, 0x99, writes 0xA5C3 @ 0x010000 and 0x5A3C @ 0x010002, reads both
+    back with sample phase 0 (one read pair), sets ok within 20 frames and
+    then runs one write + one read per frame (go). CE# low 8 / 48 SCK
+    within the 49 SCK + 2 clk bound, model protocol flag clear."""
+    try:
+        mon, t_rst = await psram_start(dut)
+        await ClockCycles(dut.clk, 20 * 512)
+        assert mon.txns, "no PSRAM traffic within 20 frames"
+        assert mon.txns[0]["t0"] - t_rst >= PSRAM_PU_PS, \
+            f"first command {(mon.txns[0]['t0'] - t_rst) / 1e6:.1f} us after reset (< 150 us)"
+        seq = [_key(t) for t in mon.txns[:6]]
+        assert seq == _probe_seq(1), f"probe sequence {mon.summary(mon.txns[:6])}"
+        assert len(_go_pairs(mon.txns[6:])) >= 2, f"no go traffic after the probe: {mon.summary()}"
+        mem = dut.psram.mem
+        assert [int(mem[0x10000 + i].value) for i in range(4)] == [0xA5, 0xC3, 0x5A, 0x3C]
+        if _ok(dut) is not None:
+            assert _ok(dut) == 1 and int(_probe(dut, "psram", "phase").value) == 0
+        _check_bus(dut, mon)
+        dut._log.info(f"probe: {mon.summary(mon.txns[:8])}")
+    finally:
+        psram_off(dut)
+
+
+@cocotb.test()
+async def test_psram_probe_phase1(dut):
+    """SO delayed 45 ns (> half an SCK, 40.7 ns): the phase-0 read pair
+    fails, the reads repeat with phase 1 (sampled at the SCK fall) and
+    pass: ok within 20 frames, phase = 1, go traffic follows."""
+    try:
+        mon, _ = await psram_start(dut, so_dly_ps=45_000)
+        await ClockCycles(dut.clk, 20 * 512)
+        seq = [_key(t, data=False) for t in mon.txns[:8]]
+        want = [(c, n, a, None) for c, n, a, _ in _probe_seq(2)]
+        assert seq == want, f"probe sequence {mon.summary(mon.txns[:8])}"
+        assert len(_go_pairs(mon.txns[8:])) >= 2, f"no go traffic after the probe: {mon.summary()}"
+        if _ok(dut) is not None:
+            assert _ok(dut) == 1 and int(_probe(dut, "psram", "phase").value) == 1
+        _check_bus(dut, mon)
+    finally:
+        psram_off(dut)
+
+
+@cocotb.test()
+async def test_psram_absent(dut):
+    """No PSRAM: uio[7] (the MISO) is just the tb's drive level, so the
+    probe reads 0x0000 (low) or 0xFFFF (high) and fails with both phases:
+    ok = 0, no go traffic. With the delay switch (ui[4]) on, the debounced en[4] rises at
+    the debounce (strobe 512) and reprobes once, which fails again.
+    CE# then stays high."""
+    try:
+        for sw in (0, 1):
+            # ui[4] = the delay enable (drives the reprobe), uio[7] = the
+            # MISO level the absent-model probe reads back
+            mon, _ = await psram_start(dut, ui=sw << 4, present=False, uio=sw << 7)
+            await ClockCycles(dut.clk, 30 * 512)
+            got = [_key(t) for t in mon.txns]
+            rd = 0xFFFF if sw else 0x0000
+            want = [(c, n, a, d if c != 0x03 else rd) for c, n, a, d in _probe_seq(2)]
+            assert got == want, f"sw {sw}: {mon.summary()}"
+            if sw:
+                await ClockCycles(dut.clk, 600 * 512)
+                more = mon.txns[len(want):]
+                assert more, "en[4] rising must reprobe"
+                assert [_key(t) for t in more[-6:]] == want[-6:], f"reprobe {mon.summary(more)}"
+                assert not [t for t in more if t["n"] == 48 and t["addr"] < 0x010000], "go traffic"
+            n = len(mon.txns)
+            await ClockCycles(dut.clk, 100 * 512)
+            assert len(mon.txns) == n and int(dut.uo_out.value) >> 1 & 1, \
+                f"sw {sw}: CE# activity after the failed probe"
+            if _ok(dut) is not None:
+                assert _ok(dut) == 0
+            _check_bus(dut, mon)
+    finally:
+        psram_off(dut)
+
+
+@cocotb.test()
+async def test_psram_rw(dut):
+    """Write / read round trip through go (Task 21 wiring, wdata now
+    quant12'd by the Task 22 delay: waddr = the ring write index dly_widx,
+    raddr = (widx + 1 - dly) mod 32768). Effects off (identity). RTL:
+    dly_len is forced to 1 so raddr = widx and every go reads back the
+    word it just wrote. GL (no force): dly = 16800, so the read lands
+    16799 words behind the write and must return the model's word there. Three addresses (RTL: dly_widx set to 0x0005, 0x2AAA,
+    0x7FFE so the third round covers the top word and the 15-bit wrap; GL:
+    consecutive). Checked at the pins (write data, read address, read data
+    on SO), in the model's memory, and (RTL) in rdata."""
+    try:
+        mon, _ = await psram_start(dut)
+        await ClockCycles(dut.clk, 22 * 512)
+        await _wait_left_start(dut)
+        wp = _probe(dut, "dly_widx")
+        dl = _probe(dut, "dly_len")
+        if dl is not None:
+            dl.value = Force(1)
+        # quant12-invariant words (Task 22: the engine writes quant12(effect_sample))
+        words = [0x1230, 0xBEF0, 0x7000]
+        rounds = []
+        for k, (base, w) in enumerate(zip((0x0005, 0x2AAA, 0x7FFE), words)):
+            if wp is not None:
+                wp.value = base
+            n0 = len(mon.txns)
+            await fast_frames(dut, [w, 0, 0])
+            rounds.append(mon.txns[n0:])
+        for w, txns in zip(words, rounds):
+            pairs = _go_pairs(txns)
+            wr = [p for p in pairs if p[0]["data"] == w]
+            assert wr, f"{w:#06x} never written: {mon.summary(txns)}"
+            a = wr[0][0]["addr"]
+            rd = wr[0][1]                   # the same go's read (write, then read)
+            assert rd is not None, "no read after the write"
+            mem = dut.psram.mem
+            assert (int(mem[a].value) << 8 | int(mem[a + 1].value)) == w
+            ra = a if dl is not None else (a + 2 * (1 - golden_model.DELAY_ABSENT)) % 0x10000
+            want = w if dl is not None else (int(mem[ra].value) << 8 | int(mem[ra + 1].value))
+            assert rd["addr"] == ra, f"read {rd['addr']:#08x} != {ra:#08x} (write {a:#08x})"
+            assert rd["data"] == want, f"SO read {rd['data']:#06x} != {want:#06x}"
+            if rd["rdata"] is not None:
+                assert rd["rdata"] == want, f"rdata {rd['rdata']:#06x} != {want:#06x}"
+            dut._log.info(f"round trip {w:#06x} @ byte {a:#08x}")
+        if wp is not None:
+            addrs = [_go_pairs(t)[[p[0]["data"] for p in _go_pairs(t)].index(w)][0]["addr"]
+                     for w, t in zip(words, rounds)]
+            assert addrs == [0x000C, 0x5556, 0xFFFE], [hex(x) for x in addrs]
+        _check_bus(dut, mon)
+    finally:
+        dl = _probe(dut, "dly_len")
+        if dl is not None:
+            dl.value = Release()
+        psram_off(dut)
+
+
+@cocotb.test()
+async def test_delay_enable_switch(dut):
+    """ui[4] = the delay enable, a plain debounced switch (Rev B3 final;
+    the MISO is uio[7]). With the PSRAM fitted and running (all-ones
+    samples written and read back on uio[7]), switching ui[4] on must
+    reach en[4] at the debounce (strobe 512) and must NOT reprobe the
+    PSRAM (Rev B3 final: the reprobe fires only while no chip is
+    detected, ok = 0 — test_psram_absent; a working chip keeps its ring),
+    and go traffic keeps running; off must not reprobe either. The SO traffic on uio[7] must never reach the enables (it
+    is not wired to the debouncer at all)."""
+    try:
+        mon, _ = await psram_start(dut)
+        await ClockCycles(dut.clk, 22 * 512)
+        await _wait_left_start(dut)
+        sw = _probe(dut, "sw")
+        en5 = []
+
+        async def run(level, word, n):
+            dut.ui_in.value = level << 4
+            for _ in range(n):
+                await fast_frames(dut, [word])
+                if sw is not None:
+                    en5.append(int(sw.value) >> 4 & 1)
+
+        def probes():
+            return [t for t in mon.txns if t["cmd"] == 0x02 and t["addr"] == 0x010000]
+
+        await run(0, 0xFFFF, 600)
+        assert len(probes()) == 1, "reprobe with the switch off"
+        assert not any(en5), "en[4] on with the switch off"
+        k = len(en5)
+        await run(1, 0x0000, 700)
+        assert len(probes()) == 1, f"switch on with a working chip must not reprobe ({len(probes())})"
+        if sw is not None:
+            on = en5[k:]
+            first = on.index(1)
+            assert all(on[first:]), "en[4] fell with the switch on"
+        last = mon.txns[-6:]
+        assert len(_go_pairs(last)) >= 2 and last[-1]["t0"] > probes()[-1]["t0"], "go traffic with the delay on"
+        k = len(en5)
+        await run(0, 0xFFFF, 700)
+        assert len(probes()) == 1, "switch off must not reprobe"
+        if sw is not None:
+            off = en5[k:]
+            first = off.index(0)
+            assert not any(off[first:]), "en[4] rose with the switch off"
+        _check_bus(dut, mon)
+    finally:
+        psram_off(dut)
+
+
+# ---------------------------------------------------------------------
+# Delay DSP (Rev B3, Task 22; golden_model.Delay). The ring lives in the
+# external PSRAM (the engine writes quant12(out) at widx and reads
+# (widx + 1 - dly) mod 32768 after chain_done of every frame). dly slews
+# +/-1 frame toward the settled K4 target from EN_SETTLE (absent 16800).
+# rd (the previous frame's read) is gated by ok and filled; filled after
+# FILL_FRAMES writes. The golden models the testbench PSRAM's LFSR fill
+# so pre-fill reads are bit-exact too. The FILL_FRAMES tests need the
+# Makefile override (make -B FILL_FRAMES=64): the GL netlist has no
+# parameters and keeps 32768 (the wav_tool check covers the delay there).
+# ---------------------------------------------------------------------
+
+
+def _fill_param(dut):
+    """The RTL FILL_FRAMES parameter (None on the flat GL netlist).
+    tb.v declares FILL_FRAMES = 64 even under GL_TEST (it only skips the
+    override there), so the GL case is detected from the DUT itself: the
+    flat netlist has no internal dly_len and keeps FILL_FRAMES = 32768."""
+    if _probe(dut, "dly_len") is None:
+        return None
+    try:
+        return int(dut.FILL_FRAMES.value)
+    except AttributeError:
+        return None
+
+
+async def _delay_hist(dut, hist, xs, compare=True):
+    """Drive xs one frame each (from a left-half start) against the
+    golden Chain history; returns the outputs (capture j = the result of
+    input frame base + j - 1, as fast_frames does) and the golden list."""
+    base = len(hist.xs)
+    outs = await fast_frames(dut, xs)
+    hist.xs += list(xs)
+    want = golden_model.render(hist.xs, hist.en, k4=hist.k4, fill=hist.fill,
+                               psram=hist.psram)
+    for j, o in enumerate(outs if compare else []):
+        assert o == want[base - 1 + j], \
+            f"frame {base - 1 + j}: out {o} != golden {want[base - 1 + j]}"
+    return outs, want
+
+
+class DelayHist:
+    """Frame history of a delay test: the golden Chain (with the Delay
+    stage) over [0] * START_FRAME + the driven frames."""
+
+    def __init__(self, en, k4=None, fill=32768, psram=True):
+        self.en, self.k4, self.fill, self.psram = en, k4, fill, psram
+        self.xs = [0] * START_FRAME
+
+
+@cocotb.test()
+async def test_delay_off_identity(dut):
+    """Delay off, PSRAM fitted and running: bit-exact dry output while the
+    ring fills with quant12(x) behind the scenes (the output is the
+    input). GL-safe (no parameter override needed)."""
+    await start(dut, 0)
+    hist = DelayHist(0)
+    xs = [0, 16384, -24576, 0, 12345, -12345] * 30
+    await _delay_hist(dut, hist, xs)
+
+
+@cocotb.test()
+async def test_delay_no_psram(dut):
+    """Delay on, no PSRAM chip (tb psram_en = 0): the probe fails, ok stays
+    0, no ring traffic: bit-exact dry output for 5000 frames."""
+    await start(dut, EN_DELAY)
+    dut.psram_en.value = 0
+    dut.psram_so_dly_ps.value = 0
+    hist = DelayHist(EN_DELAY, psram=False)
+    xs = [0, 16384, -24576, 0, 12345, -12345] * 400
+    await _delay_hist(dut, hist, xs)
+
+
+@cocotb.test()
+async def test_delay_echo(dut):
+    """Impulse into the enabled delay (EN_DELAY, K4 absent, PSRAM fitted).
+    Output == golden every frame (the golden models the PSRAM's LFSR fill
+    for the pre-echo reads). FILL_FRAMES must be overridden to 64
+    (make -B FILL_FRAMES=64): `filled` then happens at frame ~80 instead
+    of ~32784, so the impulse echo (~16800 frames later) is reachable in
+    sim. The echo frame is pinned purely in the golden: the same sequence
+    with the impulse zeroed first differs exactly where the echo lands
+    (the impulse word is read dly-1 frames after it was written).
+    With the default FILL_FRAMES (the plain suite run) only the pre-fill
+    window is checked; the full-riff bit-exact echo is the wav_tool
+    check's delay modes at the real FILL_FRAMES."""
+    dut.psram_en.value = 1          # fitted before start: the probe runs at frame 16
+    dut.psram_so_dly_ps.value = 0
+    await start(dut, EN_DELAY)    # the delay enable (ui[4])
+    fill = _fill_param(dut)
+    if fill is None:
+        return                      # GL netlist: the check covers the delay
+    n_in = 40 + fill
+    hist = DelayHist(EN_DELAY, fill=fill)
+    xs = [0] * 40 + [16384] + [0] * (n_in - 41)
+    await _delay_hist(dut, hist, xs)
+    if fill >= 32768:
+        return                      # short window only (the suite run)
+    # where the golden puts the echo (pure model, no extra RTL run)
+    tail = [0] * (golden_model.DELAY_ABSENT + 200)
+    want = golden_model.render([0] * START_FRAME + xs + tail, EN_DELAY, fill=fill)
+    xs0 = list(xs)
+    xs0[40] = 0
+    want0 = golden_model.render([0] * START_FRAME + xs0 + tail, EN_DELAY, fill=fill)
+    imp = START_FRAME + 40          # the direct impulse frame (dry path)
+    first = next((j for j in range(imp + 1, len(want)) if want[j] != want0[j]), None)
+    assert first is not None, "no impulse echo in the golden"
+    # first is an absolute render frame; the impulse sits at START_FRAME+40
+    at = first - START_FRAME - 40
+    assert abs(at - (golden_model.DELAY_ABSENT - 1)) <= 2, \
+        f"echo lands {at} frames after the impulse, expected ~{golden_model.DELAY_ABSENT - 1}"
+
+
+@cocotb.test()
+async def test_delay_time_slew(dut):
+    """K4 = 10 from reset: dly holds at 16800 until EN_SETTLE, then slews
+    exactly -1 frame per frame toward target(10) = 2072, matching
+    golden_model.Delay's dly; then K4 moves to 200 mid-run and dly still
+    moves at most 1 frame per frame (RTL-only: the dly probe; the GL
+    check covers the slew via the delay_k4* modes)."""
+    dp = _probe(dut, "dly_len")
+    if dp is None:
+        return                      # GL netlist: no internal probe
+    dut.psram_en.value = 1
+    dut.psram_so_dly_ps.value = 0
+    kp = knob_pin(dut, 3, 10)       # K4 = uio[5], v 10
+    await start(dut, EN_DELAY)
+    hist = DelayHist(EN_DELAY, k4=10, fill=_fill_param(dut))
+
+    def gold_dly(n):
+        d = golden_model.Delay(10, hist.fill)
+        for _ in range(n):
+            d.step(0, True)
+        return d.dly
+
+    await _delay_hist(dut, hist, [0] * 560)
+    d0 = int(dp.value)
+    want = [gold_dly(len(hist.xs) + k) for k in (-1, 0, 1)]
+    dut._log.info(f"dly {d0} after {len(hist.xs)} frames; golden n-1/n/n+1 = {want}")
+    assert d0 == want[1], f"dly {d0} != golden {want[1]} after {len(hist.xs)} frames"
+    assert d0 < golden_model.DELAY_ABSENT, "dly never left the reset value"
+    # the slew: 40 more frames move it exactly -40
+    await _delay_hist(dut, hist, [0] * 40)
+    d1 = int(dp.value)
+    assert d0 - d1 == 40, f"slew must be -1/frame: {d0} -> {d1} over 40 frames"
+    # knob move mid-run (the golden keeps k4 = 10, so outputs are not
+    # compared from here): the slew stays bounded to 1 frame per frame
+    kp.v = 200
+    prev = d1
+    for _ in range(10):
+        await _delay_hist(dut, hist, [0] * 40, compare=False)
+        cur = int(dp.value)
+        assert abs(cur - prev) <= 40, f"slew exceeded 1 frame/frame: {prev} -> {cur}"
+        prev = cur
+
+
+@cocotb.test()
+async def test_all_dips_on(dut):
+    """Review Focus 1 (Rev B3 final, DIP-safe pin map): every DIP on
+    (ui_in = 0xFF) with the PSRAM and the ADC wired on uio — no external
+    data source shares a ui pin, so the switches cannot fight anything:
+    the PSRAM still probes OK and every frame equals the golden chain
+    with all six enables (comp, dist, phaser, trem, delay, freeze) in
+    force, ui[7:6] ignored."""
+    dut.psram_en.value = 1
+    dut.psram_so_dly_ps.value = 0
+    try:
+        await start(dut, 0xFF)
+        ok = _ok(dut)
+        assert ok in (None, 1), "PSRAM must probe OK with every DIP on"
+        fill = _fill_param(dut)
+        hist = DelayHist(0x3F, fill=32768 if fill is None else fill)
+        xs = [(i * 2731) % 40000 - 20000 for i in range(64)]
+        await _delay_hist(dut, hist, xs)
+        assert int(dut.psram_err.value) == 0, "PSRAM protocol error with every DIP on"
+    finally:
+        psram_off(dut)
+
+
+@cocotb.test()
+async def test_chain_before_next_frame(dut):
+    """Rev B3 final (Task 3) guard: the chain reads the ADC shift register
+    rx_shift directly (no sample_in copy), which is only valid while
+    rx_shift holds still — it shifts in the LEFT half (lr_cnt[8] == 0).
+    So with every DIP on (the longest chain), every chain_done pulse in
+    32 frames must land in the RIGHT half of the frame its sample was
+    latched in (lr_cnt[8] == 1, i.e. after the latch at lr_cnt 256 and
+    before the frame wraps at 511). RTL probe; returns under GL."""
+    lr, cd = _probe(dut, "lr_cnt"), _probe(dut, "chain_done")
+    if lr is None:
+        return
+    await start(dut, 0xFF)
+    seen = 0
+    for _ in range(32 * 512):
+        await RisingEdge(dut.clk)
+        await ReadOnly()
+        if int(cd.value) == 1:
+            seen += 1
+            v = int(lr.value)
+            assert v >= 256, f"chain_done at lr_cnt {v}: in the left half (rx_shift moving)"
+    assert seen >= 31, f"only {seen} chain_done pulses in 32 frames"
+
+
+def _s16(v):
+    return v - 0x10000 if v & 0x8000 else v
+
+
+async def _freeze_case(dut, en):
+    """PSRAM fitted, switches en from reset (freeze on): 200 frames equal
+    the golden chain, and every go write word is quant12 of the word the
+    PREVIOUS go read back (the loop recirculates; no new audio enters).
+    The SPI monitor attaches after the settle, at a left-half start: a
+    transaction already in flight there is partial (n < 48) and dropped by
+    _go_pairs."""
+    dut.psram_en.value = 1
+    dut.psram_so_dly_ps.value = 0
+    try:
+        await start(dut, en)
+        mon = SpiMon(dut)
+        fill = _fill_param(dut)
+        hist = DelayHist(en, fill=32768 if fill is None else fill)
+        xs = [(i * 3001) % 40000 - 20000 for i in range(200)]
+        if fill is not None:
+            await _delay_hist(dut, hist, xs)
+        else:
+            await fast_frames(dut, xs)              # GL: the write-path check below is the test
+        pairs = _go_pairs(mon.txns)
+        assert len(pairs) >= 150, f"only {len(pairs)} go pairs"
+        # RTL (FILL_FRAMES 64): the ring is filled from frame ~81, so the
+        # frozen write is quant12 of the previous read. GL (the netlist
+        # keeps 32768): not yet filled in this window, rd = 0, so every
+        # frozen write is 0 — still no new (non-zero) audio enters.
+        filled = fill is not None
+        for (_, r0), (w1, _) in zip(pairs, pairs[1:]):
+            want = (golden_model.quant12(_s16(r0["data"])) & 0xFFFF) if filled else 0
+            assert w1["data"] == want, \
+                f"frozen write {w1['data']:#06x} != quant12(prev read {r0['data']:#06x}) {want:#06x}"
+        return len(pairs)
+    finally:
+        psram_off(dut)
+
+
+@cocotb.test()
+async def test_freeze_holds(dut):
+    """Delay + freeze (ui[4] + ui[5]): the ring write word is the word just
+    read, so the loop holds; output == golden (dry + the frozen echo)."""
+    await _freeze_case(dut, EN_DELAY | EN_FREEZE)
+
+
+@cocotb.test()
+async def test_freeze_while_bypassed(dut):
+    """Review Focus 2: freeze with the delay OFF still holds the ring (the
+    write word is the read word) while the output is the dry signal, so
+    a loop frozen while bypassed is intact when the delay comes back on
+    (the audio check's freeze_bypass mode plays it)."""
+    await _freeze_case(dut, EN_FREEZE)
+
+
+@cocotb.test()
+async def test_freeze_holds_time(dut):
+    """Final-review fix: the delay time HOLDS while frozen (turning K4 with
+    freeze on would otherwise re-slew the read pointer through a ring that
+    only recirculates, smearing the loop into one held word). K4 = 10 from
+    reset with delay + freeze on: dly stays at 16800 (the reset value)
+    after EN_SETTLE instead of slewing toward 2072, like golden Delay; the
+    outputs equal golden. RTL-only (the dly probe)."""
+    dp = _probe(dut, "dly_len")
+    if dp is None:
+        return                      # GL netlist: no internal probe
+    dut.psram_en.value = 1
+    dut.psram_so_dly_ps.value = 0
+    try:
+        knob_pin(dut, 3, 10)        # K4 = uio[5], v 10
+        en = EN_DELAY | EN_FREEZE
+        await start(dut, en)
+        hist = DelayHist(en, k4=10, fill=_fill_param(dut))
+        await _delay_hist(dut, hist, [0] * 100)
+        d = golden_model.Delay(10, hist.fill)
+        for _ in range(len(hist.xs)):
+            d.step(0, True, True)
+        assert d.dly == golden_model.DELAY_ABSENT, f"golden dly {d.dly} moved while frozen"
+        assert int(dp.value) == golden_model.DELAY_ABSENT, f"dly {int(dp.value)} moved while frozen"
+    finally:
+        psram_off(dut)

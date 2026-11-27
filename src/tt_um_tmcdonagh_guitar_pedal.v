@@ -3,30 +3,30 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Silicon Guitar Pedal — multi-effect DSP core (v3: 2x2 silicon
- * pedalboard, Rev A). I2S master in/out (codec-agnostic), serial
- * effect chain comp -> fuzz -> distortion -> phaser -> trem -> delay
- * with per-stage enable bypass (comp: smoothed-envelope compressor,
- * slewed gain through the shared multiplier, task 10; fuzz: asymmetric
- * clip + octave blend on its chain input, task 4; a post-dirt tone
- * low-pass and noise gate follow fuzz/dist, task 11; the phaser is a
- * Phase 90-style 4-stage allpass, Rev B1 Task 16; the delay is an
- * identity stub until Rev B3; the v2.2 crush slot is removed, its
- * envelope follower retained for the fuzz bias).
- * Switches: DIPs on ui[6:1] (en[0]=comp .. en[4]=trem, en[5] = the
- * delay slot, a reserved identity stub; bit order = chain order) and the
- * fuzz octave switch on ui[7], all debounced (v3 task 7: 2-flop sync,
- * two agreeing samples 256 frames apart). uio[5:2] are the RC knob pins
- * K1..K4 (one round-robin knob_rc4 reader, v3 task 9 / Task 15a: K1 =
- * trem + phaser rate, K2 = tone, task 11; K3 = dist drive; K4 = delay time, uio[5],
- * Rev B1: read, not yet used).
- * uo[7] = dp clip LED; uo[2:0] = SPI idle (SCK=0, CS=1, MOSI=0, Rev B
- * PSRAM); uo[6:3] driven 0.
+ * pedalboard, Rev B3 final). I2S master in/out (codec-agnostic), serial
+ * effect chain comp -> dist -> phaser -> trem -> delay with per-stage
+ * enable bypass (comp: smoothed-envelope compressor, slewed gain through
+ * the shared multiplier, task 10; a post-dirt tone low-pass and noise
+ * gate follow dist, task 11; the phaser is a Phase 90-style 4-stage
+ * allpass, Rev B1 Task 16; the delay is a PT2399-style echo in an
+ * external SPI PSRAM, Rev B3 Task 22). Fuzz was removed (Rev B3 final).
+ * Pins (Rev B3 final, DIP-safe: no external data source on any ui pin):
+ * ui[5:0] = DIP enables in chain order (comp, dist, phaser, trem, delay,
+ * freeze), all debounced (v3 task 7: 2-flop sync, two agreeing samples
+ * 256 frames apart); ui[7:6] unused. uio[0] = MCLK, uio[1] = I2S ADC
+ * data in, uio[5:2] = RC knob pins K1..K4 (one round-robin knob_rc4
+ * reader: K1 = trem + phaser rate, K2 = tone, K3 = dist drive, K4 =
+ * delay time), uio[6] = BCLK, uio[7] = PSRAM MISO. uo[0..2] = PSRAM SCK,
+ * CE#, MOSI; uo[3] = I2S DAC data; uo[4] = LRCLK; uo[5] = 0; uo[6] = 1
+ * (holds the QSPI Pmod's flash CS0 deselected); uo[7] = dp clip LED.
  * See docs/info.md and the spec in the ai-dev-archive.
  */
 
 `default_nettype none
 
-module tt_um_tmcdonagh_guitar_pedal (
+module tt_um_tmcdonagh_guitar_pedal #(
+    parameter FILL_FRAMES = 32768   // delay fill horizon; tests may override to 64 (RTL runs only)
+) (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs
     input  wire [7:0] uio_in,   // IOs: Input path
@@ -60,66 +60,67 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire sample_latch = (slot == 6'd32);
 
   // ------------------------------------------------------------------
-  // I2S receive: ui_in[0] sampled once per slot on BCLK rising edges
+  // I2S receive: uio_in[1] sampled once per slot on BCLK rising edges
   // (mid-slot, lr_cnt[2:0]==4), slots 1..16 of the left half only
   // ------------------------------------------------------------------
   reg [15:0] rx_shift;
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) rx_shift <= 16'd0;
     else if (!lr_cnt[8] && data_window && lr_cnt[2:0] == 3'd4)
-      rx_shift <= {rx_shift[14:0], ui_in[0]};
+      rx_shift <= {rx_shift[14:0], uio_in[1]};   // I2S ADC data on uio[1]
   end
 
-  reg [15:0] sample_in;
+  // Rev B3 final (area): no sample_in copy register. rx_shift only
+  // shifts in the LEFT half (lr_cnt[8] == 0); the frame's word is
+  // complete at the latch (slot 32, lr_cnt 256), and the chain, cenv and
+  // every other reader of the input consume it from sample_valid until
+  // chain_done, which always lands in the same RIGHT half (< 200 clk
+  // after sample_valid, CHAIN_MAX_CLK; test_chain_before_next_frame) —
+  // so sample_in == rx_shift for every read (bit-exact).
+  wire [15:0] sample_in = rx_shift;
   reg        sample_valid;
   wire       sample_strobe = sample_latch && (lr_cnt[2:0] == 3'd0); // 1-clk pulse
   always @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      sample_in    <= 16'd0;
-      sample_valid <= 1'b0;
-    end else begin
-      sample_valid <= sample_strobe;
-      if (sample_strobe) sample_in <= rx_shift;
-    end
+    if (!rst_n) sample_valid <= 1'b0;
+    else        sample_valid <= sample_strobe;
   end
 
   // ------------------------------------------------------------------
-  // Effect chain + enables (v3 task 1, 2x2 Rev A): serial comp ->
-  // fuzz -> dist -> phaser -> trem -> delay, enable-bypass per stage,
-  // en bit order = chain order (en[0]=comp .. en[5]=delay) — DIP
-  // switches on ui[6:1] (debounced), ui[7] = fuzz octave switch.
+  // Effect chain + enables: serial comp -> dist -> phaser -> trem ->
+  // delay, enable-bypass per stage, en bit order = chain order (en[0] =
+  // comp, en[1] = dist, en[2] = phaser, en[3] = trem, en[4] = delay,
+  // en[5] = delay freeze) — the DIP switches on ui[5:0], debounced.
   // Bypass stays true bypass, wired externally with a 3PDT switch
   // around the pedal (all-off DIP = "digital clean": audio still runs
-  // through the ADC -> identity chain -> DAC, a distinct mode from
-  // true bypass). Comp is the slewed-gain compressor (task 10); the
-  // phaser is live from Rev B1 (Task 16); the delay is an identity stub.
+  // through the ADC -> identity chain -> DAC).
   // ------------------------------------------------------------------
-  // Switch debounce (v3 task 7). Each of ui[7:1] passes a 2-flop
+  // Switch debounce (v3 task 7). Each of ui[5:0] passes a 2-flop
   // synchronizer; an 8-bit frame divider counts sample_strobe and every
   // 256th strobe (deb_div wrapping) is a tick that samples the
   // synchronized bits into deb_s. If the new sample equals the previous
   // tick's sample the switch bank sw updates (two agreeing ticks 256
   // frames ~ 5.3 ms apart), else it holds — so contact bounce shorter
-  // than a tick pair never reaches the chain. sw = {oct, en[5:0]}
-  // (ui[7], ui[6:1]); everything resets to 0 (pedal boots with all
-  // effects off; the switch inputs have external pull-downs), so a
-  // switch set at power-up reaches the chain at strobe 512 (frame 511's
-  // sample is the first processed with it; golden_model EN_SETTLE).
+  // than a tick pair never reaches the chain. Everything resets to 0
+  // (pedal boots with all effects off), so a switch set at power-up
+  // reaches the chain at strobe 512 (frame 511's sample is the first
+  // processed with it; golden_model EN_SETTLE).
   // ------------------------------------------------------------------
-  reg [6:0] sw_s1, sw_s2;   // synchronizer
+  wire      spi_cs_n, spi_sck, spi_mosi, spi_ok, spi_busy;   // psram_spi (below)
+
+  reg [5:0] sw_s1, sw_s2;   // synchronizer
   reg [7:0] deb_div;        // frame divider, wraps every 256 frames
-  reg [6:0] deb_s;          // previous tick's sample
-  reg [6:0] sw;             // debounced {oct, en[5:0]}
+  reg [5:0] deb_s;          // previous tick's sample
+  reg [5:0] sw;             // debounced en[5:0]
   wire      deb_tick = sample_strobe && (deb_div == 8'hFF);
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
-      sw_s1   <= 7'd0;
-      sw_s2   <= 7'd0;
+      sw_s1   <= 6'd0;
+      sw_s2   <= 6'd0;
       deb_div <= 8'd0;
-      deb_s   <= 7'd0;
-      sw      <= 7'd0;
+      deb_s   <= 6'd0;
+      sw      <= 6'd0;
     end else begin
-      sw_s1 <= ui_in[7:1];
+      sw_s1 <= ui_in[5:0];
       sw_s2 <= sw_s1;
       if (sample_strobe) deb_div <= deb_div + 8'd1;
       if (deb_tick) begin
@@ -129,7 +130,7 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  wire [5:0] en = sw[5:0];   // en[5] (ui[6]) = delay slot enable, unused (identity stub; ui[6] is also PSRAM MISO from B3)
+  wire [5:0] en = sw[5:0];   // en[4] (ui[4]) = delay enable (reprobes the PSRAM on its rising edge); en[5] = freeze
 
   wire [15:0] s0 = sample_in;
 
@@ -159,12 +160,15 @@ module tt_um_tmcdonagh_guitar_pedal (
   reg  [11:0] comp_g;
   // knob reader outputs (instances below; declared first: the dist drive,
   // tone shift and trem rate read them above their instances)
+  // only k2's top 2 bits are consumed (kt = 4 - value2[7:6])
+  /* verilator lint_off UNUSEDSIGNAL */
   wire [7:0] k1_value, k2_value, k3_value, k4_value;
+  /* verilator lint_on UNUSEDSIGNAL */
   wire       k1_present, k2_present, k3_present, k4_present;
   wire       k1_drv, k2_drv, k3_drv, k4_drv;
   wire signed [28:0] mul_p;   // shared multiplier product (u_mult below)
   wire               mul_done; // u_mult: p final (1-clk pulse)
-  wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x|, cenv and env
+  wire [15:0] mag = (sample_in == 16'h8000) ? 16'h7FFF  // saturating |x| for cenv
                     : sample_in[15] ? (~sample_in + 16'd1) : sample_in;
 
   // attack test and gap from one 25-bit subtract: (m << 8) > cenv iff
@@ -193,14 +197,16 @@ module tt_um_tmcdonagh_guitar_pedal (
     for (ci = 1; ci < 16; ci = ci + 1)
       if (comp_l[ci]) comp_e = ci[3:0];
   end
-  wire [1:0] comp_m2   = comp_lx[comp_e +: 2];
+  wire [1:0] comp_m2   = comp_lx[{1'b0, comp_e} +: 2];   // index widened: comp_e <= 15, always in range
   wire [5:0] comp_lvl  = (comp_l == 16'd0) ? 6'd0 : {comp_e, comp_m2};
 
   // gain index: over <= 63 - 44 = 19, red = (5 * over) >> 3 <= 11, so
   // gq = 6 - red >= -5: the reachable floor is -5; the -8 floor below is the
   // table's definition and is never reached (kept for the saturating convention)
   wire [5:0] comp_over = (comp_lvl > 6'd44) ? comp_lvl - 6'd44 : 6'd0;
+  /* verilator lint_off UNUSEDSIGNAL */  // only [7:3] feeds gq; <= 5*19 = 95 fits 7 bits
   wire [7:0] comp_ov5  = {2'b00, comp_over} + {comp_over, 2'b00};
+  /* verilator lint_on UNUSEDSIGNAL */
   wire signed [5:0] comp_gq_r = 6'sd6 - $signed({1'b0, comp_ov5[7:3]});
   wire signed [3:0] comp_gq   = (comp_gq_r < -6'sd8) ? -4'sd8 : comp_gq_r[3:0];
 
@@ -216,7 +222,9 @@ module tt_um_tmcdonagh_guitar_pedal (
   // slew: g + ((target - g) >>> 3), 13-bit signed gap; g stays within
   // [min target, max target] (64..724), so the 12-bit sum never wraps
   wire signed [12:0] comp_gap = $signed({1'b0, comp_tgt}) - $signed({1'b0, comp_g});
+  /* verilator lint_off UNUSEDSIGNAL */  // [12] duplicates the sign of [11] (gap is bounded)
   wire signed [12:0] comp_stp = comp_gap >>> 3;
+  /* verilator lint_on UNUSEDSIGNAL */
 
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n)            comp_g <= 12'd256;
@@ -233,7 +241,7 @@ module tt_um_tmcdonagh_guitar_pedal (
 
   // Sequenced chain (v3 task 8; serial multiplier since Task 15a): one
   // registered stage per step, stepped after sample_valid. step = 1 on
-  // the clk after sample_valid (env, the trem phase, gate state and sw are
+  // the clk after sample_valid (the trem phase, gate state and sw are
   // post-edge by then), runs to CHAIN_LAST, idles at 0. A step without the
   // multiplier lasts 1 clk. A step with it (step_mul) raises mul_start
   // on its first clk (the multiplier captures the step's operands), holds
@@ -252,10 +260,10 @@ module tt_um_tmcdonagh_guitar_pedal (
   // (they read the s3 / s4 value cs still holds). DO NOT write cs at steps
   // 4 or 6..9: the held s3 / s4 values would be lost. Step map:
   //   step 1: comp (mult)     -> cs
-  //   step 2: fuzz            -> cs
+  //   step 2: (fuzz removed, Rev B3 final) pass-through, no cs write
   //   step 3: dist (mult)     -> cs   (= the s3 value, held through step 5)
   //   step 4: tone            -> ytone (every frame; 16.4 low-pass of cs)
-  //   step 5: gate (mult)     -> cs (fuzz/dist on: tone * gg, else cs); = s4
+  //   step 5: gate (mult)     -> cs (dist on: tone * gg, else cs); = s4
   //   steps 6..9: phaser allpass stages 0..3 (mult) -> ph_* state (every frame)
   //   step 10: phaser mix     -> cs (s4 held through step 10)
   //   step 11: trem (mult)    -> cs
@@ -271,74 +279,13 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire       ph_step   = (step >= 4'd6) & (step <= 4'd9);   // phaser stages 0..3
   wire       step_mul  = (step == 4'd1) | (step == 4'd3) | (step == 4'd5)
                        | ph_step | (step == 4'd11);
-  wire       mul_start = step_mul & ~mwait;
+  wire       ch_start  = step_mul & ~mwait;          // the chain step's multiply
+  wire       mul_start = ch_start;
   wire       step_adv  = (step != 4'd0) & (~step_mul | mul_done);
 
   // ------------------------------------------------------------------
-  // Step 2 — fuzz (v3 task 4): Fuzz Face-inspired asymmetric clip +
-  // octave blend on the stage's CHAIN input cs — the task-3 routed
-  // re-coupling (v2.2's cell-saving trim read the PRE-CHAIN sample_in
-  // here, masking comp in every fuzz-on stack, probe-verified en=0x03
-  // == en=0x02; fuzz now consumes comp's output, and dist below
-  // consumes fuzz's). Input x = cs, signed; constants provisional:
-  //   a      = sat_mag(x)  — the saturating-|x| idiom on cs
-  //   t_pos  = 19660       (~ +0.6 FS)
-  //   t_neg  = sat16(13107 + (env >>> 2))  (~ -0.4 FS at env 0,
-  //             relaxing to -21298 at env 32766 — bias-starve
-  //             dynamics: the negative clip point eases up with the
-  //             input level. env is read POST-update (env updates on
-  //             the sample_valid edge, step 2 runs after it), so the
-  //             word transmitted in frame N+1 is fuzz(x_N, env_N).
-  //             env <= 32766 -> env>>>2
-  //             <= 8191 -> the sum <= 21298 < 32767: the sat16 clamp
-  //             below is unreachable, kept as a guard for by-ear
-  //             retunes; it tests bits [16:15] because the sum fits a
-  //             positive 16-bit value iff both are clear)
-  //   shaped = a > t ? t : a              (asym clip on the magnitude)
-  //   fuzz_core = x[15] ? (-shaped) : shaped (sat16 negate; shaped <=
-  //             21298 -> -shaped >= -21298 > -32768: that clamp is
-  //             unreachable too, kept per the convention)
-  // The octave switch (ui[7]) blends the full-wave-rectified copy (the octave):
-  //   fuzz_out = oct ? sat16(shaped + a) : fuzz_core
-  // shaped + a >= 0 always (both non-negative), so the blend's sat16
-  // clamps UPPER only (max 21298 + 32767 -> 0x7FFF): with the octave on
-  // fuzz_out is non-negative in every reachable state; with it off it
-  // is signed (the plain asym fuzz); dist below takes |s2| either way.
-  // ------------------------------------------------------------------
-  wire [15:0] fuzz_mag = (cs == 16'h8000) ? 16'h7FFF   // saturating |cs|
-                       : cs[15] ? (~cs + 16'd1) : cs;
-
-  wire fuzz_oct = sw[6];   // debounced ui[7]: octave blend
-
-  // negative clip point sat16(13107 + (env >>> 2))
-  wire [16:0] fuzz_tn_sum = 17'd13107 + {3'b000, env[15:2]};
-  wire [15:0] fuzz_tneg = |fuzz_tn_sum[16:15] ? 16'h7FFF : fuzz_tn_sum[15:0];
-  wire [15:0] fuzz_t = cs[15] ? fuzz_tneg : 16'd19660;
-
-  wire [15:0] fuzz_shaped = (fuzz_mag > fuzz_t) ? fuzz_t : fuzz_mag;
-
-  // sat16 negate (clamp unreachable, kept per convention)
-  wire [16:0] fuzz_neg = 17'd0 - {1'b0, fuzz_shaped};
-  wire        fuzz_neg_ovf = (fuzz_neg[16] != fuzz_neg[15]);
-  wire [15:0] fuzz_core = cs[15] ? (fuzz_neg_ovf ? 16'h8000 : fuzz_neg[15:0])
-                                 : fuzz_shaped;
-
-  // octave blend: sat16(shaped + a), upper clamp only — both terms are
-  // non-negative so the sum cannot underflow, and it fits a positive
-  // 16-bit magnitude iff <= 0x7FFF, i.e. iff bits [16:15] are both
-  // clear (their OR is exactly "sum > 0x7FFF" for any 17-bit sum; the
-  // plain [16] carry test would MISS sums in [0x8000, 0xFFFF] — the
-  // max here is 21298 + 32767 = 54065, so [16] never sets on its own)
-  wire [16:0] fuzz_blend_w = {1'b0, fuzz_shaped} + {1'b0, fuzz_mag};
-  wire [15:0] fuzz_blend = |fuzz_blend_w[16:15] ? 16'h7FFF : fuzz_blend_w[15:0];
-
-  wire [15:0] fuzz_out = fuzz_oct ? fuzz_blend : fuzz_core;
-
-  wire [15:0] s2_w = en[1] ? fuzz_out : cs;
-
-  // ------------------------------------------------------------------
   // Step 3 — distortion (v3 task 5, K3 drive task 12): drive into a
-  // 3-piece diode-knee PWL on the stage input's magnitude. a = sat_mag(s2);
+  // 3-piece diode-knee PWL on the stage input's magnitude. a = sat_mag(cs);
   // w = (a * drive) >> 8 through the shared multiplier (18-bit, NO
   // intermediate saturation — keeps the top soft):
   //   w <= 8192   : out = w                        (slope 1)
@@ -349,9 +296,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   // 32768) / 16 = 28,615 < 32767 (x4 default: 20479), so the sign negate
   // below never overflows.
   // ------------------------------------------------------------------
-  // Direct saturating |x| on the actual stage input s2 (sign stays
-  // cs[15] below). Correct for every enable/octave combination, including
-  // fuzz's signed core output with the octave off.
+  // Direct saturating |x| on the stage input cs (sign stays cs[15] below).
   wire [15:0] dist_mag = (cs == 16'h8000) ? 16'h7FFF   // saturating |cs|
                        : cs[15] ? (~cs + 16'd1) : cs;
 
@@ -359,8 +304,10 @@ module tt_um_tmcdonagh_guitar_pedal (
       ? (12'd256 + {1'b0, k3_value, 3'b000} - {4'b0000, k3_value})
       : 12'd1024;
   wire [17:0] dist_w = mul_p[25:8];     // a * drive >> 8 (p >= 0, < 2^26)
+  /* verilator lint_off UNUSEDSIGNAL */  // [17:16] provably clear (w <= 18 bits by design, sums bounded)
   wire [17:0] dist_o1 = 18'd8192 + ((dist_w - 18'd8192) >> 2);
   wire [17:0] dist_o2 = 18'd14336 + ((dist_w - 18'd32768) >> 4);
+  /* verilator lint_on UNUSEDSIGNAL */
   wire [15:0] dist_pw = (dist_w <= 18'd8192)  ? dist_w[15:0]
                       : (dist_w <= 18'd32768) ? dist_o1[15:0]
                                               : dist_o2[15:0];
@@ -372,12 +319,11 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [15:0] dist_out = cs[15] ? (dist_neg_ovf ? 16'h8000 : dist_neg[15:0])
                                 : dist_pw;
 
-  wire [15:0] s3_w = en[2] ? dist_out : cs;
+  wire [15:0] s3_w = en[1] ? dist_out : cs;
 
   // ------------------------------------------------------------------
   // Steps 4-5 — post-dirt tone + noise gate (v3 task 11), applied only
-  // while fuzz or dist is on (dirt_on; the two are the only stages that
-  // add noise and harshness).
+  // while dist is on (dirt_on; the stage that adds noise and harshness).
   //   Tone (step 4): ytone (20-bit signed, 16.4) one-pole low-pass of
   //     cs, updated EVERY frame whatever the enables are (so it is
   //     warm when dirt comes on):
@@ -396,14 +342,16 @@ module tt_um_tmcdonagh_guitar_pedal (
   //   Step 5 (shared multiplier): cs = dirt_on ? (tone * gg) >>> 8
   //     : cs. |tone * gg| <= 2^23, so p[23:8] fits 16 bits (no clamp).
   // ------------------------------------------------------------------
-  wire dirt_on = en[1] | en[2];
+  wire dirt_on = en[1];
 
   reg signed [19:0] ytone;
   reg               gate_open;
   reg [8:0]         gate_gg;
   wire [2:0] tone_kt = k2_present ? (3'd4 - {1'b0, k2_value[7:6]}) : 3'd2;
   wire signed [20:0] tone_d = {cs[15], cs, 4'b0000} - {ytone[19], ytone};
+  /* verilator lint_off UNUSEDSIGNAL */  // [20] duplicates the sign of [19] after the >>> kt
   wire signed [20:0] tone_s = tone_d >>> tone_kt;
+  /* verilator lint_on UNUSEDSIGNAL */
   wire signed [15:0] tone   = ytone[19:4];     // >>> 4
 
   wire [8:0] gate_rem = 9'd256 - gate_gg;
@@ -428,7 +376,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   // ------------------------------------------------------------------
   // Steps 6..10 — phaser (Rev B1, Task 16): Phase 90-style, 4 first-order
   // allpass stages (no feedback) + 50/50 dry mix, golden_model.Phaser.
-  //   pp (phaser_p, 22-bit) <= en[3] ? pp + inc : 0 on sample_valid, inc =
+  //   pp (phaser_p, 22-bit) <= en[2] ? pp + inc : 0 on sample_valid, inc =
   //     K1 present ? the trem increment (shared knob) : 87 (~1.0 Hz, prov)
   //   t = pp[20:9], inverted if pp[21] (12-bit triangle)
   //   v = (3 t) >> 2 (0..3071); d = ((1024 + v[9:0]) << v[11:10]) >> 2
@@ -437,7 +385,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   //     y = sat16(x1[k] + (((y1[k] - s) * c) >>> 12))   (shared multiplier)
   //     x1[k] <= s; y1[k] <= y; s = y
   //   mix (step 10): ph_out = (cs + y3) >>> 1 (17-bit sum, floor)
-  // The stages run every frame whatever en[3] is (warm on switch-on).
+  // The stages run every frame whatever en[2] is (warm on switch-on).
   // Lean state (bit-exact with the golden's 8 registers): x1[k] for k >= 1
   // always equals y1[k-1] (both load stage k-1's output in the same frame,
   // both reset 0), so only y1[0..3] are kept, as a 4-deep shift chain
@@ -460,7 +408,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [9:0]  phaser_inc = k1_present ? trem_inc_k : 10'd87;
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n)            phaser_p <= 22'd0;
-    else if (sample_valid) phaser_p <= en[3] ? (phaser_p + {12'd0, phaser_inc}) : 22'd0;
+    else if (sample_valid) phaser_p <= en[2] ? (phaser_p + {12'd0, phaser_inc}) : 22'd0;
   end
 
   wire [11:0] ph_t     = phaser_p[21] ? ~phaser_p[20:9] : phaser_p[20:9];
@@ -491,43 +439,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [16:0] ph_mix     = {cs[15], cs} + {ph_y3[15], ph_y3};
   wire [15:0] phaser_out = ph_mix[16:1];        // (s4 + y3) >>> 1
 
-  wire [15:0] s5_w = en[3] ? phaser_out : cs;
-
-  // ------------------------------------------------------------------
-  // Fast envelope (v3): the v2.2 auto-lofi envelope follower, retained
-  // after the crush slot's removal — the fuzz negative clip point
-  // (task 4) reads it; the compressor has its own smoothed cenv.
-  // 16-bit envelope of the PRE-CHAIN input magnitude (mag, shared with
-  // cenv and declared with it above, the
-  // saturating |sample_in| idiom — env's own source since task 4 moved
-  // stage 2 onto its chain input; fix-round ruling — the player's
-  // dynamics live in the raw input):
-  //   attack (mag > env): env <= (env + mag) >>> 1   — 17-bit add,
-  //     >> 1 back to 16; halves the gap, ~12 frames to converge;
-  //   release: env <= env - (env>>>8) - (env != 0)   — tau ~256 frames
-  //     ~5.3 ms; the 1-LSB floor makes the decay terminate at exactly
-  //     0 (the plain subtract-shift stalls anywhere below 256).
-  // env tops out at 32766 — env[15] never sets. One update per audio
-  // frame on sample_valid.
-  // ------------------------------------------------------------------
-  reg  [15:0] env;
-  wire [16:0] env_atk = {1'b0, env} + {1'b0, mag};       // 17-bit env+mag
-  wire        env_nz  = (env != 16'd0);                   // release floor
-
-  // release decrement (env>>>8) + (env != 0) in one 8-bit sum: the
-  // carry-out cannot occur (env <= 32766, so env[15:8] <= 127) — keeps
-  // the release a single 16-bit subtractor against a zero-extended
-  // byte instead of two cascaded full-width subtractors
-  wire [7:0]  env_dec8 = env[15:8] + {7'b0, env_nz};
-  wire [15:0] env_dec  = {8'h00, env_dec8};
-
-  always @(posedge clk or negedge rst_n) begin
-    if (!rst_n)             env <= 16'd0;
-    else if (sample_valid)  begin
-      if (mag > env)        env <= env_atk[16:1];         // (env+mag) >>> 1
-      else                  env <= env - env_dec;
-    end
-  end
+  wire [15:0] s5_w = en[2] ? phaser_out : cs;
 
   // ------------------------------------------------------------------
   // RC knob reader (v3 task 9; one shared round-robin reader since Task
@@ -562,7 +474,7 @@ module tt_um_tmcdonagh_guitar_pedal (
   wire [9:0]  trem_inc   = k1_present ? trem_inc_k : 10'd437;
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n)            trem_p <= 22'd0;
-    else if (sample_valid) trem_p <= en[4] ? (trem_p + {12'd0, trem_inc}) : 22'd0;
+    else if (sample_valid) trem_p <= en[3] ? (trem_p + {12'd0, trem_inc}) : 22'd0;
   end
 
   wire [7:0] trem_tri  = trem_p[21] ? ~trem_p[20:13] : trem_p[20:13];
@@ -593,10 +505,139 @@ module tt_um_tmcdonagh_guitar_pedal (
 
   wire [15:0] trem_out = mul_p[23:8];   // >>> 8; fits 16 bits (gain <= 256)
 
-  wire [15:0] s6_w = en[4] ? trem_out : cs;
+  wire [15:0] s6_w = en[3] ? trem_out : cs;
 
-  // Step 12 — delay slot (en[5]): identity until Task 22 (Rev B3).
-  wire [15:0] s7_w = cs;
+  // ------------------------------------------------------------------
+  // Delay (Rev B3, Task 22; golden_model.Delay): PT2399-style echo in
+  // the external PSRAM. The engine writes quant12(out) at word widx and
+  // reads (widx + 1 - dly) mod 32768 after chain_done of every frame;
+  // widx increments at the NEXT sample_valid edge (the transactions
+  // complete at lr ~56, before the edge at lr ~135, and the engine
+  // reads the addresses bit by bit during them, so widx/dly hold).
+  // Frame state on the sample_valid edge (pre-edge values):
+  //   tgt = the K4 target, applied from frame 511 = EN_SETTLE (the
+  //         settled knob, like every other knob consumer; absent
+  //         16800 *prov* 350 ms; target = ((64 + (v & 63)) << (v >> 6))
+  //         * 28 = (.. << 5) - (.. << 2), 1792..28448 frames)
+  //   dly += sign(tgt - dly)                     (reset 16800)
+  //   rd  = (ok && filled) ? rdata : 0           (the previous frame's
+  //         read; ok is high for every frame >= 17: the probe
+  //         completes mid-frame 16, the first write is frame 17's)
+  //   lp += (rd - lp) >>> 2                      (16-bit state)
+  // out (step 12, post-edge state): en[4] ? sat16(cs + mixv) : cs with
+  //   mixv = (lp >>> 2) + (lp >>> 3) + (lp >>> 6)  (*prov* ~0.39)
+  // w (for the go) = quant12(out): |out| with the low 4 bits cleared,
+  //   sign reapplied; registered at the step-12 advance, stable through
+  //   the transaction (the engine reads wdata bit by bit).
+  // filled after FILL_FRAMES writes since ok rose: the count resets on
+  // the ok rising edge, counts chain_done & ok (the reprobe probe
+  // traffic runs with ok low, and the reprobe pulse itself is at the
+  // sample-strobe clk, never at chain_done), and sets filled on the
+  // FILL_FRAMES-th write.
+  // ------------------------------------------------------------------
+  localparam [14:0] DLY_ABSENT = 15'd16800;   // *prov* 350 ms
+  reg  [14:0] dly_len;         // echo delay in frames (slews toward tgt)
+  reg  [14:0] dly_widx;        // ring write index (mod 32768)
+  reg  signed [15:0] dly_lp;   // echo low-pass state
+  reg  [15:0] dly_fill;        // writes since ok rose
+  reg         dly_filled;
+  reg  [15:0] dly_w;           // the write word (stable through the go)
+  reg  [8:0]  dly_fc;          // frames since reset, saturating at 511 (the EN_SETTLE gate)
+  reg         dly_pend;        // a write was accepted at the last chain_done
+  reg         ok_q;            // ok one clk ago (rising-edge detect)
+
+  wire [9:0]  k4_q   = {3'b000, k4_value[5:0]} + 10'd64;
+  wire [9:0]  k4_sh  = k4_q << k4_value[7:6];
+  wire [14:0] k4_tgt = ({5'b00000, k4_sh} << 5) - ({5'b00000, k4_sh} << 2);
+  wire [14:0] dly_tgt = (&dly_fc) ? (k4_present ? k4_tgt : DLY_ABSENT)
+                                            : DLY_ABSENT;
+  wire signed [15:0] dly_diff = $signed({1'b0, dly_tgt}) - $signed({1'b0, dly_len});
+  wire signed [15:0] spi_rdata;                        // the engine's read word
+  wire signed [15:0] dly_rd   = (spi_ok && dly_filled) ? spi_rdata : 16'sd0;
+  // the subtraction MUST run at 17 bits: rd-lp spans +/-65535 (iverilog
+  // truncates the parenthesized 16-bit subexpression under the shift)
+  wire signed [16:0] dly_rd17  = {dly_rd[15], dly_rd};  // sign-extended
+  wire signed [16:0] dly_lp17  = {dly_lp[15], dly_lp};
+  wire signed [16:0] dly_lstep = (dly_rd17 - dly_lp17) >>> 2;
+  /* verilator lint_off UNUSEDSIGNAL */  // [16] duplicates the sign of [15] (the sum stays between rd and lp)
+  wire signed [16:0] dly_lp_nx = dly_lp17 + dly_lstep;   // stays 16-bit (between rd and lp)
+  /* verilator lint_on UNUSEDSIGNAL */
+
+  wire signed [15:0] dly_mixv = (dly_lp >>> 2) + (dly_lp >>> 3) + (dly_lp >>> 6);
+  // sat16(cs + mixv): the mix is ~0.39 of |lp| so the sum cannot exceed
+  // 17 bits; upper clamp only when both terms are non-negative is NOT
+  // enough here (lp can be negative) — full sat16
+  // the add also at 17 bits explicitly (mixed-sign, |sum| up to ~45600)
+  wire signed [16:0] dly_cs17  = {cs[15], cs};
+  wire signed [16:0] dly_mix17 = {dly_mixv[15], dly_mixv};
+  wire signed [16:0] dly_sum   = dly_cs17 + dly_mix17;
+  wire        dly_ovf = (dly_sum[16] != dly_sum[15]);
+  wire [15:0] dly_sat = dly_ovf ? (dly_sum[16] ? 16'h8000 : 16'h7FFF) : dly_sum[15:0];
+  wire [15:0] dly_out = en[4] ? dly_sat : cs;
+
+  // Freeze (Rev B3 final, en[5] = ui[5]): the write word is quant12 of
+  // the word just read (dly_rd: the previous frame's read, 0 before
+  // `filled`) instead of quant12(out) — the loop recirculates unchanged,
+  // no new audio enters; independent of the delay enable en[4].
+  wire [15:0] dly_src = en[5] ? dly_rd : dly_out;
+  // quant12 = golden_model.quant12: saturating |x| (-32768 -> 32767),
+  // low 4 bits cleared, sign reapplied
+  wire [15:0] dly_wm = (dly_src == 16'h8000) ? 16'h7FFF
+                     : dly_src[15] ? (~dly_src + 16'd1) : dly_src;
+  wire [15:0] dly_wq = dly_wm & 16'hFFF0;                 // quant12: low 4 bits clear
+  wire [15:0] dly_wn = dly_src[15] ? (16'd0 - dly_wq) : dly_wq;
+
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      dly_len <= DLY_ABSENT; dly_widx <= 15'd0; dly_lp <= 16'sd0;
+      dly_fill <= 16'd0; dly_filled <= 1'b0;
+      dly_fc <= 9'd0; dly_pend <= 1'b0; ok_q <= 1'b0;
+    end else begin
+      ok_q <= spi_ok;
+      if (spi_ok && !ok_q) begin           // ok rising: (re)start the fill
+        dly_fill  <= 16'd0;
+        dly_filled <= 1'b0;
+      end
+      if (chain_done && spi_ok) begin      // the go is accepted: one write
+        dly_fill <= dly_fill + 16'd1;
+        if (dly_fill == FILL_FRAMES - 1) dly_filled <= 1'b1;
+        dly_pend <= 1'b1;
+      end
+      if (sample_valid) begin
+        if (!(&dly_fc)) dly_fc <= dly_fc + 9'd1;   // saturate: never wraps back under EN_SETTLE
+        // the delay time holds while frozen (en[5]): a K4 move would
+        // otherwise re-slew the read pointer through a ring that only
+        // recirculates, smearing the loop into one held word
+        if (!en[5]) begin
+          if (dly_diff > 0)      dly_len <= dly_len + 15'd1;
+          else if (dly_diff < 0) dly_len <= dly_len - 15'd1;
+        end
+        dly_lp <= dly_lp_nx[15:0];
+        if (dly_pend) begin              // the write completed before this edge
+          dly_widx <= dly_widx + 15'd1;
+          dly_pend <= 1'b0;
+        end
+      end
+    end
+  end
+
+  reg en5_q;   // the delay enable en[4] one clk ago (name kept from Rev B3 Task 21)
+  always @(posedge clk or negedge rst_n)
+    if (!rst_n) en5_q <= 1'b0;
+    else        en5_q <= en[4];
+  psram_spi psram (.clk(clk), .rst_n(rst_n),
+                   .go(chain_done & spi_ok), .hold(1'b0),
+                   .wdata(dly_w),
+                   .waddr_w(dly_widx),
+                   .raddr_w(dly_widx + 15'd1 - dly_len),
+                   // the delay-on edge reprobes only while no chip is detected
+                   // (Rev B3 final): a working chip keeps its ring + filled
+                   .miso(uio_in[7]), .reprobe(en[4] & ~en5_q & ~spi_ok),
+                   .sck(spi_sck), .cs_n(spi_cs_n), .mosi(spi_mosi),
+                   .rdata(spi_rdata), .ok(spi_ok), .busy(spi_busy));
+
+
+  // Step 12 — delay slot (en[4]).
 
   // ------------------------------------------------------------------
   // Chain output (name kept from v1: the audio tooling probes
@@ -610,27 +651,30 @@ module tt_um_tmcdonagh_guitar_pedal (
       cs    <= 16'd0;
       ytone <= 20'sd0;
       effect_sample <= 16'd0;
+      dly_w <= 16'd0;
       chain_done    <= 1'b0;
     end else begin
       chain_done <= step_adv & (step == CHAIN_LAST);
       if (sample_valid) begin
-        step  <= 4'd1;
+        step  <= 4'd1;                  // the chain runs every frame
         mwait <= 1'b0;
       end else begin
-        if (mul_start)     mwait <= 1'b1;
+        if (ch_start)      mwait <= 1'b1;
         else if (mul_done) mwait <= 1'b0;
         if (step_adv) step <= (step == CHAIN_LAST) ? 4'd0 : step + 4'd1;
       end
       if (step_adv) begin
         case (step)
           4'd1: cs <= s1_w;            // comp (mult)
-          4'd2: cs <= s2_w;            // fuzz
           4'd3: cs <= s3_w;            // dist (mult)
           4'd4: ytone <= ytone + tone_s[19:0];   // tone (every frame)
           4'd5: cs <= s4_w;            // gate (mult)
           4'd10: cs <= s5_w;           // phaser mix (stages 6..9: ph_* above)
           4'd11: cs <= s6_w;           // trem (mult)
-          4'd12: effect_sample <= s7_w;  // delay slot (identity stub)
+          4'd12: begin
+            effect_sample <= dly_out;   // delay (Rev B3): echo mix, dry when off
+            dly_w <= dly_wn;            // the write word, stable through the go
+          end
           default: ;
         endcase
       end
@@ -695,28 +739,31 @@ module tt_um_tmcdonagh_guitar_pedal (
     end
   end
 
-  // uo[7] = dp clip LED (peak-hold); uo[6:4] reserved, driven 0; uo[3] =
-  // 595 RCLK (idle 0, driven from Rev B2); uo[2:0] = SPI idle for the Rev B
-  // PSRAM: SCK = 0, CS = 1 (deselected), MOSI = 0
-  assign uo_out  = {dp_q, 4'b0000, 3'b010};
+  // uo[7] = dp clip LED (peak-hold); uo[6:4] and uo[3] driven 0 (the 595
+  // RCLK driver left with the Rev B2 display); uo[2:0] = the SPI bus,
+  // idle SCK = 0, CE# = 1, MOSI = 0 (uo[1] = the PSRAM CE#).
 
-  // [7]=LRCLK, [6]=BCLK, [5:2]=0 (knob discharge
-  // level, enabled only while the reader discharges that pin), [1]=DAC data,
-  // [0]=MCLK = clk (512 fs)
-  assign uio_out = {lrclk, bclk, 1'b0, 3'b000, dac_data, clk};
-  // uio[7:6] + uio[1:0] outputs; uio[5:2] = knob pins K4..K1, outputs
+
+  // Rev B3 final: [7] dp, [6] = 1 (QSPI Pmod flash CS0 held deselected),
+  // [5] = 0, [4] LRCLK, [3] DAC data, [2] MOSI, [1] CE# (PSRAM), [0] SCK
+  assign uo_out  = {dp_q, 1'b1, 1'b0, lrclk, dac_data, spi_mosi, spi_cs_n, spi_sck};
+
+  // [7] = PSRAM MISO (input), [6] = BCLK, [5:2] = 0 (knob discharge
+  // level, enabled only while the reader discharges that pin), [1] = I2S
+  // ADC data (input), [0] = MCLK = clk (512 fs)
+  assign uio_out = {1'b0, bclk, 4'b0000, 1'b0, clk};
+  // uio[6] + uio[0] outputs; uio[7] and uio[1] are ALWAYS inputs (an
+  // external ADC/PSRAM drives them); uio[5:2] = knob pins K4..K1, outputs
   // only while discharging (one at a time, round robin)
-  assign uio_oe  = {2'b11, k4_drv, k3_drv, k2_drv, k1_drv, 2'b11};
+  assign uio_oe  = {1'b0, 1'b1, k4_drv, k3_drv, k2_drv, k1_drv, 1'b0, 1'b1};
 
-  // List all unused inputs to prevent warnings
-  // (ui[7:1] = switches and ui[0] = ADC data are live; uio[7:6]/[1:0]
-  // are clock/data outputs, their input side is unused; uio[5:2] feed the
-  // knob reader K1..K4. K3 sets the dist drive; K4 is not
-  // consumed yet; the multiplier's fraction bits below the >>> 8 are
-  // unused; the phaser's 3t low bits fall off the >> 2, and d's bit 13 is
-  // always 0; the mix floor drops ph_mix[0])
-  wire _unused = &{ena, uio_in[7:6], uio_in[1:0], en[5], gate_rem[1:0],
-                   k4_value, k4_present,
+  // List all unused inputs to prevent warnings: ui[7:6] are unused
+  // switch pins; the input side of the output uio pins (uio[6], uio[0])
+  // is unused; the multiplier's
+  // fraction bits below the >>> 8 are unused; the phaser's 3t low bits
+  // fall off the >> 2, and d's bit 13 is always 0; the mix floor drops
+  // ph_mix[0]; spi_busy is unused (hold = 0)
+  wire _unused = &{ena, ui_in[7:6], uio_in[6], uio_in[0], spi_busy, gate_rem[1:0],
                    mul_p[7:0], trem_tri[0], ph_v3[1:0], ph_dx[13], ph_dx[1:0], ph_mix[0], 1'b0};
 
 endmodule

@@ -6,8 +6,10 @@
 // sample per frame. Runs entirely inside Icarus — ~30 s per mode.
 //
 // v3 task 7 byte layout: this tb drives the effect enables on ui[6:1]
-// (+EN=, 0..63: bit order = chain order, en[0]=comp..en[5]=delay) and the
-// fuzz octave switch on ui[7] (+OCT=, 0/1). The switches are debounced in
+// (+EN=, 0..63: bit order = chain order, en[0]=comp..en[5]=delay).
+// Rev B3 2x2 pivot: the octave switch is gone (fuzz is always the octave
+// voice); ui[7] is the PSRAM MISO (psram_model wired here in Task 22).
+// The switches are debounced in
 // the DUT (they reach the chain at frame 511; golden_model.EN_SETTLE).
 // The knob pins uio[5:2] follow an RC pin model (+K1= +K2= +K3= +K4=, 0..255,
 // -1 = absent = pin held low, the default) and ui[6] (PSRAM MISO) idles
@@ -25,7 +27,7 @@
 //   $ verilator --binary --timing -j 16 -o sim_audio_vl --top-module tb_audio \
 //       -Wno-WIDTHEXPAND -Wno-WIDTHTRUNC tb_audio.v ../src/*.v
 // Run (per mode, in parallel):
-//   vvp sim_audio.vvp +EN=2 +OCT=1 +N=2818047 +K1=-1 +K2=-1 +K3=-1 +K4=-1 > fuzzoct.log
+//   vvp sim_audio.vvp +EN=2 +N=2818047 +K1=-1 +K2=-1 +K3=-1 +K4=-1 > fuzz.log
 // Input:  audio_in.hex, or +IN=<file> (one 16-bit sample per line, from audio_in.wav)
 // Output: one "S:xxxx" line per frame on stdout
 
@@ -47,7 +49,7 @@ module tb_audio;
 
   tt_um_tmcdonagh_guitar_pedal dut (
       .ui_in  (ui_in),
-      .uo_out (),
+      .uo_out (uo_out),
       .uio_in (uio_in),
       .uio_out (),
       .uio_oe (uio_oe),
@@ -67,7 +69,8 @@ module tb_audio;
   integer k1v = -1, k2v = -1, k3v = -1, k4v = -1;   // knob plusargs, -1 = absent (declared before use)
   reg k1_pin = 1'b0, k2_pin = 1'b0, k3_pin = 1'b0, k4_pin = 1'b0;
   integer k1c = 0, k2c = 0, k3c = 0, k4c = 0;
-  assign uio_in = {2'b00, k4_pin, k3_pin, k2_pin, k1_pin, 2'b00};
+  reg adc_din = 1'b0;       // I2S ADC data on uio[1] (Rev B3 final pin map)
+  assign uio_in = {miso_pin, 1'b0, k4_pin, k3_pin, k2_pin, k1_pin, adc_din, 1'b0};
 
   always @(negedge clk) begin
     if (k1v < 0 || uio_oe[2] !== 1'b0) begin k1_pin = 1'b0; k1c = 0; end
@@ -134,9 +137,26 @@ module tb_audio;
     if (k1_arm && (dut.k4_value !== k4_ref || dut.k4_present !== k4_pref))
       k4_moved = 1'b1;
 
+  // PSRAM model (Rev B3 Task 22): on the SPI pins; SO (high-Z aware)
+  // drives ui[7]. +PSRAM=0/1 fits/unfits the chip (default fitted).
+  reg         psram_en = 1'b1;
+  reg  [31:0] psram_so_dly_ps = 32'd0;
+  wire [7:0]  uo_out;      // the SPI bus taps (uo[0]=SCK, [1]=CE#, [2]=MOSI)
+  wire        psram_so;
+  wire        psram_so_driven;
+  wire        psram_err;
+  wire [1:0]  psram_err_code;
+  wire        miso_pin = psram_so_driven ? psram_so : 1'b0;   // uio[7]; absent chip: the board pull-down
+  psram_model psram (.sck(uo_out[0]), .ce_n(uo_out[1] | ~psram_en), .si(uo_out[2]),
+                     .so(psram_so), .so_driven(psram_so_driven), .so_dly_ps(psram_so_dly_ps),
+                     .err(psram_err), .err_code(psram_err_code));
+
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
-  integer en_dip = 0, oct_sw = 0, n_in = 0;
+  integer en_dip = 0, n_in = 0;
+  // switch schedule (Rev B3 final): ui[5:0] <= EN2 at input frame AT2,
+  // EN3 at AT3 (-1 = never); wav_tool.py sched_args / golden switch_frame
+  integer en2 = 0, at2 = -1, en3 = 0, at3 = -1;
   integer i, slot;
   reg [15:0] word;
   integer dummy;
@@ -144,22 +164,29 @@ module tb_audio;
 
   initial begin
     dummy = $value$plusargs("EN=%d", en_dip);
-    dummy = $value$plusargs("OCT=%d", oct_sw);
+    dummy = $value$plusargs("EN2=%d", en2);
+    dummy = $value$plusargs("AT2=%d", at2);
+    dummy = $value$plusargs("EN3=%d", en3);
+    dummy = $value$plusargs("AT3=%d", at3);
     dummy = $value$plusargs("N=%d", n_in);
     dummy = $value$plusargs("K1=%d", k1v);
     dummy = $value$plusargs("K2=%d", k2v);
     dummy = $value$plusargs("K3=%d", k3v);
     dummy = $value$plusargs("K4=%d", k4v);
+    dummy = $value$plusargs("PSRAM=%d", psram_en);
     dummy = $value$plusargs("IN=%s", in_file);
-    ui_in[7:1] = {oct_sw[0], en_dip[5:0]};      // ui[6:1]=enables en[5:0], ui[7]=fuzz octave
+    // Rev B3 2x2 pivot: the octave switch is gone; ui[7] is the PSRAM MISO
+    // (the psram_model is wired here in Task 22).
+    // (en[5] = delay enable on ui[6]).
+    ui_in[5:0] = en_dip[5:0];   // Rev B3 final: ui[5:0] = the DIP enables, chain order
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
     $readmemh(in_file, mem);
     n_samples = n_in;
-    $display("loaded %0d samples, EN=%0d OCT=%0d K1=%0d K2=%0d K3=%0d K4=%0d",
-             n_samples, en_dip, oct_sw, k1v, k2v, k3v, k4v);
+    $display("loaded %0d samples, EN=%0d K1=%0d K2=%0d K3=%0d K4=%0d",
+             n_samples, en_dip, k1v, k2v, k3v, k4v);
 
     // reset
     rst_n = 1'b0;
@@ -168,6 +195,8 @@ module tb_audio;
     rst_n = 1'b1;
 
     for (i = 0; i < n_samples; i = i + 1) begin
+      if (i == at2) ui_in[5:0] = en2[5:0];
+      if (i == at3) ui_in[5:0] = en3[5:0];
       word = mem[i];
       if (i == EN_SETTLE - 1) begin
         k1_ref  = dut.k1_value;
@@ -182,7 +211,7 @@ module tb_audio;
       end
       // drive one frame's left half: 32 slots x 8 clk, I2S data on ui[0]
       for (slot = 0; slot < 32; slot = slot + 1) begin
-        ui_in[0] = (slot >= 1 && slot <= 16) ? word[16 - slot] : 1'b0;
+        adc_din = (slot >= 1 && slot <= 16) ? word[16 - slot] : 1'b0;
         repeat (8) @(posedge clk);
       end
       // right half: RX already latched; let registered effects settle

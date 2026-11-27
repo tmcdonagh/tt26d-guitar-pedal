@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = tt_um_tmcdonagh_guitar_pedal.v mult.v knob_rc4.v
+PROJECT_SOURCES = tt_um_tmcdonagh_guitar_pedal.v mult.v knob_rc4.v psram_spi.v
 
 ifneq ($(GATES),yes)
 
@@ -33,9 +33,14 @@ endif
 
 # Allow sharing configuration between design and testbench via `include`:
 COMPILE_ARGS 		+= -I$(SRC_DIR)
+# make -B FILL_FRAMES=64 shortens the delay tests' fill horizon (RTL only;
+# the GL netlist has no parameters and keeps 32768)
+ifneq ($(FILL_FRAMES),)
+COMPILE_ARGS 		+= -Ptb.FILL_FRAMES=$(FILL_FRAMES)
+endif
 
 # Include the testbench sources:
-VERILOG_SOURCES += $(PWD)/tb.v
+VERILOG_SOURCES += $(PWD)/tb.v $(PWD)/psram_model.v
 TOPLEVEL = tb
 
 # List test modules to run, separated by commas and without the .py suffix:

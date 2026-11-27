@@ -53,45 +53,71 @@ VL_EXE = os.path.join(HERE, "obj_dir", "sim_audio_vl")
 EXCERPT_START = 2452800
 EXCERPT_FRAMES = 288000
 
-# sha256 of little-endian int16 bytes of
-# golden_model.render(excerpt, en=0x02, tgb=True)[1024:], computed at 2063810
-# behavior. Fuzz-sound regression: any change to the fuzz voicing breaks it.
-FUZZ_BASELINE_SHA256 = "daadb2a3c1a6f891dd9cb47bd24bdfe0381babf752e514d2ed75e4484f3fe94c"
-
-# name, en (ui[6:1], bit order = chain order en[0]=comp..en[5]=delay;
-# +EN range 0..63), oct (ui[7] fuzz octave switch; +OCT 0/1). The switches
-# are debounced in the DUT: golden_model.EN_SETTLE frames render as off.
+# name, en (bit order = chain order: en[0]=comp, en[1]=dist, en[2]=phaser,
+# en[3]=trem, en[4]=delay, en[5]=freeze; +EN range 0..63). Rev B3 final
+# (2026-11-26): fuzz removed. The switches are debounced in the DUT:
+# golden_model.EN_SETTLE frames render as off.
 LISTEN_MODES = [
-    ("bypass",   0x0,  0),  # all stages off — digital clean identity
-    ("comp",     0x01, 0),  # comp: smoothed env, 1.5 dB gain table, slewed gain
-    ("fuzz",     0x02, 0),  # asym clip, env-biased negative point
-    ("fuzzoct",  0x02, 1),  # fuzz + octave blend
-    ("dist",     0x04, 0),  # diode-knee PWL, fixed drive x4
-    ("trem",     0x10, 0),  # smooth trem, K1 absent (inc 437, ~5 Hz)
-    ("fuzzdist", 0x06, 0),  # fuzz clip, then diode knee
-    ("all4",     0x17, 0),  # comp+fuzz+dist+trem (the Rev A stack, unchanged)
-    ("all5",     0x1F, 0),  # comp+fuzz+dist+phaser+trem (Rev B1)
+    ("bypass",   0x0 ),  # all stages off — digital clean identity
+    ("comp",     0x01),  # comp: smoothed env, 1.5 dB gain table, slewed gain
+    ("dist",     0x02),  # diode-knee PWL, fixed drive x4 (+ tone/gate)
+    ("trem",     0x08),  # smooth trem, K1 absent (inc 437, ~5 Hz)
+    ("compdist", 0x03),  # comp into dist
+    ("all4",     0x0F),  # comp+dist+phaser+trem
+    ("all5",     0x1F),  # comp+dist+phaser+trem+delay
 ]
-# check modes: name, en, oct, k1, k2, k3, k4 (knob K1..K4 values 0..255 for the
+# check modes: name, en, k1, k2, k3, k4 (knob K1..K4 values 0..255 for the
 # tb's RC pin model, None = absent). Every listening mode runs both
 # knobs absent; the K1 modes pin the trem/phaser rate path (inc = (64 +
 # k1[5:0]) << k1[7:6]), the K2 modes the tone shift (kt = 4 - k2[7:6]:
 # k2=0 -> kt 4 dark, k2=255 -> kt 1 bright).
-CHECK_MODES = [(name, en, oct_sw, None, None, None, None) for name, en, oct_sw in LISTEN_MODES] + [
-    ("trem_k1lo",  0x10, 0, 8, None, None, None),    # inc 72  (~0.82 Hz)
-    ("trem_k1mid", 0x10, 0, 128, None, None, None),  # inc 256 (~2.93 Hz)
-    ("trem_k1hi",  0x10, 0, 250, None, None, None),  # inc 976 (~11.2 Hz)
-    ("fuzz_k2dark",   0x02, 0, None, 0, None, None),    # fuzz + tone kt 4 (darkest)
-    ("fuzz_k2bright", 0x02, 0, None, 255, None, None),  # fuzz + tone kt 1 (brightest)
-    ("dist_k3lo",  0x04, 0, None, None, 0, None),    # dist drive x1 (256)
-    ("dist_k3hi",  0x04, 0, None, None, 255, None),  # dist drive x7.97 (2041)
-    ("phaser",      0x08, 0, None, None, None, None),  # 4-stage allpass, K1 absent (inc 87, ~1.0 Hz)
-    ("phaser_k1lo", 0x08, 0, 8, None, None, None),     # inc 72  (~0.82 Hz)
-    ("phaser_k1hi", 0x08, 0, 250, None, None, None),   # inc 976 (~11.2 Hz)
-    ("phasertrem",  0x18, 0, None, None, None, None),  # phaser into trem
-    ("fuzzphaser",  0x0A, 0, None, None, None, None),  # fuzz (+ tone/gate) into the phaser
+CHECK_MODES = [(name, en, None, None, None, None) for name, en in LISTEN_MODES] + [
+    ("trem_k1lo",  0x08, 8, None, None, None),    # inc 72  (~0.82 Hz)
+    ("trem_k1mid", 0x08, 128, None, None, None),  # inc 256 (~2.93 Hz)
+    ("trem_k1hi",  0x08, 250, None, None, None),  # inc 976 (~11.2 Hz)
+    ("dist_k2dark",   0x02, None, 0, None, None),    # dist + tone kt 4 (darkest)
+    ("dist_k2bright", 0x02, None, 255, None, None),  # dist + tone kt 1 (brightest)
+    ("dist_k3lo",  0x02, None, None, 0, None),    # dist drive x1 (256)
+    ("dist_k3hi",  0x02, None, None, 255, None),  # dist drive x7.97 (2041)
+    ("phaser",      0x04, None, None, None, None),  # 4-stage allpass, K1 absent (inc 87, ~1.0 Hz)
+    ("phaser_k1lo", 0x04, 8, None, None, None),     # inc 72  (~0.82 Hz)
+    ("phaser_k1hi", 0x04, 250, None, None, None),   # inc 976 (~11.2 Hz)
+    ("phasertrem",  0x0C, None, None, None, None),  # phaser into trem
+    ("distphaser",  0x06, None, None, None, None),  # dist (+ tone/gate) into the phaser
+    # the delay modes (Rev B3, Task 22): the ring in the PSRAM, FILL_FRAMES
+    # 32768 (the echo appears ~0.68 s into the 6 s excerpt)
+    ("delay",        0x10, None, None, None, None, 1),  # K4 absent: dly 16800 (350 ms)
+    ("delay_k4lo",   0x10, None, None, None, 0,    1),  # dly 1792 (~37 ms)
+    ("delay_k4hi",   0x10, None, None, None, 255,  1),  # dly 28448 (~593 ms)
+    ("delay_nopsram", 0x10, None, None, None, None, 0),  # no chip: ok = 0, dry
+    ("distdelay",    0x12, None, None, None, None, 1),  # dist into the delay
+    # the freeze modes (Rev B3 final): ui[5] holds the ring (write word =
+    # the word just read); switch changes at input frames 96000 / 192000
+    # (2 s / 4 s into the 6 s excerpt; effective at golden switch_frame)
+    ("freeze",        0x10, None, None, None, None, 1, ((96000, 0x30),)),  # loop over the dry signal
+    ("freeze_bypass", 0x10, None, None, None, None, 1, ((96000, 0x20), (192000, 0x30))),  # frozen while bypassed, then delay on
+    ("freeze_nopsram", 0x30, None, None, None, None, 0),  # no chip: dry, no hang
 ]
 MODES = CHECK_MODES   # `run`/`model`/parity cover every mode, knob modes included
+
+
+def mode_fields(mode):
+    """(name, en, k1, k2, k3, k4, psram, sched) of a mode tuple; psram
+    defaults to 1 (fitted) and sched (switch changes ((at, en), ...) the tb
+    makes at input frame at; at most two) to ()."""
+    name, en, k1, k2, k3, k4 = mode[:6]
+    psram = mode[6] if len(mode) > 6 else 1
+    sched = mode[7] if len(mode) > 7 else ()
+    assert len(sched) <= 2, f"{name}: the tb takes at most two switch changes"
+    return name, en, k1, k2, k3, k4, psram, sched
+
+
+def sched_args(sched):
+    """tb_audio plusargs for a switch schedule (+EN2/+AT2, +EN3/+AT3)."""
+    args = []
+    for j, (at, e) in enumerate(sched):
+        args += [f"+EN{j + 2}={e}", f"+AT{j + 2}={at}"]
+    return args
 K1_RE = re.compile(r"^K1:(\d+) (\d+) (\d+)$")
 K2_RE = re.compile(r"^K2:(\d+) (\d+) (\d+)$")
 K3_RE = re.compile(r"^K3:(\d+) (\d+) (\d+)$")
@@ -307,18 +333,20 @@ def check():
         if gl:
             tmp = OUT_DIR_GL   # netlist logs land in audio_out_gl/<mode>.log
         procs = {}
-        for name, en, oct_sw, k1, k2, k3, k4 in CHECK_MODES:
+        for mode in CHECK_MODES:
+            name, en, k1, k2, k3, k4, psram, sched = mode_fields(mode)
             with open(os.path.join(tmp, f"{name}.log"), "w") as log:
                 procs[name] = subprocess.Popen(
-                    [exe, f"+EN={en}", f"+OCT={oct_sw}", f"+N={EXCERPT_FRAMES}",
+                    [exe, f"+EN={en}", f"+N={EXCERPT_FRAMES}",
                      f"+IN={EXCERPT_HEX}", f"+K1={-1 if k1 is None else k1}",
                      f"+K2={-1 if k2 is None else k2}",
                      f"+K3={-1 if k3 is None else k3}",
-                     f"+K4={-1 if k4 is None else k4}"],
+                     f"+K4={-1 if k4 is None else k4}", f"+PSRAM={psram}"] + sched_args(sched),
                     stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
         rcs = {name: p.wait() for name, p in procs.items()}
         bad = False
-        for name, en, oct_sw, k1, k2, k3, k4 in CHECK_MODES:
+        for mode in CHECK_MODES:
+            name, en, k1, k2, k3, k4, psram, sched = mode_fields(mode)
             if rcs[name] != 0:
                 bad = True
                 print(f"{name}: FAIL (sim exited with return code {rcs[name]})")
@@ -331,7 +359,8 @@ def check():
             if not gl and not probes_ok(log_path, k1, k2, k3, k4, name):
                 bad = True
                 continue
-            want = golden_model.render(ex, en, oct=oct_sw, k1=k1, k2=k2, k3=k3, k4=k4)
+            want = golden_model.render(ex, en, k1=k1, k2=k2, k3=k3, k4=k4,
+                                       psram=bool(psram), sched=sched)
             got = parse_samples(log_path)
             first = next((i for i in range(min(len(got), len(want))) if got[i] != want[i]), None)
             if first is None and len(got) != len(want):
@@ -351,13 +380,6 @@ def check():
     else:
         bad = True
         print(f"selftest: FAIL (exit {st.returncode}) {st.stdout.strip()} {st.stderr.strip()}")
-    fz = golden_model.render(ex, en=0x02, tgb=True)[1024:]
-    digest = hashlib.sha256(struct.pack(f"<{len(fz)}h", *fz)).hexdigest()
-    if digest == FUZZ_BASELINE_SHA256:
-        print("fuzz-regression: PASS")
-    else:
-        bad = True
-        print(f"fuzz-regression: FAIL (sha256 {digest} != baseline {FUZZ_BASELINE_SHA256})")
     if bad:
         raise SystemExit(1)
 
@@ -366,8 +388,10 @@ def model():
     """Full-riff golden renders to audio_model/<mode>.wav (for listening)."""
     os.makedirs(MODEL_DIR, exist_ok=True)
     full = read_wav(IN_WAV)
-    for name, en, oct_sw, k1, k2, k3, k4 in MODES:
-        out = golden_model.render(full, en, oct=oct_sw, k1=k1, k2=k2, k3=k3, k4=k4)
+    for mode in MODES:
+        name, en, k1, k2, k3, k4, psram, sched = mode_fields(mode)
+        out = golden_model.render(full, en, k1=k1, k2=k2, k3=k3, k4=k4,
+                                  psram=bool(psram), sched=sched)
         path = os.path.join(MODEL_DIR, f"{name}.wav")
         with wave.open(path, "wb") as w:
             w.setnchannels(1)
@@ -383,7 +407,8 @@ def model_parity():
     (`model` first)."""
     out_dir = OUT_DIR_GL if os.environ.get("SIM", "verilator").startswith("gl") else OUT_DIR
     bad = []
-    for name, *_ in MODES:
+    for mode in MODES:
+        name = mode[0]
         a = read_wav(os.path.join(out_dir, f"{name}.wav"))
         b = read_wav(os.path.join(MODEL_DIR, f"{name}.wav"))
         first = next((i for i, (x, y) in enumerate(zip(a, b)) if x != y), None)
@@ -396,12 +421,12 @@ def model_parity():
         raise SystemExit(f"model-parity FAIL: {bad}")
 
 
-def run_mode(name, en, oct_sw, k1, k2, k3, k4, n, sim):
+def run_mode(name, en, k1, k2, k3, k4, n, sim, psram=1, sched=()):
     out_dir = OUT_DIR_GL if sim.startswith("gl") else OUT_DIR
-    args = [f"+EN={en}", f"+OCT={oct_sw}", f"+N={n}",
+    args = [f"+EN={en}", f"+N={n}", f"+PSRAM={psram}",
             f"+K1={-1 if k1 is None else k1}", f"+K2={-1 if k2 is None else k2}",
             f"+K3={-1 if k3 is None else k3}",
-            f"+K4={-1 if k4 is None else k4}"]
+            f"+K4={-1 if k4 is None else k4}"] + sched_args(sched)
     if sim == "gl":
         cmd = ["vvp", GL_VVP] + args
     elif sim == "glvl":
@@ -443,9 +468,11 @@ def render(label):
         pending, running, failed = list(MODES), [], []
         while pending or running:
             while pending and len(running) < RENDER_JOBS:
-                name, en, oct_sw, *knobs = pending.pop(0)
-                args = [f"+EN={en}", f"+OCT={oct_sw}", f"+N={n}"] + [
-                    f"+K{i + 1}={-1 if k is None else k}" for i, k in enumerate(knobs)]
+                entry = pending.pop(0)
+                name, en, k1, k2, k3, k4, psram, sched = mode_fields(entry)
+                args = [f"+EN={en}", f"+N={n}", f"+PSRAM={psram}"] + [
+                    f"+K{i + 1}={-1 if k is None else k}"
+                    for i, k in enumerate((k1, k2, k3, k4))] + sched_args(sched)
                 lf = open(os.path.join(logs, f"{name}.log"), "w")
                 running.append((name, lf, subprocess.Popen(
                     [VL_EXE] + args, stdout=lf, stderr=subprocess.STDOUT, cwd=HERE)))
@@ -458,7 +485,7 @@ def render(label):
             raise SystemExit("render FAIL: simulator exited non-zero: "
                              + ", ".join(f"{m} (rc {rc})" for m, rc in failed))
         rows = []
-        for name, en, oct_sw, *knobs in MODES:
+        for name, en, *knobs in MODES:
             samples = array.array("h", parse_samples(os.path.join(logs, f"{name}.log")))
             if len(samples) != n:
                 raise SystemExit(f"render FAIL: {name}: {len(samples)} samples, expected {n}")
@@ -469,7 +496,7 @@ def render(label):
                 w.writeframes(samples.tobytes())
             kn = ", ".join(f"K{i + 1}=" + ("absent" if k is None else str(k))
                            for i, k in enumerate(knobs)) or "-"
-            rows.append(f"| {name} | 0x{en:02X} | {oct_sw} | {kn} |")
+            rows.append(f"| {name} | 0x{en:02X} | {kn} |")
             print(f"{os.path.join(out, name + '.wav')}: {len(samples)} samples")
     except BaseException:
         shutil.rmtree(out, ignore_errors=True)   # never leave a partial dated folder
@@ -483,7 +510,7 @@ def render(label):
                 f"- Base commit: `{git('rev-parse', 'HEAD')}`\n"
                 f"- Command (from `test/`): `{cmd}`\n"
                 f"- Date: {today}\n\n"
-                "## Modes\n\n| name | en (ui[6:1]) | oct (ui[7]) | knobs |\n|---|---|---|---|\n"
+                "## Modes\n\n| name | en (ui[6:1]) | knobs |\n|---|---|---|\n"
                 + "\n".join(rows)
                 + "\n\n## git diff --stat HEAD (working tree vs base commit)\n\n```\n"
                 + git("diff", "--stat", "HEAD") + "\n```\n")
@@ -528,8 +555,10 @@ def main():
         elif sim == "glvl":
             glvl_build()
         n = wav2hex()
-        procs = [run_mode(name, en, oct_sw, k1, k2, k3, k4, n, sim)
-                 for name, en, oct_sw, k1, k2, k3, k4 in MODES]
+        procs = []
+        for mode in MODES:
+            name, en, k1, k2, k3, k4, psram, sched = mode_fields(mode)
+            procs.append(run_mode(name, en, k1, k2, k3, k4, n, sim, psram, sched))
         rcs = [p.wait() for p in procs]
         failed = [(m[0], rc) for m, rc in zip(MODES, rcs) if rc != 0]
         if failed:

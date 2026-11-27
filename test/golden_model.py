@@ -5,9 +5,15 @@ formulas, not by executing the RTL). One output per input frame, signed
 16-bit ints. wav_tool.py `check` compares the Verilator sim against it
 bit-exactly; `model` renders listening WAVs from it.
 
-Chain order: comp -> fuzz (+octave) -> dist -> tone -> gate -> phaser
--> trem -> delay (stub); tone + gate act only when fuzz or dist is on. en bit i enables stage i (en[0]=comp .. en[5]=delay).
+Chain order: comp -> dist -> tone -> gate -> phaser -> trem -> delay;
+tone + gate act only when dist is on. Rev B3 final (2026-11-26): fuzz is
+removed; the switches are ui[5:0] in chain order, en bits EN_COMP ..
+EN_FREEZE below.
 """
+import math
+
+# en bits = debounced ui_in[5:0] (Rev B3 final, switches in chain order)
+EN_COMP, EN_DIST, EN_PHASER, EN_TREM, EN_DELAY, EN_FREEZE = 1, 2, 4, 8, 16, 32
 
 
 def sat16(v):
@@ -17,22 +23,6 @@ def sat16(v):
 def smag(x):
     """Saturating |x|."""
     return 32767 if x == -32768 else abs(x)
-
-
-class Env:
-    """Peak-follower envelope: fast attack (average toward peak), slow
-    release. The post-update value is what the chain sees on this frame."""
-
-    def __init__(self):
-        self.v = 0
-
-    def step(self, x):
-        m = smag(x)
-        if m > self.v:
-            self.v = (self.v + m) >> 1
-        else:
-            self.v -= (self.v >> 8) + (1 if self.v else 0)
-        return self.v
 
 
 class KnobRC:
@@ -155,15 +145,6 @@ def comp(s, g):
     return sat16((s * g) >> 8)
 
 
-def fuzz(s, env, oct):
-    a = smag(s)
-    t = min(32767, 13107 + (env >> 2)) if s < 0 else 19660
-    shaped = min(a, t)
-    if oct:
-        return min(32767, shaped + a)
-    return -shaped if s < 0 else shaped
-
-
 DRIVE_ABSENT = 1024   # K3 absent: x4 (Q4.8)
 
 
@@ -197,7 +178,7 @@ def dist(s, drive_q8=DRIVE_ABSENT):
 # edge from pre-edge values, keyed by L = cenv >> 8 of the compressor's
 # pre-edge cenv: open needs L >= 256 to open, L < 128 to close (hysteresis);
 # gg ramps 0..256 (open: gg + ((256 - gg) >> 2) + 1 capped at 256, closed:
-# gg - 1 down to 0). With fuzz or dist on, out = (tone * gg) >> 8.
+# gg - 1 down to 0). With dist on, out = (tone * gg) >> 8.
 GATE_OPEN_L, GATE_CLOSE_L, GATE_MAX = 256, 128, 256
 TONE_KT_ABSENT = 2
 
@@ -291,6 +272,113 @@ def trem(s, p):
     return (s * trem_gain(p)) >> 8
 
 
+# Delay (Rev B3, Task 22): PT2399-style echo in the external PSRAM. One
+# quantized write + one read per frame, both issued by the engine after
+# chain_done (go = chain_done & ok). Per frame N (golden order):
+#   dly slews +/-1 toward the K4 target, applied from EN_SETTLE (the
+#   settled knob, like every other knob consumer; absent = 16800 = 350 ms
+#   *prov*; target = ((64 + (v & 63)) << (v >> 6)) * 28 for v = the steady
+#   K4 value, 1792..28448 frames)
+#   rd   = (ok && filled) ? the previous frame's read : 0
+#   lp  += (rd - lp) >>> 2                                  (16-bit state)
+#   mixv = (lp >>> 2) + (lp >>> 3) + (lp >>> 6)              (*prov* ~0.39)
+#   out = en5 ? sat16(x + mixv) : x      (x = the trem-stage output s6)
+#   wv   = out (the feedback uses the same mix; both are *prov* separately)
+#   w    = quant12(wv): sign-magnitude, |wv| with the low 4 bits cleared,
+#          sign reapplied (magnitude-symmetric)
+#   SPI: write w at word widx; read (widx + 1 - dly) mod 32768; widx += 1
+# filled: 1 after FILL_FRAMES writes since ok rose. ok timing (the
+# engine's): the probe completes mid-frame 16 (pu 8192 clk + ~436 clk),
+# so ok is high for every frame >= 17: the first write is frame 17's
+# (at that frame's chain_done), rd_N = the read issued at frame N-1
+# (it completes at lr ~56 of frame N, before the sample edge ~lr 135).
+# The ring models the testbench PSRAM's LFSR fill (word = bytes 2a, 2a+1)
+# so unwritten addresses are bit-exact under the FILL_FRAMES test
+# override; on real silicon pre-fill content is undefined.
+DELAY_ABSENT = 16800   # *prov* 350 ms
+
+
+def delay_target(k4):
+    """Delay length in frames from the K4 knob value (None = absent)."""
+    if k4 is None:
+        return DELAY_ABSENT
+    v = knob_steady(k4)
+    return ((64 + (v & 63)) << (v >> 6)) * 28
+
+
+def quant12(w):
+    """12-magnitude-bit sign-magnitude quantization (low 4 bits cleared)."""
+    m = smag(w) & ~0xF
+    return -m if w < 0 else m
+
+
+class Delay:
+    """The delay stage's per-frame state (dly, lp, the ring write index,
+    the fill counter). step() is one frame in the golden order above."""
+
+    def __init__(self, k4=None, fill=32768, psram=True):
+        # Rev B3 final: the delay-enable rising edge reprobes the PSRAM only
+        # while NO chip is detected (ok = 0) — a working chip keeps its ring
+        # and `filled` across delay toggles. With a chip fitted, ok is high
+        # from frame 17 on, so no reprobe ever happens here; without one,
+        # every probe fails (ok stays 0).
+        self.dly = DELAY_ABSENT
+        self.lp = 0
+        self.widx = 0
+        self.fill_cnt = 0
+        self.filled = False
+        self.rd_prev = 0
+        self.f = 0
+        self.fill = fill
+        self.psram = psram
+        self.tgt = delay_target(k4)
+        self.ring = None
+        if psram:
+            lfsr = 0xACE1
+            mem = bytearray(131072)
+            for i in range(131072):
+                mem[i] = lfsr & 0xFF
+                lfsr = ((lfsr >> 1) ^ 0xB400) if (lfsr & 1) else (lfsr >> 1)
+            # the engine's rdata is a SIGNED 16-bit word (the audio and the
+            # model's LFSR fill alike) — the unwritten addresses must be
+            # sign-interpreted to match the RTL
+            self.ring = [(((mem[2 * a] << 8) | mem[2 * a + 1]) + 32768) % 65536 - 32768
+                         for a in range(32768)]
+
+    def step(self, x, en5, freeze=False):
+        """One frame. freeze (Rev B3 final, ui[5]): the ring write word is
+        quant12(rd) — the word just read, the loop recirculates unchanged
+        and no new audio enters — instead of quant12(out). Independent of
+        the delay enable en5 (a loop frozen while bypassed plays when the
+        delay comes back on); rd is 0 before `filled`, so freezing an
+        unfilled ring holds silence."""
+        f = self.f
+        self.f += 1
+        ok = self.psram and f >= 17
+        tgt = self.tgt if f >= EN_SETTLE else DELAY_ABSENT
+        # the delay time HOLDS while frozen (a K4 move would otherwise
+        # re-slew the read pointer through a ring that only recirculates)
+        if not freeze:
+            if self.dly < tgt:
+                self.dly += 1
+            elif self.dly > tgt:
+                self.dly -= 1
+        rd = self.rd_prev if (ok and self.filled) else 0
+        self.lp += (rd - self.lp) >> 2
+        mixv = (self.lp >> 2) + (self.lp >> 3) + (self.lp >> 6)
+        out = sat16(x + mixv) if en5 else x
+        if ok:
+            a = self.widx
+            self.ring[a] = quant12(rd if freeze else out)
+            self.rd_prev = self.ring[(a + 1 - self.dly) % 32768]
+            self.widx = (a + 1) % 32768
+            self.fill_cnt += 1
+            if self.fill_cnt >= self.fill:
+                self.filled = True
+        return out
+
+
+
 # Switch-debounce settle (RTL: 2-flop sync -> deb_div, an 8-bit counter on
 # sample_strobe; every 256th strobe is a tick that samples the switches,
 # and sw updates when two consecutive ticks agree, from reset-0 state).
@@ -299,7 +387,7 @@ def trem(s, p):
 # and tick 2 is strobe 512 (frame 511): sw updates on that strobe's clock
 # edge, the same edge that latches frame 511's sample, so frame 511 is the
 # first output computed with the switch values. Frames before it render
-# with en = 0, oct = 0 (switches held constant from reset).
+# with en = 0 (switches held constant from reset).
 EN_SETTLE = 511
 
 
@@ -308,10 +396,11 @@ class Chain:
     per-frame step(); render() is this driven by the settled switches.
     Tests that change the enables mid-run drive it directly: silent
     frames leave every stage's output 0, so the enable split inside a
-    settle run does not matter."""
+    settle run does not matter.
+    Rev B3 final: no fuzz stage; no tuner/595 display."""
 
-    def __init__(self, k1=None, k2=None, k3=None, tgb=False):
-        self.env = Env()
+    def __init__(self, k1=None, k2=None, k3=None, tgb=False, k4=None,
+                 fill=32768, psram=True, reprobe=False):
         self.cst = Comp()
         self.tg = ToneGate(tone_kt(k2))
         self.inc = trem_inc(k1)
@@ -321,42 +410,58 @@ class Chain:
         self.dq = drive_q8(k3)
         self.tgb = tgb
         self.p = 0
+        self.frame = 0
+        self.s3 = 0
+        self.dly = Delay(k4, fill, psram)   # reprobe: unused since Rev B3 final (see Delay)
 
-    def step(self, x, en_i, oct_i=0):
-        """One frame with switches en_i/oct_i in force. Returns
+    def step(self, x, en_i):
+        """One frame with switches en_i in force. Returns
         (out, s3): the output word and the dist-stage output s3."""
-        e = self.env.step(x)
+        i = self.frame
+        self.frame += 1
         self.tg.gate(self.cst.cenv)          # from the pre-edge cenv
         g = self.cst.step(x)
         s = x
         # trem phase: steps on sample_valid while enabled, else held at 0
-        self.p = (self.p + self.inc) & 0x3FFFFF if en_i & 16 else 0
-        # phaser phase: the same rule on en[3]
-        self.pp = (self.pp + self.pinc) & 0x3FFFFF if en_i & 8 else 0
-        if en_i & 1:
+        self.p = (self.p + self.inc) & 0x3FFFFF if en_i & EN_TREM else 0
+        # phaser phase: the same rule on its own enable
+        self.pp = (self.pp + self.pinc) & 0x3FFFFF if en_i & EN_PHASER else 0
+        if en_i & EN_COMP:
             s = comp(s, g)
-        if en_i & 2:
-            s = fuzz(s, e, oct_i)
-        if en_i & 4:
+        if en_i & EN_DIST:
             s = dist(s, self.dq)
-        s3 = s
+        s3 = self.s3 = s
         t = self.tg.tone(s)                  # every frame, dirt or not
-        if (en_i & 6) and not self.tgb:
+        if (en_i & EN_DIST) and not self.tgb:
             s = self.tg.apply(t)
         ph = self.ph.step(s, self.pp)        # every frame, warm when off
-        if en_i & 8:
+        if en_i & EN_PHASER:
             s = ph
-        if en_i & 16:
+        if en_i & EN_TREM:
             s = trem(s, self.p)
+        # step 12: the delay (Rev B3); the ring write + read are part of
+        # the same frame (the engine issues them after chain_done)
+        s = self.dly.step(s, en_i & EN_DELAY, bool(en_i & EN_FREEZE))
         return s, s3
 
 
-def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False, tap=None, k4=None):
+def switch_frame(at):
+    """The first frame processed with switches the tb sets at the start of
+    input frame `at` (> 0): the debounce ticks at strobes 256*j (strobe n
+    latches frame n-1) and updates sw on the second agreeing tick."""
+    m = -(-(at + 1) // 256) * 256
+    return m + 255
+
+
+def render(xs, en, k1=None, k2=None, k3=None, tgb=False, tap=None, k4=None,
+           psram=True, fill=32768, sched=()):
     """k1 (0..255 or None = absent) sets the trem and phaser rate; k2 (None = absent)
-    the tone shift; k3 the dist drive (drive_q8); k4 (delay time) is
-    accepted but unused until the delay lands (Rev B3); tgb (tone/gate bypass,
-    model-only) is the fuzz regression hash.
-    en/oct are the switch values held from reset: they take effect at
+    the tone shift; k3 the dist drive (drive_q8); k4 (0..255 or None = absent)
+    the delay time (Rev B3: the PSRAM echo, delay_target); psram False
+    models an absent PSRAM chip (ok = 0: dry output, no ring writes);
+    fill = FILL_FRAMES (the tb parameter override in the short-horizon
+    tests); tgb (tone/gate bypass, model-only; unused since fuzz was removed).
+    en is the switch value held from reset: it takes effect at
     frame EN_SETTLE (debounce). The knob value is knob_steady(k1) from
     frame 0: valid because trem only reads it from EN_SETTLE on, long
     after the reader's first measurement (fast startup, ~34 frames).
@@ -372,11 +477,16 @@ def render(xs, en, oct=0, k1=None, k2=None, k3=None, tgb=False, tap=None, k4=Non
     see the drive.
     tap (a list) collects each frame's dist-stage output s3, the value
     the tone filter sees (the RTL cs value held at step 4, sampled by test.py _s3_monitor)."""
-    ch = Chain(k1, k2, k3, tgb)
+    ch = Chain(k1, k2, k3, tgb, k4, fill, psram)
     out = []
+    # sched: ((at, en_new), ...) switch changes the tb makes at input frame at
+    chg = sorted((switch_frame(at), e) for at, e in sched)
     for i, x in enumerate(xs):
-        en_i, oct_i = (en, oct) if i >= EN_SETTLE else (0, 0)
-        s, s3 = ch.step(x, en_i, oct_i)
+        en_i = en if i >= EN_SETTLE else 0
+        for f0, e in chg:
+            if i >= f0:
+                en_i = e
+        s, s3 = ch.step(x, en_i)
         if tap is not None:
             tap.append(s3)
         out.append(s)

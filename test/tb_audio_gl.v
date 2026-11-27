@@ -16,7 +16,7 @@
 // gate_level_netlist.v). Capture is PORT-BASED: synthesis flattens the
 // design and the RTL's internal `effect_sample` alias does not survive
 // (first GL compile proved it — opt_clean collapsed it), so the output
-// sample is reassembled from the DAC data pin `uio_out[1]` (slots 1..16,
+// sample is reassembled from the DAC data pin `uo_out[3]` (slots 1..16,
 // MSB first, sampled mid-slot — the same instant the codec would latch).
 // The DAC emits each frame's result one frame late (TX reloads from the
 // previous frame's effect at slot 0/32), so the loop prints the capture
@@ -37,10 +37,11 @@
 // Output: one "S:xxxx" line per frame on stdout (captured per-mode by the
 //         .log file in audio_out_gl/), converted to .wav by wav_tool.py
 //
-// +EN/+OCT/+N/+IN/+K1/+K2/+K3/+K4 interface and ui/uio byte layout: identical to
-// tb_audio.v (ui[6:1]=enables en[0]=comp..en[5]=delay, ui[7]=fuzz octave
-// via +OCT=, ui[0]=ADC data; knob pins uio[5:2] follow the same RC pin
-// model, -1 = absent = held low; ui[6] (PSRAM MISO) idles low). The K1 settle
+// +EN/+N/+IN/+K1/+K2/+K3/+K4 interface and ui/uio byte layout: identical to
+// tb_audio.v (ui[6:1]=enables en[0]=comp..en[5]=delay; ui[7] = PSRAM MISO
+// from the Rev B3 pivot — the GL tb leaves it low unless Task 22 wires the
+// model, ui[0]=ADC data; knob pins uio[5:2] follow the same RC pin
+// model, -1 = absent = held low). The K1 settle
 // probe is RTL-only (tb_audio.v).
 // Samples are printed as prefixed "S:xxxx" lines, as in tb_audio.v.
 
@@ -75,7 +76,7 @@ module tb_audio_gl;
 `endif
 
       .ui_in  (ui_in),
-      .uo_out (),
+      .uo_out (uo_out),
       .uio_in (uio_in),
       .uio_out(uio_out),
       .uio_oe (uio_oe),
@@ -97,7 +98,8 @@ module tb_audio_gl;
   integer k1v = -1, k2v = -1, k3v = -1, k4v = -1;   // knob plusargs, -1 = absent (declared before use)
   reg k1_pin = 1'b0, k2_pin = 1'b0, k3_pin = 1'b0, k4_pin = 1'b0;
   integer k1c = 0, k2c = 0, k3c = 0, k4c = 0;
-  assign uio_in = {2'b00, k4_pin, k3_pin, k2_pin, k1_pin, 2'b00};
+  reg adc_din = 1'b0;       // I2S ADC data on uio[1] (Rev B3 final pin map)
+  assign uio_in = {miso_pin, 1'b0, k4_pin, k3_pin, k2_pin, k1_pin, adc_din, 1'b0};
 
   always @(negedge clk) begin
     if (k1v < 0 || uio_oe[2] !== 1'b0) begin k1_pin = 1'b0; k1c = 0; end
@@ -128,33 +130,55 @@ module tb_audio_gl;
     end
   end
 
+  // PSRAM model (Rev B3 Task 22): on the SPI pins; SO (high-Z aware)
+  // drives ui[7]. +PSRAM=0/1 fits/unfits the chip (default fitted).
+  reg         psram_en = 1'b1;
+  reg  [31:0] psram_so_dly_ps = 32'd0;
+  wire [7:0]  uo_out;      // the SPI bus taps (uo[0]=SCK, [1]=CE#, [2]=MOSI)
+  wire        psram_so;
+  wire        psram_so_driven;
+  wire        psram_err;
+  wire [1:0]  psram_err_code;
+  wire        miso_pin = psram_so_driven ? psram_so : 1'b0;   // uio[7]; absent chip: the board pull-down
+  psram_model psram (.sck(uo_out[0]), .ce_n(uo_out[1] | ~psram_en), .si(uo_out[2]),
+                     .so(psram_so), .so_driven(psram_so_driven), .so_dly_ps(psram_so_dly_ps),
+                     .err(psram_err), .err_code(psram_err_code));
+
   reg [15:0] mem [0:3200000];
   integer n_samples = 0;
-  integer en_dip = 0, oct_sw = 0, n_in = 0;
+  integer en_dip = 0, n_in = 0;
+  // switch schedule (Rev B3 final): ui[5:0] <= EN2 at input frame AT2,
+  // EN3 at AT3 (-1 = never); wav_tool.py sched_args / golden switch_frame
+  integer en2 = 0, at2 = -1, en3 = 0, at3 = -1;
   integer i, slot;
   reg [15:0] word;
-  reg [15:0] cap;   // DAC-side sample reassembled from uio_out[1]
+  reg [15:0] cap;   // DAC-side sample reassembled from uo_out[3]
   integer dummy;
   reg [8*256-1:0] in_file = "audio_in.hex";
 
   initial begin
     dummy = $value$plusargs("EN=%d", en_dip);
-    dummy = $value$plusargs("OCT=%d", oct_sw);
+    dummy = $value$plusargs("EN2=%d", en2);
+    dummy = $value$plusargs("AT2=%d", at2);
+    dummy = $value$plusargs("EN3=%d", en3);
+    dummy = $value$plusargs("AT3=%d", at3);
     dummy = $value$plusargs("N=%d", n_in);
     dummy = $value$plusargs("IN=%s", in_file);
     dummy = $value$plusargs("K1=%d", k1v);
     dummy = $value$plusargs("K2=%d", k2v);
     dummy = $value$plusargs("K3=%d", k3v);
     dummy = $value$plusargs("K4=%d", k4v);
-    ui_in[7:1] = {oct_sw[0], en_dip[5:0]};      // ui[6:1]=enables en[5:0], ui[7]=fuzz octave
+    dummy = $value$plusargs("PSRAM=%d", psram_en);
+    // Rev B3 2x2 pivot: ui[7] = PSRAM MISO (model wired in Task 22);
+    ui_in[5:0] = en_dip[5:0];   // Rev B3 final: ui[5:0] = the DIP enables, chain order
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
 
     $readmemh(in_file, mem);
     n_samples = n_in;
-    $display("loaded %0d samples, EN=%0d OCT=%0d K1=%0d K2=%0d K3=%0d K4=%0d",
-             n_samples, en_dip, oct_sw, k1v, k2v, k3v, k4v);
+    $display("loaded %0d samples, EN=%0d K1=%0d K2=%0d K3=%0d K4=%0d",
+             n_samples, en_dip, k1v, k2v, k3v, k4v);
 
     // reset
     rst_n = 1'b0;
@@ -167,13 +191,15 @@ module tb_audio_gl;
     // capture at the end of iteration i (for i ≥ 1) yields log line
     // i−1 = effect of input i−1 — identical alignment to the RTL log.
     for (i = 0; i < n_samples + 1; i = i + 1) begin
+      if (i == at2) ui_in[5:0] = en2[5:0];
+      if (i == at3) ui_in[5:0] = en3[5:0];
       word = (i < n_samples) ? mem[i] : 16'h0000;
       // drive one frame's left half: 32 slots x 8 clk, I2S data on ui[0];
-      // reassemble the DAC sample from uio_out[1], slots 1..16, mid-slot
+      // reassemble the DAC sample from uo_out[3], slots 1..16, mid-slot
       for (slot = 0; slot < 32; slot = slot + 1) begin
-        ui_in[0] = (slot >= 1 && slot <= 16) ? word[16 - slot] : 1'b0;
+        adc_din = (slot >= 1 && slot <= 16) ? word[16 - slot] : 1'b0;
         repeat (4) @(posedge clk);
-        if (slot >= 1 && slot <= 16) cap = {cap[14:0], uio_out[1]};
+        if (slot >= 1 && slot <= 16) cap = {cap[14:0], uo_out[3]};
         repeat (4) @(posedge clk);
       end
       // right half: RX already latched; let registered effects settle

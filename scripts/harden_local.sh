@@ -7,11 +7,13 @@
 # checks, and write SUMMARY.md. No GitHub Actions needed.
 # Full write-up: ai-dev-archive .../specs/2x2-pedalboard/local-gds-flow.md
 #
-# Usage: scripts/harden_local.sh <label> [--force] [--no-glvl] [--gl-test]
+# Usage: scripts/harden_local.sh <label> [--force] [--no-glvl] [--gl-test] [--tiles <WxH>]
 #   <label>     run dir is ~/tools/harden/<label>/ (must not exist, see --force)
 #   --force     delete an existing ~/tools/harden/<label>/ first
 #   --no-glvl   skip the fast Verilator gate-level check (~10 min)
 #   --gl-test   also run the slow iverilog cocotb gate-level test (>30 min)
+#   --tiles T   harden at tile size T (e.g. 3x2): rewrites `tiles:` in the COPY's
+#               info.yaml only, never the repo's; recorded in SUMMARY.md
 # Env overrides: TOOLS (~/tools), HARDEN_PDK / PRECHECK_PDK (ciel hashes).
 set -euo pipefail
 
@@ -22,18 +24,22 @@ TOP=tt_um_tmcdonagh_guitar_pedal
 CVENV="${CVENV:-/home/tom/dev/.venv-tt}"   # cocotb venv for the gate-level make test
 CIEL="$HOME/.ciel/ciel/sky130/versions"
 
-label="" force=0 do_glvl=1 do_gltest=0
-for a in "$@"; do
+label="" force=0 do_glvl=1 do_gltest=0 tiles=""
+while [ $# -gt 0 ]; do
+  a="$1"; shift
   case "$a" in
+    --tiles) [ $# -gt 0 ] || { echo "--tiles needs a value (e.g. 3x2)" >&2; exit 2; }
+             tiles="$1"; shift
+             [[ "$tiles" =~ ^[0-9]+x[0-9]+$ ]] || { echo "bad --tiles: $tiles" >&2; exit 2; } ;;
     --force) force=1 ;;
     --no-glvl) do_glvl=0 ;;
     --gl-test) do_gltest=1 ;;
-    -h|--help) sed -n 2,16p "$0"; exit 0 ;;
+    -h|--help) sed -n 2,19p "$0"; exit 0 ;;
     -*) echo "unknown option: $a" >&2; exit 2 ;;
     *) [ -z "$label" ] && label="$a" || { echo "one label only" >&2; exit 2; } ;;
   esac
 done
-[ -n "$label" ] || { echo "usage: $0 <label> [--force] [--no-glvl] [--gl-test]" >&2; exit 2; }
+[ -n "$label" ] || { echo "usage: $0 <label> [--force] [--no-glvl] [--gl-test] [--tiles WxH]" >&2; exit 2; }
 [[ "$label" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "bad label: $label" >&2; exit 2; }
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -94,6 +100,15 @@ ln -sfn "$TOOLS/tt" "$DEST/tt"
 cd "$DEST"
 BASE_COMMIT="$(git -C "$REPO" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 DIRTY="$(git -C "$REPO" status --porcelain 2>/dev/null | wc -l)"
+
+# --tiles: rewrite tiles: in the COPY's info.yaml (never the repo's)
+TILES_NOTE="from info.yaml ($(sed -nE 's/^[[:space:]]*tiles:[[:space:]]*"?([0-9]+x[0-9]+).*/\1/p' info.yaml | head -1))"
+if [ -n "$tiles" ]; then
+  grep -qE '^[[:space:]]*tiles:' info.yaml || { echo "no tiles: line in info.yaml" >&2; exit 2; }
+  sed -i -E "s/^([[:space:]]*tiles:[[:space:]]*).*/\\1\"$tiles\"/" info.yaml
+  TILES_NOTE="$tiles (override; repo info.yaml untouched)"
+fi
+grep -E '^[[:space:]]*tiles:' info.yaml
 
 # --- 2. harden ----------------------------------------------------------------
 set +u; source "$TOOLS/venv-ll/bin/activate"; set -u
@@ -165,13 +180,14 @@ fi
 # --- 5. SUMMARY.md --------------------------------------------------------------
 say "writing SUMMARY.md"
 STEPS_FILE="$(mktemp)"; printf '%s\n' "${STEPS[@]}" >"$STEPS_FILE"
-LABEL="$label" SRC="$REPO" BASE="$BASE_COMMIT" DIRTY="$DIRTY" PCS="$precheck_status" TOTAL=$((SECONDS - START)) \
+LABEL="$label" SRC="$REPO" BASE="$BASE_COMMIT" DIRTY="$DIRTY" TILES="$TILES_NOTE" PCS="$precheck_status" TOTAL=$((SECONDS - START)) \
   STEPS_FILE="$STEPS_FILE" "$PYSYS" -I - <<'PY' >SUMMARY.md
 import json, os, re
 e = os.environ
 def sec(s): return f"{int(s)//60}m{int(s)%60:02d}s"
 out = [f"# Local harden summary: {e['LABEL']}", "",
        f"- Source: {e['SRC']} (base commit {e['BASE']}, {e['DIRTY']} dirty paths in the working tree)",
+       f"- Tiles: {e['TILES']}",
        f"- Total wall time: {sec(int(e['TOTAL']))}", ""]
 fails = []
 out += ["## Steps", "", "| step | result | time | note |", "|---|---|---|---|"]
