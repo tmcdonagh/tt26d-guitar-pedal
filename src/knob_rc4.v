@@ -6,7 +6,9 @@
 // one knob at a time, knob 0, 1, 2, 3, 0, .. in turn (sel); every
 // measurement is exactly the per-knob algorithm of the v3 task 9 reader:
 // it discharges the selected cap by driving that pin low (drive_low[sel]
-// = 1 -> uio_oe) for 1024 clk, then releases it (CHARGE) and counts clk
+// = 1 -> uio_oe) for 8192 clk (Rev B4, was 1024: a 10 kOhm pot needs
+// a 100 nF cap at 24.576 MHz, 220 nF on a 12.5 MHz FPGA, and 8192 clk
+// empties it fully with margin for the pad's on-resistance), then releases it (CHARGE) and counts clk
 // in the 16-bit cnt until the selected pin's 2-flop synchronizer reads 1:
 //   raw = min(255, cnt >> 6)
 // and present[sel] <= 1. If cnt reaches 65535 first (pin never rises:
@@ -14,12 +16,12 @@
 // 0, value holds. Either way the next knob's DISCHARGE starts on the same
 // edge (sel + 1, cnt = 0). Pins that are not selected are released
 // (inputs): a present knob's cap charges to 1 between its turns and is
-// pulled low again by its next 1024-clk discharge.
+// pulled low again by its next 8192-clk discharge.
 // Timing (pins the testbench knob model): the release edge leaves cnt = 0;
 // a pin that rises right after clk edge N of the charge phase is seen
 // through the synchronizer at edge N + 3 with cnt = N + 2 (SYNC_LAT = 2),
 // and the charge phase lasts N + 3 clk. One rotation takes at most
-// 4 x (1024 + 65536) clk (all absent).
+// 4 x (8192 + 65536) clk (all absent).
 // Smoothing per completed measurement, on the selected knob's state only:
 // the first one while not present (after reset or an absence) loads
 // acc = raw << 2 and value = raw (fast startup); later ones run the IIR
@@ -77,8 +79,8 @@ module knob_rc4 (
     end else begin
       pin_s1 <= pin_in;
       pin_s2 <= pin_s1;
-      if (dis) begin                             // DISCHARGE, 1024 clk
-        if (cnt == 16'd1023) begin
+      if (dis) begin                             // DISCHARGE, 8192 clk
+        if (cnt == 16'd8191) begin
           drive_low <= 4'b0000;
           cnt       <= 16'd0;
         end else begin

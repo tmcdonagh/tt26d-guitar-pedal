@@ -101,8 +101,9 @@ loop) survives.
 **Knobs.** `uio[2]`-`uio[5]` are RC-timing knob pins K1 (tremolo and
 phaser rate), K2 (tone), K3 (distortion drive), K4 (delay time). One shared
 round-robin reader measures the four knobs in turn (a full rotation takes at
-most about 4 x 66k clk = 11 ms with every knob absent; fitted knobs are
-faster). For the knob in turn it drives the pin low for 1024 clk to
+most about 4 x 74k clk = 12 ms with every knob absent; with four fitted
+knobs it is at most about 4 ms). For the knob in turn it drives the pin low
+for 8192 clk to
 discharge the capacitor, releases it, and counts clk until the pin reads
 high (raw = count / 64, capped at 255; a 65535 clk timeout means "absent").
 The reading is smoothed (IIR over measurements) with a 2-count hysteresis,
@@ -199,23 +200,35 @@ comparison against an independent Python model, and
   pull-down resistor to GND, the switch common to 3V3** (open = low = off);
   the demoboard DIPs work directly. Toggles, stomp switches and push-pull
   pots all work; the design debounces them.
-- **Knobs (K1-K4, all optional; use 22-27 nF instead of 10-15 nF if an FPGA
-  runs the design at 12.5 MHz)**: per knob, 3V3 -> 1 kOhm in series with a
-  100 kOhm linear pot -> node; node -> 10 nF -> GND; node -> the `uio` pin.
+- **Knobs (K1-K4, all optional; use 220 nF instead of 100 nF if an FPGA
+  runs the design at 12.5 MHz)**: per knob, 3V3 -> 1 kOhm -> lug 1 of a
+  **10 kOhm linear (B10K) pot**; the wiper is the node (tie lug 3 to it);
+  node -> **100 nF** (film or C0G) -> GND; node -> the `uio` pin. Lug 1 +
+  wiper make the value rise clockwise.
   The 1 kOhm series resistor is **mandatory**: during each discharge the pin
   drives low against the pot, and with the pot at 0 Ohm the 1 kOhm limits
-  that current to about 3.3 mA. Never omit it.
+  that current to about 3.3 mA. Never omit it. It also sets the bottom of
+  the range (raw about 23 at the pot's 0 Ohm end, spread evenly up to 255).
+  *Why 10 kOhm.* The Tiny Tapeout demoboard's RP2350 sits on these pins as
+  an input with its ~50 kOhm pull-down enabled. With a 100 kOhm pot that
+  pull-down forms a divider the cap can never charge past the pad threshold
+  (the top of the rotation reads "absent"); with 10 kOhm the node still
+  reaches about 2.7 V and the pull-down only bends the curve by about 10 %.
+  So the same parts work on the demoboard and on a bare pedal board, with
+  no firmware change. Avoid pots above about 20 kOhm.
   *Full scale and the capacitor.* A reading of raw = 255 needs a charge
   count of at least 16,320 clk (the reader uses cnt >> 6). The count is
   about -ln(1 - Vth/VDD) x R x C x f_clk, where Vth is the pad's input
-  threshold. With 101 kOhm x 10 nF (tau about 24,800 clk at 24.576 MHz)
-  full scale needs the pad to trip at about 0.48 x VDD or higher. A lower
-  threshold loses the top of the range. **12-15 nF is recommended**: it
-  guarantees the full range at the cost of a small dead zone at the top of
-  the rotation. The 65,535 clk timeout still has margin at 15 nF (about
-  1.76 tau). This has not been validated on hardware yet.
-  A **knob that is not fitted must have its pin tied to GND through about 10
-  kOhm** (not left floating) so it reads absent and the default is used.
+  threshold. With 11 kOhm x 100 nF at 24.576 MHz full scale needs the pad
+  to trip at about 0.45 x VDD or higher; a lower threshold leaves a small
+  dead zone at the top of the rotation, a higher one loses the top of the
+  range (use 120 nF if so). The 8192-clk discharge (333 us) empties 100 nF
+  through the pad's on-resistance with a wide margin, and the 65,535 clk
+  timeout has margin up to well past 220 nF. Not yet validated on
+  hardware.
+  A **knob that is not fitted must have its pin tied to GND** (directly or
+  through about 10 kOhm; the reader only ever drives low) so it reads
+  absent and the default is used.
 - **PSRAM (Tiny Tapeout QSPI Pmod, RAM A, used in plain SPI mode)**. The
   Pmod's signal labels PMOD1-PMOD8 (= the TT uio[0]-uio[7] QSPI
   convention) sit on the standard Pmod header pins 1-4 (top row) and 7-10

@@ -77,6 +77,11 @@ async def test_skeleton_baseline(dut):
 # ---------------------------------------------------------------------
 
 CLK_PERIOD_PS = 40534
+# knob_rc4 discharge phase per knob turn (Rev B4: 8192, was 1024, so the
+# 100-220 nF caps of 10 kOhm pots empty fully)
+KNOB_DIS = 8192
+# one knob turn, worst case: discharge + the 65536-clk absent timeout
+KNOB_TURN_MAX = KNOB_DIS + 65536 + 200
 
 
 async def _bclk_edge(dut, want_rising, settle_ns=1):
@@ -283,7 +288,7 @@ async def knob_cycle(dut, idx):
     discharge, so uio_oe[2 + (idx+1) % 4] rises. Returns the charge length
     in clk. Fails (instead of hanging) if no full cycle within one
     worst-case rotation (4 timeouts) plus 2 timeouts."""
-    return await with_timeout(_knob_cycle(dut, idx), 6 * 67000 * CLK_PERIOD_PS, "ps")
+    return await with_timeout(_knob_cycle(dut, idx), 6 * KNOB_TURN_MAX * CLK_PERIOD_PS, "ps")
 
 
 async def _knob_cycle(dut, idx):
@@ -303,7 +308,7 @@ async def _knob_cycle(dut, idx):
 
 def fast_knobs(dut, *idxs):
     """Pin models at v = 0 on the given knobs: each of their round-robin
-    turns then lasts 1024 + 33 clk instead of a 66.6k-clk timeout, so the
+    turns then lasts KNOB_DIS + 33 clk instead of a ~74k-clk timeout, so the
     knob under test comes round quickly (timing only: tests that use this
     never read those knobs' values)."""
     return [knob_pin(dut, i, 0) for i in idxs]
@@ -814,8 +819,8 @@ async def _bare_reset(dut):
 @cocotb.test()
 async def test_knob_reader(dut):
     """RC knob reader (knob_rc4 round robin, K1 on uio[2]; K2..K4 run
-    v = 0 pin models so K1's turn comes round every ~4.2k clk): discharge
-    1024 clk with uio_oe[2] = 1, then charge until the pin reads 1; raw =
+    v = 0 pin models so K1's turn comes round every ~33k clk): discharge
+    KNOB_DIS clk with uio_oe[2] = 1, then charge until the pin reads 1; raw =
     cnt >> 6. Port level: every charge phase (uio_oe[2] fall -> the next
     knob's uio_oe[3] rise) lasts exactly 64*v + 33 clk (the pin
     model's N = 64v + 32 - SYNC_LAT, + SYNC_LAT synchronizer, + the
@@ -899,7 +904,7 @@ async def test_knob4_reader(dut):
 async def test_knob_round_robin(dut):
     """One shared reader (knob_rc4, Task 15a) measures K1, K2, K3, K4,
     K1, .. in turn: at any time at most one knob pin is driven (uio_oe
-    [5:2] one-hot or 0), each turn discharges its pin for 1024 clk then
+    [5:2] one-hot or 0), each turn discharges its pin for KNOB_DIS clk then
     releases it, and the measurement end (pin seen high: 64*v + 33 clk;
     absent: the 65536-clk timeout) starts the next knob's discharge on
     the same edge. K3 = 20, the rest absent (pins held low)."""
@@ -924,13 +929,14 @@ async def test_knob_round_robin(dut):
                 ev.append((get_sim_time(unit="ps"), cur))
         return ev
 
-    ev = await with_timeout(record(10), 5 * 67000 * CLK_PERIOD_PS, "ps")
+    ev = await with_timeout(record(10), 5 * KNOB_TURN_MAX * CLK_PERIOD_PS, "ps")
     pats = [p for _, p in ev]
     assert pats == [1, 0, 2, 0, 4, 0, 8, 0, 1, 0], f"turn order {pats}"
     lens = [round((b[0] - a[0]) / CLK_PERIOD_PS) for a, b in zip(ev, ev[1:])]
-    want = [1024, 65536, 1024, 65536, 1024, 64 * 20 + 33, 1024, 65536, 1024]
+    D = KNOB_DIS
+    want = [D, 65536, D, 65536, D, 64 * 20 + 33, D, 65536, D]
     # the first discharge counts from the reset release (+-1 clk of phase)
-    assert abs(lens[0] - 1024) <= 1 and lens[1:] == want[1:], f"phase lengths {lens}"
+    assert abs(lens[0] - D) <= 1 and lens[1:] == want[1:], f"phase lengths {lens}"
 
 
 def _signed(x):
@@ -995,9 +1001,9 @@ async def test_trem_rate_change(dut):
     (GL-visible): the post-change output must DIFFER from the golden
     render that keeps k1 = 128 (the rate really changed). Round robin
     (knob_rc4): K2..K4 run v = 0 pin models (en = trem only, so their
-    values never reach the output), giving one K1 reading per ~40
-    frames; the IIR needs 16 readings from 128 to 249, so the post-change
-    run is 900 frames."""
+    values never reach the output), giving one K1 reading per ~96
+    frames (8192-clk discharges); the IIR needs 16 readings from 128 to
+    249 (~1540 frames), so the post-change run is 1800 frames."""
     kp = knob_pin(dut, 0, 128)
     fast_knobs(dut, 1, 2, 3)
     await start(dut, EN_TREM)
@@ -1005,11 +1011,11 @@ async def test_trem_rate_change(dut):
     want = golden_model.render([0] * START_FRAME + [16384] * 200, EN_TREM, k1=128)[START_FRAME:]
     assert pre == want, "pre-change output must equal golden (k1=128)"
     kp.v = 250
-    post = await fast_frames(dut, [16384] * 900)
+    post = await fast_frames(dut, [16384] * 1800)
     seq = pre + post[1:]
     step = max(abs(a - b) for a, b in zip(seq, seq[1:]))
     assert step <= TREM_MAX_STEP_16384, f"max |dout| across the change {step}"
-    keep = golden_model.render([0] * START_FRAME + [16384] * 1100, EN_TREM, k1=128)[START_FRAME + 200:]
+    keep = golden_model.render([0] * START_FRAME + [16384] * 2000, EN_TREM, k1=128)[START_FRAME + 200:]
     ndiff = sum(1 for a, b in zip(post, keep) if a != b)
     assert ndiff > 200, f"post-change output tracks the k1=128 render ({ndiff} diffs): rate did not change"
     kval, kpres = _probe(dut, "k1_value"), _probe(dut, "k1_present")
@@ -1209,7 +1215,7 @@ async def test_pin_map(dut):
     data are inputs at EVERY clk — Review Focus 4: an input pin driven
     into the ADC/PSRAM output would fight it; uio[5:2] are the knob pins
     K4..K1, driven low only while the round-robin reader discharges that
-    pin: K1 alone in reset and for the first 1024 clk after it),
+    pin: K1 alone in reset and for the first KNOB_DIS (8192) clk after it),
     uio_out[5:2] = 0, uo = {dp 0, CS0 hold 1, 0, LRCLK, DAC, MOSI 0,
     CE# 1, SCK 0} at idle."""
     cocotb.start_soon(
@@ -1225,9 +1231,9 @@ async def test_pin_map(dut):
     assert int(dut.uio_out.value) & 0b0011_1100 == 0, "uio_out[5:2] must be 0 in reset"
     assert int(dut.uo_out.value) & 0xE7 == 0x42, "uo must idle dp=0 CS0=1 uo5=0 SCK=0 CS=1 MOSI=0 in reset"
     dut.rst_n.value = 1
-    await ClockCycles(dut.clk, 1020)
+    await ClockCycles(dut.clk, KNOB_DIS - 4)
     await Timer(1, unit="ns")
-    assert dut.uio_oe.value == 0b0100_0101, "K1 alone must discharge for 1024 clk"
+    assert dut.uio_oe.value == 0b0100_0101, f"K1 alone must discharge for {KNOB_DIS} clk"
     await ClockCycles(dut.clk, 10)
     await Timer(1, unit="ns")
     assert dut.uio_oe.value == 0b0100_0001, "K1 must release after the discharge"
@@ -1235,7 +1241,7 @@ async def test_pin_map(dut):
     # every knob phase (4 discharges + charges, all knobs absent: the
     # 65536-clk timeout each), sampled every 64 clk: uio[7] and uio[1]
     # never driven, uio[6] and uio[0] always driven
-    for _ in range(4 * 67000 // 64):
+    for _ in range(4 * KNOB_TURN_MAX // 64):
         await ClockCycles(dut.clk, 64)
         oe = int(dut.uio_oe.value)
         assert oe & 0b1000_0010 == 0, f"uio[7]/uio[1] driven: uio_oe {oe:08b}"

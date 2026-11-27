@@ -108,8 +108,8 @@ module tb_audio;
   // at the start of frame 510; printed as "K1:value present moved".
   // The probes read the top-level knob_rc4 outputs dut.kN_value /
   // dut.kN_present (one round-robin reader since Task 15a; worst case
-  // K4's first reading lands after 3 absent knobs' timeouts, ~217k clk
-  // ~ frame 424, before the frame-510 reference).
+  // K4's first reading lands after 3 absent knobs' timeouts, ~246k clk
+  // ~ frame 480 (8192-clk discharges), before the frame-510 reference).
   localparam integer EN_SETTLE = 511;
   reg [7:0] k1_ref = 8'd0;
   reg       k1_pref = 1'b0, k1_arm = 1'b0, k1_moved = 1'b0;
