@@ -19,7 +19,7 @@ Usage (from test/):
     python3 wav_tool.py model-parity # bit-exact audio_out/ (run) vs audio_model/ (model)
     python3 wav_tool.py render <label>  # RTL full riff, every mode -> ../renders/YYYY-MM-DD-<label>/
                                      # (<mode>.wav + README.md; refuses an existing folder)
-Modes = MODES (= CHECK_MODES: listening modes plus the K1/K2/K3 knob modes).
+Modes = MODES (= CHECK_MODES: listening modes plus the knob modes).
 """
 import array
 import os
@@ -60,28 +60,29 @@ EXCERPT_FRAMES = 288000
 LISTEN_MODES = [
     ("bypass",   0x0 ),  # all stages off — digital clean identity
     ("comp",     0x01),  # comp: smoothed env, 1.5 dB gain table, slewed gain
-    ("dist",     0x02),  # diode-knee PWL, fixed drive x4 (+ tone/gate)
-    ("trem",     0x08),  # smooth trem, K1 absent (inc 437, ~5 Hz)
+    ("dist",     0x02),  # diode-knee PWL, fixed drive x7.97 (+ tone/gate)
+    ("trem",     0x08),  # smooth trem, K3 absent (inc 437, ~5 Hz)
     ("compdist", 0x03),  # comp into dist
     ("all4",     0x0F),  # comp+dist+phaser+trem
     ("all5",     0x1F),  # comp+dist+phaser+trem+delay
 ]
 # check modes: name, en, k1, k2, k3, k4 (knob K1..K4 values 0..255 for the
-# tb's RC pin model, None = absent). Every listening mode runs both
-# knobs absent; the K1 modes pin the trem/phaser rate path (inc = (64 +
-# k1[5:0]) << k1[7:6]), the K2 modes the tone shift (kt = 4 - k2[7:6]:
-# k2=0 -> kt 4 dark, k2=255 -> kt 1 bright).
+# tb's RC pin model, None = absent). Rev B5 knob map: K1 tone, K2 echo
+# level + trem depth, K3 speed (trem + phaser rate), K4 delay time. Every
+# listening mode runs all knobs absent; the K3 modes pin the trem/phaser
+# rate path (inc = (64 + k3[5:0]) << k3[7:6]), the K1 modes the tone
+# shift (kt = 4 - k1[7:6]: k1=0 -> kt 4 dark, k1=255 -> kt 1 bright).
 CHECK_MODES = [(name, en, None, None, None, None) for name, en in LISTEN_MODES] + [
-    ("trem_k1lo",  0x08, 8, None, None, None),    # inc 72  (~0.82 Hz)
-    ("trem_k1mid", 0x08, 128, None, None, None),  # inc 256 (~2.93 Hz)
-    ("trem_k1hi",  0x08, 250, None, None, None),  # inc 976 (~11.2 Hz)
-    ("dist_k2dark",   0x02, None, 0, None, None),    # dist + tone kt 4 (darkest)
-    ("dist_k2bright", 0x02, None, 255, None, None),  # dist + tone kt 1 (brightest)
-    ("dist_k3lo",  0x02, None, None, 0, None),    # dist drive x1 (256)
-    ("dist_k3hi",  0x02, None, None, 255, None),  # dist drive x7.97 (2041)
-    ("phaser",      0x04, None, None, None, None),  # 4-stage allpass, K1 absent (inc 87, ~1.0 Hz)
-    ("phaser_k1lo", 0x04, 8, None, None, None),     # inc 72  (~0.82 Hz)
-    ("phaser_k1hi", 0x04, 250, None, None, None),   # inc 976 (~11.2 Hz)
+    ("trem_k3lo",  0x08, None, None, 8, None),    # inc 72  (~0.82 Hz)
+    ("trem_k3mid", 0x08, None, None, 128, None),  # inc 256 (~2.93 Hz)
+    ("trem_k3hi",  0x08, None, None, 250, None),  # inc 976 (~11.2 Hz)
+    ("trem_k2lo",  0x08, None, 0, None, None),    # Rev B5 depth 0: no trem
+    ("trem_k2hi",  0x08, None, 255, None, None),  # Rev B5 depth ~100% (gain 2..256)
+    ("dist_k1dark",   0x02, 0, None, None, None),    # dist + tone kt 4 (darkest)
+    ("dist_k1bright", 0x02, 255, None, None, None),  # dist + tone kt 1 (brightest)
+    ("phaser",      0x04, None, None, None, None),  # 4-stage allpass, K3 absent (inc 87, ~1.0 Hz)
+    ("phaser_k3lo", 0x04, None, None, 8, None),     # inc 72  (~0.82 Hz)
+    ("phaser_k3hi", 0x04, None, None, 250, None),   # inc 976 (~11.2 Hz)
     ("phasertrem",  0x0C, None, None, None, None),  # phaser into trem
     ("distphaser",  0x06, None, None, None, None),  # dist (+ tone/gate) into the phaser
     # the delay modes (Rev B3, Task 22): the ring in the PSRAM, FILL_FRAMES
@@ -90,6 +91,8 @@ CHECK_MODES = [(name, en, None, None, None, None) for name, en in LISTEN_MODES] 
     ("delay_k4lo",   0x10, None, None, None, 0,    1),  # dly 1792 (~37 ms)
     ("delay_k4hi",   0x10, None, None, None, 255,  1),  # dly 28448 (~593 ms)
     ("delay_nopsram", 0x10, None, None, None, None, 0),  # no chip: ok = 0, dry
+    ("delay_k2lo",   0x10, None, 0,    None, None, 1),  # Rev B5 level 0: dry heard, ring still fills
+    ("delay_k2hi",   0x10, None, 255,  None, None, 1),  # Rev B5 level ~1.0, repeats fixed ~0.39
     ("distdelay",    0x12, None, None, None, None, 1),  # dist into the delay
     # the freeze modes (Rev B3 final): ui[5] holds the ring (write word =
     # the word just read); switch changes at input frames 96000 / 192000

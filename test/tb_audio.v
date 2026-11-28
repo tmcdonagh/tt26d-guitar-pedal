@@ -102,7 +102,7 @@ module tb_audio;
   end
 
   // Knob-settle probe (RTL only; read by wav_tool.py check): the golden
-  // model applies knob_steady(k1) from frame 0, which is exact only if
+  // model applies knob_steady(k) (K1 = tone since Rev B5) from frame 0, which is exact only if
   // the K1 reading (value, present) never moves from frame EN_SETTLE-1
   // (510) on. k1_moved latches any change after the reference is taken
   // at the start of frame 510; printed as "K1:value present moved".
@@ -116,14 +116,14 @@ module tb_audio;
   always @(posedge clk)
     if (k1_arm && (dut.k1_value !== k1_ref || dut.k1_present !== k1_pref))
       k1_moved = 1'b1;
-  // the same probe on K2 (tone shift), printed as "K2:value present moved"
+  // the same probe on K2 (Rev B5: echo level + trem depth), printed as "K2:value present moved"
   reg [7:0] k2_ref = 8'd0;
   reg       k2_pref = 1'b0, k2_moved = 1'b0;
   always @(posedge clk)
     if (k1_arm && (dut.k2_value !== k2_ref || dut.k2_present !== k2_pref))
       k2_moved = 1'b1;
 
-  // and on K3 (dist drive), printed as "K3:value present moved"
+  // and on K3 (Rev B5: trem + phaser speed), printed as "K3:value present moved"
   reg [7:0] k3_ref = 8'd0;
   reg       k3_pref = 1'b0, k3_moved = 1'b0;
   always @(posedge clk)

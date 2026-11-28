@@ -596,8 +596,8 @@ class Hist:
     of an isolated-frame literal. The gate is opened beforehand by a
     loud priming run (L >= 256) so the outputs are non-zero."""
 
-    def __init__(self, en, k3=None):
-        self.en, self.k3 = en, k3
+    def __init__(self, en):
+        self.en = en
         self.xs = [0] * START_FRAME
 
     def add(self, x, n=1):
@@ -606,7 +606,7 @@ class Hist:
     def render(self, en=None):
         tap = []
         out = golden_model.render(self.xs, self.en if en is None else en,
-                                  k3=self.k3, tap=tap)
+                                  tap=tap)
         return out, tap
 
 
@@ -678,11 +678,12 @@ async def hold_frames(dut, hist, word16, n=HOLD_FRAMES, direct=True):
 
 @cocotb.test()
 async def test_dist_diode(dut):
-    """Dist stage (en[2]), v3 task 5: fixed drive x4 into a 3-piece diode
-    knee. a = sat_mag(x); w = 4a (18-bit, no intermediate saturation);
+    """Dist stage (en[2]), v3 task 5: fixed drive x7.97 (Rev B5: 2041,
+    Q4.8) into a 3-piece diode knee. a = sat_mag(x); w = (a * 2041) >> 8
+    (18-bit, no intermediate saturation);
     w <= 8192: out = w; w <= 32768: out = 8192 + ((w-8192) >> 2) (slope
     1/4, 14336 at w = 32768); else out = 14336 + ((w-32768) >> 4)
-    (slope 1/16, max 20479 — sat16 never reached). Sign reapplied from
+    (slope 1/16, max 28615 — sat16 never reached). Sign reapplied from
     x[15]. Comp is off, so the input is the raw sample. Exact points
     pin both seams (K1 at a=2048, K2 at a=8192, both sides) and the
     extremes; each is also asserted against golden_model.dist. Since
@@ -702,18 +703,16 @@ async def test_dist_diode(dut):
         return stage
 
     points = [
-        (1000, 4000),      # linear x4 below K1
-        (4096, 10240),     # w = 16384 -> 8192 + 8192/4
-        (2047, 8188),      # just below K1
-        (2048, 8192),      # K1 (w = 8192)
-        (2049, 8193),      # just above K1: slope 1/4 (8192 + 4/4)
-        (8191, 14335),     # w = 32764 -> 8192 + 24572/4
-        (8192, 14336),     # K2 (w = 32768)
-        (8193, 14336),     # w = 32772 -> 14336 + 4/16 (floor)
-        (32767, 20479),    # w = 131068 -> 14336 + 98300/16
-        (-32768, -20479),  # mag sat 32767, sign kept
-        (-1000, -4000),    # sign reapplied, linear region
-        (-16384, -16384),  # w = 65536 -> 14336 + 32768/16 = 16384
+        (1000, 7972),      # linear x7.97 below K1
+        (1027, 8187),      # just below K1 (w = 8187)
+        (1028, 8192),      # just above K1 (w = 8195 -> 8192 + 3/4, floor)
+        (4096, 14308),     # w = 32656 -> 8192 + 24464/4
+        (4110, 14335),     # just below K2 (w = 32767)
+        (4111, 14336),     # just above K2 (w = 32775 -> 14336 + 7/16)
+        (32767, 28615),    # w = 261,248 -> 14336 + 228480/16
+        (-32768, -28615),  # mag sat 32767, sign kept
+        (-1000, -7972),    # sign reapplied, linear region
+        (-16384, -20452),  # w = 130,624 -> 14336 + 97856/16
     ]
     for k, (x, want) in enumerate(points):
         assert want == golden_model.dist(x), f"pin {x}: {want} != golden"
@@ -722,44 +721,35 @@ async def test_dist_diode(dut):
 
     # Gate-level-visible seam pass (the pins above read the RTL s3 tap
     # probe; at the port a single frame is hidden by the tone low-pass).
-    # A DC hold lets the tone settle (the >>> floor leaves the 16.4
-    # state up to 3/16 LSB under 16*s3, so the port reads s3 or s3-1)
-    # and the open gate passes it. Golden settled port words: 2047/2048/
-    # 2049 -> 8188/8191/8192 (the K1 seam, three distinct words) and
-    # 8191/8192/8193 -> 14334/14335/14335 (K2 low side distinct; 8192 vs
-    # 8193 are equal in dist itself). Every frame of every hold is
-    # asserted against golden, so these distinctions are GL-visible.
+    # A DC hold lets the tone settle and the open gate passes it. Every
+    # frame of every hold is asserted against golden; the settled port
+    # words of each seam pair (K1 1027/1028, K2 4110/4111) must differ,
+    # so the seams are GL-visible.
     settled = {}
-    for x in (2047, 2048, 2049, 8191, 8192, 8193):
+    for x in (1027, 1028, 4110, 4111):
         port, stage, i, want_out, tap = await hold_frames(
-            dut, hist, x, direct=(x != 2047))
+            dut, hist, x, direct=(x != 1027))
         assert tap[-1] == golden_model.dist(x)
         settled[x] = port
-    assert len({settled[2047], settled[2048], settled[2049]}) == 3, settled
-    assert settled[8191] != settled[8192], settled
+    assert settled[1027] != settled[1028], settled
+    assert settled[4110] != settled[4111], settled
 
 
-async def _drive_points(dut, k3, points, en=EN_DIST):
-    """Fresh run with K3 = k3 (None = absent): prime the gate, then for
-    each x hold it and require the dist-stage output (RTL s3 tap probe,
-    None on GL) and the settled port word to equal golden at the K3
-    drive; every frame is golden-checked inside hold_frames. Returns the
-    list of (x, settled port, golden dist)."""
+async def _drive_points(dut, points, k3=None, en=EN_DIST):
+    """Fresh run (K3 = k3 pin model, None = absent): prime the gate, then
+    for each x hold it and require the dist-stage output (RTL s3 tap
+    probe, None on GL) and the settled port word to equal golden at the
+    fixed drive; every frame is golden-checked inside hold_frames.
+    Returns the list of (x, settled port, golden dist)."""
     if k3 is not None:
         knob_pin(dut, 2, k3)
     await start(dut, en)
-    kval, kpres = _probe(dut, "k3_value"), _probe(dut, "k3_present")
-    if kval is not None:
-        assert int(kpres.value) == (0 if k3 is None else 1)
-        if k3 is not None:
-            assert int(kval.value) == golden_model.knob_steady(k3)
-    hist = Hist(en, k3=k3)
+    hist = Hist(en)
     await prime_gate(dut, hist)
-    dq = golden_model.drive_q8(k3)
     res = []
     for x in points:
         port, stage, i, want, tap = await hold_frames(dut, hist, x)
-        d = golden_model.dist(x, dq)
+        d = golden_model.dist(x)
         assert tap[-1] == d and stage in (None, d), f"x={x}: stage {stage} != {d}"
         assert abs(port) <= 32767 and abs(d) <= 32767
         res.append((x, port, d))
@@ -767,38 +757,16 @@ async def _drive_points(dut, k3, points, en=EN_DIST):
 
 
 @cocotb.test()
-async def test_drive_default(dut):
-    """K3 absent: drive = 1024 (x4) — every test_dist_diode point is
-    unchanged (that test reruns the pins in the same suite; here the
-    golden default is pinned and K3 reads absent). Pins at the port after
-    a DC hold: three points across the knee pieces."""
-    assert golden_model.drive_q8(None) == 1024
+async def test_drive_fixed(dut):
+    """Rev B5: the dist drive is fixed at 2041 (x7.97, the old K3 knob
+    maximum) and K3 (now the speed knob) does not touch it: K3 absent and
+    K3 = 0 both give the x7.97 points, through both knee seams and the
+    rail (32767 -> 28615, inside +-32767; no wrap)."""
+    assert golden_model.DRIVE == 2041
     pts = (1000, 4096, 32767)
-    res = await _drive_points(dut, None, pts)
-    assert [d for _, _, d in res] == [golden_model.dist(x) for x in pts]
-    assert [d for _, _, d in res] == [4000, 10240, 20479]
-
-
-@cocotb.test()
-async def test_drive_rails(dut):
-    """K3 = 255: drive = 256 + 7*255 = 2041 (x7.97). Full-scale inputs:
-    w = 261,248 (18 bits, no pre-knee saturation) -> top piece
-    14336 + (261248 - 32768)/16 = 28615, inside +-32767 for both rails
-    (the -32768 input sat-mags to 32767 first); no wrap."""
-    assert golden_model.drive_q8(255) == 2041
-    res = await _drive_points(dut, 255, (32767, -32768, 1000))
-    assert [d for _, _, d in res] == [28615, -28615, 7972]
-    assert abs(res[0][1]) <= 32767 and abs(res[1][1]) <= 32767
-
-
-@cocotb.test()
-async def test_drive_mid(dut):
-    """K3 = 128: drive = 256 + 7*128 = 1152 (x4.5). Three points, one
-    per knee piece (+ a negative): 1000 -> 4500 (linear); 8000 ->
-    w 36000 -> 14538 (top piece); -20000 -> w 90000 -> -17913."""
-    assert golden_model.drive_q8(128) == 1152
-    res = await _drive_points(dut, 128, (1000, 8000, -20000))
-    assert [d for _, _, d in res] == [4500, 14538, -17913]
+    for k3 in (None, 0):
+        res = await _drive_points(dut, pts, k3=k3)
+        assert [d for _, _, d in res] == [7972, 14308, 28615], f"K3 {k3}"
 
 
 def _probe(dut, *path):
@@ -944,12 +912,45 @@ def _signed(x):
 
 
 @cocotb.test()
+async def test_trem_depth(dut):
+    """Rev B5: K2 sets the trem depth, gain = 256 - ((tri * v2) >> 8)
+    (K2 absent keeps B4's 256 - tri/2 - tri/4, 75%; pinned by
+    test_knob_absent_default). Constant 16384 input, K3 = 250 (inc 976,
+    one LFO cycle ~4300 frames), 4400 frames per case, fresh reset each:
+    K2 = 0 -> no trem (every word 16384); K2 = 255 -> == golden and the
+    trough reaches gain 2 (word 128); K2 = 128 -> == golden, trough gain
+    129 (word 8256)."""
+    tri_max = 0xFF << 13                 # tri = 255 (rising half)
+    assert golden_model.trem_gain(tri_max, None) == 66
+    assert golden_model.trem_gain(tri_max, 255) == 2
+    assert golden_model.trem_gain(tri_max, 128) == 129
+    assert golden_model.trem_gain(tri_max, 0) == 256
+    assert golden_model.trem_gain(0, 255) == 256
+    kp2 = knob_pin(dut, 1, 0)
+    knob_pin(dut, 2, 250)
+    n = 4400
+    for i, (v, lo) in enumerate(((0, 16384), (255, 128), (128, 8256))):
+        kp2.v = v
+        await start(dut, EN_TREM, clock=(i == 0))
+        got = (await fast_frames(dut, [16384] * (n + 1)))[1:]
+        want = golden_model.render([0] * START_FRAME + [16384] * n, EN_TREM,
+                                   k2=v, k3=250)[START_FRAME:]
+        first = _first_diff(got, want)
+        assert first is None, f"K2 {v} frame {first}: got {got[first]} want {want[first]}"
+        assert min(got) == lo, f"K2 {v}: trough {min(got)} != {lo}"
+        if v == 0:
+            assert set(got) == {16384}, "K2 = 0 must be no trem"
+        step = max(abs(a - b) for a, b in zip(got, got[1:]))
+        assert step <= TREM_MAX_STEP_16384, f"K2 {v}: max |dout| {step}"
+
+
+@cocotb.test()
 async def test_knob_absent_default(dut):
-    """K1 absent (pin tied low): the trem phase steps by the default 437
+    """K3 absent (pin tied low): the trem phase steps by the default 437
     per frame (~5 Hz). Probe (RTL only): trem_p advances exactly 437 per
     frame over 5 consecutive frames (and equals 437 * frames since the
     enable reached the chain at EN_SETTLE). Port level: 20 consecutive
-    TX words on a constant 16384 equal golden_model (k1 = None)."""
+    TX words on a constant 16384 equal golden_model (k3 = None)."""
     await start(dut, EN_TREM)                 # trem only (ui[3]), uio_in = 0
     p = _probe(dut, "trem_p")
     if p is not None:
@@ -969,21 +970,21 @@ async def test_knob_absent_default(dut):
 
 # Smooth-trem step bound: gain = 256 - tri/2 - tri/4 moves by at most 2
 # per tri LSB, and tri moves by at most 1 per frame for every inc <= 8192
-# (K1 max inc 127 << 3 = 1016), so |dout| <= |x| * 2 / 256 = 128 at
+# (K3 max inc 127 << 3 = 1016), so |dout| <= |x| * 2 / 256 = 128 at
 # x = 16384 (the old stepped trem jumped by 8192).
 TREM_MAX_STEP_16384 = 16384 * 2 // 256
 
 
 @cocotb.test()
 async def test_trem_smooth(dut):
-    """Smooth trem at K1 = 128 (inc = 256): constant 16384 for 2000
+    """Smooth trem at K3 = 128 (inc = 256): constant 16384 for 2000
     frames; the output equals golden_model frame-for-frame and never
     steps by more than TREM_MAX_STEP_16384."""
-    knob_pin(dut, 0, 128)
+    knob_pin(dut, 2, 128)
     await start(dut, EN_TREM)
     n = 2000
     got = (await fast_frames(dut, [16384] * (n + 1)))[1:]
-    want = golden_model.render([0] * START_FRAME + [16384] * n, EN_TREM, k1=128)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + [16384] * n, EN_TREM, k3=128)[START_FRAME:]
     first = next((i for i in range(n) if got[i] != want[i]), None)
     assert first is None, f"frame {first}: got {got[first]} want {want[first]}"
     step = max(abs(a - b) for a, b in zip(got, got[1:]))
@@ -993,32 +994,34 @@ async def test_trem_smooth(dut):
 
 @cocotb.test()
 async def test_trem_rate_change(dut):
-    """K1 128 -> 250 mid-run (pin model re-timed): the phase keeps
+    """K3 (speed) 128 -> 250 mid-run (pin model re-timed): the phase keeps
     accumulating (no reset/jump), so the output stays smooth across the
-    change. Before the change the output equals golden_model (k1 = 128);
+    change. Before the change the output equals golden_model (k3 = 128);
     across it max |dout| <= TREM_MAX_STEP_16384; probe (RTL only): the
     knob value has moved to within the hysteresis of 250. Port level
     (GL-visible): the post-change output must DIFFER from the golden
-    render that keeps k1 = 128 (the rate really changed). Round robin
-    (knob_rc4): K2..K4 run v = 0 pin models (en = trem only, so their
-    values never reach the output), giving one K1 reading per ~96
+    render that keeps k3 = 128 (the rate really changed). Round robin
+    (knob_rc4): K1, K4 run v = 0 pin models (en = trem only, so their
+    values never reach the output) and K2 (trem depth since Rev B5) a
+    v = 128 one (golden k2 = 128), giving one K3 reading per ~100
     frames (8192-clk discharges); the IIR needs 16 readings from 128 to
     249 (~1540 frames), so the post-change run is 1800 frames."""
-    kp = knob_pin(dut, 0, 128)
-    fast_knobs(dut, 1, 2, 3)
+    kp = knob_pin(dut, 2, 128)
+    fast_knobs(dut, 0, 3)
+    knob_pin(dut, 1, 128)     # K2 (Rev B5 trem depth) reaches the output: golden k2=128
     await start(dut, EN_TREM)
     pre = (await fast_frames(dut, [16384] * 201))[1:]
-    want = golden_model.render([0] * START_FRAME + [16384] * 200, EN_TREM, k1=128)[START_FRAME:]
-    assert pre == want, "pre-change output must equal golden (k1=128)"
+    want = golden_model.render([0] * START_FRAME + [16384] * 200, EN_TREM, k2=128, k3=128)[START_FRAME:]
+    assert pre == want, "pre-change output must equal golden (k3=128)"
     kp.v = 250
     post = await fast_frames(dut, [16384] * 1800)
     seq = pre + post[1:]
     step = max(abs(a - b) for a, b in zip(seq, seq[1:]))
     assert step <= TREM_MAX_STEP_16384, f"max |dout| across the change {step}"
-    keep = golden_model.render([0] * START_FRAME + [16384] * 2000, EN_TREM, k1=128)[START_FRAME + 200:]
+    keep = golden_model.render([0] * START_FRAME + [16384] * 2000, EN_TREM, k2=128, k3=128)[START_FRAME + 200:]
     ndiff = sum(1 for a, b in zip(post, keep) if a != b)
-    assert ndiff > 200, f"post-change output tracks the k1=128 render ({ndiff} diffs): rate did not change"
-    kval, kpres = _probe(dut, "k1_value"), _probe(dut, "k1_present")
+    assert ndiff > 200, f"post-change output tracks the k3=128 render ({ndiff} diffs): rate did not change"
+    kval, kpres = _probe(dut, "k3_value"), _probe(dut, "k3_present")
     if kval is not None:
         kv = int(kval.value)
         assert int(kpres.value) == 1
@@ -1113,9 +1116,9 @@ async def test_chain_enables(dut):
         assert probe in (None, s3), f"en {en_val:#x} word {word16}: s3 tap {probe} != golden {s3}"
         return probe if stage else out
 
-    # dist ON: diode-knee PWL, fixed drive x4 (expected values from
-    # golden_model.dist); 1234 the linear piece, 20000 the top piece
-    for x, want in ((-32768, -20479), (1234, 4936), (20000, 17288)):
+    # dist ON: diode-knee PWL, fixed drive x7.97 (Rev B5; expected values
+    # from golden_model.dist); 1234 the slope-1/4 piece, 20000 the top piece
+    for x, want in ((-32768, -28615), (1234, 8603), (20000, 22253)):
         assert golden_model.dist(x) == want
         assert await stage_once(EN_DIST, x, stage=True) in (None, want)
 
@@ -1140,27 +1143,28 @@ async def test_enable_bounce(dut):
     """Switch debounce (v3 task 7): a burst of contact bounce on an
     enable followed by a stable level must produce exactly ONE clean
     transition on the output — never a glitch back. Dist (ui[1]) on a
-    constant 20000 input: off -> 20000 (identity), on -> the tone
-    low-pass of golden dist(20000) = 17288 (top knee piece, drive x4),
-    which settles from 20000 down to golden's steady value over a few
+    constant 30000 input: off -> 30000 (identity), on -> the tone
+    low-pass of golden dist(30000) = 27236 (top knee piece, drive x7.97;
+    Rev B5: 30000 because x7.97 boosts inputs below ~24.5k), which
+    settles from 30000 down to golden's steady value over a few
     frames (task 11; the gate is open on the loud constant).
     The debounce samples every 256 frames and needs two agreeing ticks,
     so the switch toggles every 5 frames for 200 frames (at most one
     tick inside the burst), then holds; the engage output must start at
-    20000, only ever FALL (a bounce glitch back would rise), and end at
+    30000, only ever FALL (a bounce glitch back would rise), and end at
     the steady value, its first change within 600 frames of the hold.
-    The release repeats the burst toward 0: exactly one steady -> 20000
+    The release repeats the burst toward 0: exactly one steady -> 30000
     transition (dirt off is identity at once)."""
     await start(dut, 0)
 
-    off_val = 20000
-    assert golden_model.dist(20000) == 17288
-    tg = golden_model.ToneGate()         # tone: settled on 20000, then the dist output
+    off_val = 30000
+    assert golden_model.dist(30000) == 27236
+    tg = golden_model.ToneGate()         # tone: settled on 30000, then the dist output
     for _ in range(300):
-        tg.tone(20000)
+        tg.tone(30000)
     for _ in range(300):
-        on_val = tg.tone(golden_model.dist(20000))
-    assert on_val in (17288, 17289)      # approached from above (1-LSB floor possible)
+        on_val = tg.tone(golden_model.dist(30000))
+    assert on_val in (27236, 27237)      # approached from above (1-LSB floor possible)
     sw_on = EN_DIST
 
     async def frame(ui):
@@ -1190,7 +1194,7 @@ async def test_enable_bounce(dut):
     assert all(a >= b for a, b in zip(outs, outs[1:])), "engage output rose again (glitch back)"
     assert trans and outs[-1] == on_val, f"engage must settle at {on_val}, got {outs[-1]}"
     assert trans[0] - hold_start <= 600, f"engage began {trans[0] - hold_start} frames after the hold"
-    # the tone one-pole (kt 2) crosses the 20000 -> 17288 gap within 40 frames
+    # the tone one-pole (kt 2) crosses the 30000 -> 27236 gap within 40 frames
     assert all(outs[i] == on_val for i in range(trans[0] + 40, len(outs))), "engage must settle within 40 frames"
 
     # release: bounce toward 0 starting from level 1, then hold 0
@@ -1400,12 +1404,12 @@ async def test_chain_latency(dut):
 
 @cocotb.test()
 async def test_tone_lpf(dut):
-    """Post-dirt tone (v3 task 11), dist on, K2 absent (kt = 2): the
+    """Post-dirt tone (v3 task 11), dist on, K1 absent (kt = 2): the
     one-pole low-pass ytone += ((s3 << 4) - ytone) >>> 2. An alternating
-    +-8000 input (Nyquist; dist maps it to +-14144) is attenuated to
-    |out| < 3000 (golden: 2021 once the gate is open), and a DC input of
-    8000 settles to golden's 14143 (the floor leaves the 16.4 state a
-    few LSB under dist's 14144). Each run is exact against golden for
+    +-8000 input (Nyquist; dist at x7.97 maps it to +-16274) is attenuated
+    to |out| < 3000 (golden: 2325 once the gate is open), and a DC input
+    of 8000 settles to golden's 16273 (the floor leaves the 16.4 state a
+    few LSB under dist's 16274). Each run is exact against golden for
     every frame, from a fresh reset (the gate opens within ~60 frames)."""
     n = 300
     for i, (name, xs) in enumerate((
@@ -1418,9 +1422,9 @@ async def test_tone_lpf(dut):
             f"{next(j for j in range(n) if got[1 + j] != want[j])}"
         if name == "nyquist":
             assert max(abs(v) for v in got[-50:]) < 3000, f"nyquist {got[-6:]}"
-            assert got[-1] == -2021
+            assert got[-1] == -2325
         else:
-            assert len(set(got[-10:])) == 1 and got[-1] == 14143, f"dc {got[-10:]}"
+            assert len(set(got[-10:])) == 1 and got[-1] == 16273, f"dc {got[-10:]}"
 
 
 @cocotb.test()
@@ -1590,13 +1594,13 @@ async def test_phaser_coef(dut):
 
 @cocotb.test()
 async def test_phaser_sweep(dut):
-    """Phaser on, K1 = 250 (inc 976): a 200 Hz - 4 kHz exponential sweep at
+    """Phaser on, K3 = 250 (inc 976): a 200 Hz - 4 kHz exponential sweep at
     amplitude 8000 for 4000 frames; every port word equals golden."""
-    knob_pin(dut, 0, 250)
+    knob_pin(dut, 2, 250)
     await start(dut, EN_PHASER)
     xs = _sweep(4000, 200, 4000, 8000)
     got = (await fast_frames(dut, xs + [0]))[1:]
-    want = golden_model.render([0] * START_FRAME + xs, EN_PHASER, k1=250)[START_FRAME:]
+    want = golden_model.render([0] * START_FRAME + xs, EN_PHASER, k3=250)[START_FRAME:]
     first = _first_diff(got, want)
     assert first is None, f"frame {first}: got {got[first]} want {want[first]}"
     assert got != xs and len(set(got)) > 1000, "phaser must change the signal"
@@ -1604,7 +1608,7 @@ async def test_phaser_sweep(dut):
 
 @cocotb.test()
 async def test_phaser_rails(dut):
-    """Phaser on, K1 absent: a +-32767 square at 100 Hz (240 frames per
+    """Phaser on, K3 absent: a +-32767 square at 100 Hz (240 frames per
     half) for 2000 frames equals golden every frame, and never wraps sign
     against it (the sat16 stage sums). RTL probe: the phase steps by
     PHASER_INC_ABSENT = 87 per frame."""
@@ -1628,14 +1632,14 @@ async def test_phaser_rails(dut):
 
 
 @cocotb.test()
-async def test_phaser_rate_k1(dut):
-    """K1 = 250 sets the phaser rate (shared with trem): RTL probe, the
+async def test_phaser_rate_k3(dut):
+    """K3 = 250 sets the phaser rate (shared with trem): RTL probe, the
     phaser phase advances by phaser_inc(250) = 976 per frame over 5 frames
     and equals 976 * frames since EN_SETTLE; port level, 20 words of a
-    constant-ish input equal golden (k1 = 250)."""
+    constant-ish input equal golden (k3 = 250)."""
     assert golden_model.phaser_inc(250) == golden_model.trem_inc(250) == 976
     assert golden_model.phaser_inc(None) == golden_model.PHASER_INC_ABSENT == 87
-    knob_pin(dut, 0, 250)
+    knob_pin(dut, 2, 250)
     await start(dut, EN_PHASER)
     pp = _probe(dut, "phaser_p")
     nf = 0
@@ -1651,7 +1655,7 @@ async def test_phaser_rate_k1(dut):
         assert d == [976] * 5, f"phase steps {d}"
     f0 = START_FRAME + nf
     xs = _sweep(20, 500, 600, 12000)
-    want = golden_model.render([0] * f0 + xs, EN_PHASER, k1=250)[f0:]
+    want = golden_model.render([0] * f0 + xs, EN_PHASER, k3=250)[f0:]
     got = (await fast_frames(dut, xs + [0]))[1:]
     assert got == want, f"got {got} want {want}"
 
@@ -1918,6 +1922,33 @@ async def test_psram_absent(dut):
 
 
 @cocotb.test()
+async def test_psram_status_pin(dut):
+    """Rev B5 status pin: uo[5] = PSRAM detected (the engine's ok; seg f
+    on the demoboard). Model fitted: 0 from reset through the probe (it
+    starts after 16 frames), 1 within 20 frames and held while the go
+    traffic runs. No PSRAM (MISO low and high): 0 for 30 frames."""
+    try:
+        mon, _ = await psram_start(dut)
+        for f in range(16):
+            await ClockCycles(dut.clk, 512)
+            assert int(dut.uo_out[5].value) == 0, f"uo[5] high at frame {f + 1}, before the probe"
+        await ClockCycles(dut.clk, 4 * 512)
+        for f in range(10):
+            assert int(dut.uo_out[5].value) == 1, f"uo[5] low {f} frames after the probe passed"
+            if _ok(dut) is not None:
+                assert _ok(dut) == 1
+            await ClockCycles(dut.clk, 512)
+        assert _go_pairs(mon.txns), "no go traffic while uo[5] is high"
+    finally:
+        psram_off(dut)
+    for miso in (0, 1):
+        await psram_start(dut, present=False, uio=miso << 7)
+        for f in range(30):
+            await ClockCycles(dut.clk, 512)
+            assert int(dut.uo_out[5].value) == 0, f"uo[5] high with no PSRAM (MISO {miso}), frame {f + 1}"
+
+
+@cocotb.test()
 async def test_psram_rw(dut):
     """Write / read round trip through go (Task 21 wiring, wdata now
     quant12'd by the Task 22 delay: waddr = the ring write index dly_widx,
@@ -2057,8 +2088,8 @@ async def _delay_hist(dut, hist, xs, compare=True):
     base = len(hist.xs)
     outs = await fast_frames(dut, xs)
     hist.xs += list(xs)
-    want = golden_model.render(hist.xs, hist.en, k4=hist.k4, fill=hist.fill,
-                               psram=hist.psram)
+    want = golden_model.render(hist.xs, hist.en, k2=hist.k2, k4=hist.k4,
+                               fill=hist.fill, psram=hist.psram)
     for j, o in enumerate(outs if compare else []):
         assert o == want[base - 1 + j], \
             f"frame {base - 1 + j}: out {o} != golden {want[base - 1 + j]}"
@@ -2069,9 +2100,92 @@ class DelayHist:
     """Frame history of a delay test: the golden Chain (with the Delay
     stage) over [0] * START_FRAME + the driven frames."""
 
-    def __init__(self, en, k4=None, fill=32768, psram=True):
-        self.en, self.k4, self.fill, self.psram = en, k4, fill, psram
+    def __init__(self, en, k4=None, fill=32768, psram=True, k2=None):
+        self.en, self.k4, self.fill, self.psram, self.k2 = en, k4, fill, psram, k2
         self.xs = [0] * START_FRAME
+
+
+async def _dly_w_frames(dut, hist, xs):
+    """_delay_hist one frame at a time, also returning the ring write
+    word (RTL probe dly_w, held from step 12 to the next frame's step 12)
+    after each frame."""
+    ws = []
+    for x in xs:
+        await _delay_hist(dut, hist, [x])
+        ws.append(int(_probe(dut, "dly_w").value))
+    return ws
+
+
+@cocotb.test()
+async def test_echo_level(dut):
+    """Rev B5: K2 sets the echo level, out = sat16(dry + ((lp * v2) >> 8))
+    (K2 absent: B4's ~0.39 mix). Needs make -B FILL_FRAMES=64: the ring is
+    then `filled` at frame ~81 and every read returns the PSRAM model's
+    full-scale LFSR fill (dly is ~16800, nothing written that far back),
+    so lp is busy every frame. Per K2 in (0, 128, 255, absent), fresh
+    reset: 200 zero frames then a +-32767 square (100 frames): every word
+    == golden; K2 = 0 -> output == dry exactly; and (golden) the K2 = 255
+    echo is >= 2.4x louder than the absent one; no wrap at the rails."""
+    kp2 = knob_pin(dut, 1, None)
+    try:
+        dut.psram_en.value = 1
+        dut.psram_so_dly_ps.value = 0
+        fill = None
+        sums = {}
+        sq = [32767 if (i // 10) % 2 == 0 else -32767 for i in range(100)]
+        for i, v in enumerate((0, 128, 255, None)):
+            kp2.v = v
+            await start(dut, EN_DELAY, clock=(i == 0))
+            fill = _fill_param(dut)
+            if fill != 64:
+                return              # plain suite / GL: the wav_tool delay_k2* modes cover it
+            hist = DelayHist(EN_DELAY, fill=fill, k2=v)
+            outs, want = await _delay_hist(dut, hist, [0] * 200 + sq)
+            echo = outs[1:201]
+            if v == 0:
+                assert outs[1:] == [0] * 200 + sq[:99], "K2 = 0 must be dry only"
+            else:
+                assert any(echo), f"K2 {v}: no echo (lp never moved)"
+            assert all(-32768 <= o <= 32767 for o in outs)
+            sums[v] = sum(abs(o) for o in echo)
+        assert sums[255] >= 2.4 * sums[None], f"level 255 vs absent {sums}"
+    finally:
+        kp2.v = None                # leave K2 absent for later tests
+        dut.psram_en.value = 0       # and the PSRAM unfitted (the tb default)
+
+
+@cocotb.test()
+async def test_echo_level_feedback_fixed(dut):
+    """Rev B5: the level only scales what is heard; the ring write word
+    (repeats) stays B4's quant12(sat16(dry + ~0.39 lp)). RTL probe dly_w
+    after each of 120 frames (FILL_FRAMES=64, ring reading the LFSR fill):
+    K2 = 0 and K2 absent write identical words (non-zero), while the
+    outputs differ (dry vs echo). Then freeze on at K2 = 0: the output is
+    dry (silent here) but the ring still recirculates (dly_w = quant12 of
+    the word just read, non-zero)."""
+    kp2 = knob_pin(dut, 1, None)
+    try:
+        dut.psram_en.value = 1
+        dut.psram_so_dly_ps.value = 0
+        words = {}
+        for i, v in enumerate((0, None)):
+            kp2.v = v
+            await start(dut, EN_DELAY, clock=(i == 0))
+            fill = _fill_param(dut)
+            if fill != 64:
+                return
+            hist = DelayHist(EN_DELAY, fill=fill, k2=v)
+            words[v] = await _dly_w_frames(dut, hist, [0] * 120)
+        assert words[0] == words[None], "K2 changed the ring write word (repeats)"
+        assert any(words[0]), "ring write words all zero: the test does not bite"
+        kp2.v = 0
+        await start(dut, EN_DELAY | EN_FREEZE, clock=False)
+        hist = DelayHist(EN_DELAY | EN_FREEZE, fill=64, k2=0)
+        ws = await _dly_w_frames(dut, hist, [0] * 120)
+        assert any(ws), "frozen ring must still recirculate at K2 = 0"
+    finally:
+        kp2.v = None                # leave K2 absent for later tests
+        dut.psram_en.value = 0       # and the PSRAM unfitted (the tb default)
 
 
 @cocotb.test()
@@ -2089,9 +2203,9 @@ async def test_delay_off_identity(dut):
 async def test_delay_no_psram(dut):
     """Delay on, no PSRAM chip (tb psram_en = 0): the probe fails, ok stays
     0, no ring traffic: bit-exact dry output for 5000 frames."""
-    await start(dut, EN_DELAY)
-    dut.psram_en.value = 0
+    dut.psram_en.value = 0          # absent BEFORE reset: the probe runs at frame 16
     dut.psram_so_dly_ps.value = 0
+    await start(dut, EN_DELAY)
     hist = DelayHist(EN_DELAY, psram=False)
     xs = [0, 16384, -24576, 0, 12345, -12345] * 400
     await _delay_hist(dut, hist, xs)

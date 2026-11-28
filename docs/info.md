@@ -28,7 +28,7 @@ design never drives. Flip any or all of the demoboard DIPs.
 Each received sample runs through a serial effect chain: a step counter runs
 the stages one after another through one running chain register, sharing
 one serial multiplier (12 clk per multiply plus the step overhead, the whole
-chain about 116 of the 512 clk in a frame). A disabled stage passes its input
+chain about 142 of the 512 clk in a frame). A disabled stage passes its input
 through bit-exactly:
 
 **comp -> distortion -> (tone + gate) -> phaser -> tremolo -> delay**
@@ -39,13 +39,13 @@ through bit-exactly:
   gain reduction per dB over the knee, roughly 2.7:1), down to -4.5 dB.
   The gain slews (1/8 of the gap per frame) so it cannot click. The
   envelope keeps running when the stage is off (it also keys the gate).
-- **Distortion** (`ui[1]`): the input magnitude is multiplied by a drive
-  (default **x4**; K3 sets x1 to x7.97), then a three-piece soft diode
+- **Distortion** (`ui[1]`): the input magnitude is multiplied by a fixed
+  drive of **x7.97** (no knob), then a three-piece soft diode
   knee: slope 1 up to 8192, slope 1/4 up to 32768 (output 14336), slope
   1/16 above, sign reapplied.
 - **Tone + noise gate** (automatic whenever the distortion is on): a
   one-pole low-pass on the distortion output (corner about 2.2 kHz by
-  default; K2 sweeps it from about 490 Hz to 5.3 kHz), then a gate keyed
+  default; K1 sweeps it from about 490 Hz to 5.3 kHz), then a gate keyed
   from the compressor envelope: it opens above about -42 dBFS and closes
   below about -48 dBFS, opening within about a millisecond and closing over
   about 5 ms. The gate starts closed, so the distortion is silent until a
@@ -54,20 +54,23 @@ through bit-exactly:
   (no feedback) mixed 50/50 with the dry signal, giving two notches that
   sweep together (the first from about 200 Hz to 2 kHz, the second from
   about 1.2 to 12 kHz) on an exponential triangle LFO. The rate comes from
-  K1, shared with the tremolo (0.73 to 11.6 Hz); with no K1 fitted it is
+  K3, shared with the tremolo (0.73 to 11.6 Hz); with no K3 fitted it is
   about 1.0 Hz. The allpass states keep running when the stage is off;
   the LFO restarts from its start point when the phaser is switched on.
-- **Tremolo** (`ui[3]`): smooth triangle LFO on the gain (no steps), fixed
-  75% depth (gain 1.0 down to 0.26). K1 sets the rate from about 0.73 to
-  11.6 Hz (an approximately exponential, piecewise map); with no K1 fitted
-  the rate is about 5 Hz. The LFO restarts from the top when the effect is
+- **Tremolo** (`ui[3]`): smooth triangle LFO on the gain (no steps). K2
+  sets the depth from none to nearly full (gain 1.0 down to 0.01); with no
+  K2 fitted it is 75% (gain down to 0.26). K3 sets the rate from about
+  0.73 to 11.6 Hz (an approximately exponential, piecewise map); with no
+  K3 fitted the rate is about 5 Hz. The LFO restarts from the top when the effect is
   switched on.
 - **Delay** (`ui[4]`, needs the PSRAM Pmod): a PT2399-style echo. Every
   frame the chip writes the output (with 12 bits of magnitude) into a
   32768-word ring in an external SPI PSRAM and reads the word written
   `dly` frames earlier. The echo is low-passed (it darkens a little on each
-  repeat) and mixed back at about 0.39, and because the output itself is
-  written back, the echo repeats and fades. K4 sets the time from about 37
+  repeat). What you hear is the dry signal plus the echo at a level set by
+  K2 (none to about 1.0, unity; about 0.39 with no K2 fitted). What is
+  written back is the dry signal plus the echo at a fixed 0.39, so the
+  echo repeats and fades at the same rate whatever the level knob says. K4 sets the time from about 37
   ms to 593 ms (350 ms with no K4 fitted); a knob change glides the time
   (one frame per frame, a tape-like pitch bend). The echo starts once the
   ring has been filled (about 0.7 s after power-up). With no PSRAM fitted
@@ -98,8 +101,8 @@ retries the probe (so a Pmod plugged in later is found). Once a chip is
 detected, toggling the delay does not re-probe, so the ring (and a frozen
 loop) survives.
 
-**Knobs.** `uio[2]`-`uio[5]` are RC-timing knob pins K1 (tremolo and
-phaser rate), K2 (tone), K3 (distortion drive), K4 (delay time). One shared
+**Knobs.** `uio[2]`-`uio[5]` are RC-timing knob pins K1 (tone), K2 (echo
+level and tremolo depth), K3 (tremolo and phaser speed), K4 (delay time). One shared
 round-robin reader measures the four knobs in turn (a full rotation takes at
 most about 4 x 74k clk = 12 ms with every knob absent; with four fitted
 knobs it is at most about 4 ms). For the knob in turn it drives the pin low
@@ -116,8 +119,14 @@ supported: tie unused knob pins to ground.
 full scale (0x7FFF or 0x8000) and holds about 43 ms (2048 frames).
 
 **Fixed outputs.** `uo[6]` is driven **1** permanently: wire it to the QSPI
-Pmod's flash chip select (CS0) to keep the flash deselected. `uo[5]` is
-driven 0.
+Pmod's flash chip select (CS0) to keep the flash deselected.
+
+**PSRAM status LED.** `uo[5]` (segment f on the demoboard) is **1** while
+the PSRAM is detected: it lights about 16 frames after reset once the probe
+passes, and stays dark with no chip, a chip that fails the probe, or a
+chip that was not powered at reset. If the delay is silent, check this
+first: dark means flip the delay switch (`ui[4]`) off and on to reprobe,
+then check the Pmod wiring and its 3.3 V supply.
 
 ## Signal table
 
@@ -136,14 +145,14 @@ driven 0.
 | uo[2] | out | PSRAM SPI MOSI (idle 0) |
 | uo[3] | out | I2S DAC data out |
 | uo[4] | out | I2S LRCLK/WS (master, 48 kHz) |
-| uo[5] | out | Driven 0 |
+| uo[5] | out | PSRAM detected (1 = probe passed) |
 | uo[6] | out | Driven 1 (QSPI Pmod flash CS0 hold) |
 | uo[7] | out | dp = clip LED (peak hold ~43 ms) |
 | uio[0] | out | MCLK (= clk, 24.576 MHz) |
 | uio[1] | in | I2S ADC data in |
-| uio[2] | bidir | K1 tremolo + phaser rate (RC knob) |
-| uio[3] | bidir | K2 post-distortion tone (RC knob) |
-| uio[4] | bidir | K3 distortion drive (RC knob) |
+| uio[2] | bidir | K1 post-distortion tone (RC knob) |
+| uio[3] | bidir | K2 echo level + tremolo depth (RC knob) |
+| uio[4] | bidir | K3 tremolo + phaser speed (RC knob) |
 | uio[5] | bidir | K4 delay time (RC knob) |
 | uio[6] | out | I2S BCLK (master, 3.072 MHz) |
 | uio[7] | in | PSRAM SPI MISO (SO) |
@@ -156,9 +165,9 @@ while discharging their capacitor, inputs otherwise.
 
 | Knob | Pin | Absent | Effect of raw value v (0..255) |
 |---|---|---|---|
-| K1 | uio[2] | trem ~5 Hz, phaser ~1.0 Hz | trem + phaser rate: inc = (64 + v[5:0]) << v[7:6]; f = inc x 48000 / 2^22 = 0.73 .. 11.6 Hz |
-| K2 | uio[3] | corner ~2.2 kHz | tone shift kt = 4 - v[7:6], alpha = 2^-kt, corner = -ln(1-alpha) x 48000 / 2pi: kt 4 ~490 Hz, kt 3 ~1.0 kHz, kt 2 ~2.2 kHz, kt 1 ~5.3 kHz (low to high v) |
-| K3 | uio[4] | x4 | dist drive (256 + 7v) / 256 = x1 .. x7.97 |
+| K1 | uio[2] | corner ~2.2 kHz | tone shift kt = 4 - v[7:6], alpha = 2^-kt, corner = -ln(1-alpha) x 48000 / 2pi: kt 4 ~490 Hz, kt 3 ~1.0 kHz, kt 2 ~2.2 kHz, kt 1 ~5.3 kHz (low to high v) |
+| K2 | uio[3] | echo ~0.39, trem depth 75% | echo level = v / 256 (0 .. ~1.0, heard only; the repeats stay at ~0.39); trem gain = 256 - ((tri x v) >> 8), tri 0..255 (depth 0 .. ~100%) |
+| K3 | uio[4] | trem ~5 Hz, phaser ~1.0 Hz | trem + phaser rate: inc = (64 + v[5:0]) << v[7:6]; f = inc x 48000 / 2^22 = 0.73 .. 11.6 Hz |
 | K4 | uio[5] | 350 ms | delay time = ((64 + v[5:0]) << v[7:6]) x 28 frames = 1792 .. 28448 frames (37 .. 593 ms) |
 
 ## How to test
@@ -170,13 +179,15 @@ stage on live (about 5-11 ms) and any combination stacks in chain order.
 No microcontroller firmware is needed: the chip is the whole pedal.
 
 **Phaser and tremolo.** Switch on `ui[2]` alone on a sustained chord: two
-notches sweep up and down at about 1 Hz (K1 absent). Turn K1 and the sweep
-speeds up to about 11 Hz; the tremolo (`ui[3]`) shares K1, so with both on
-they run at the same rate (with no K1 fitted they differ: trem ~5 Hz,
-phaser ~1 Hz).
+notches sweep up and down at about 1 Hz (K3 absent). Turn K3 and the sweep
+speeds up to about 11 Hz; the tremolo (`ui[3]`) shares K3, so with both on
+they run at the same rate (with no K3 fitted they differ: trem ~5 Hz,
+phaser ~1 Hz). K2 sets how deep the tremolo goes.
 
 **Delay and freeze.** Fit the PSRAM Pmod, switch on `ui[4]`, play a short
-phrase: echoes at 350 ms (K4 absent). Switch on `ui[5]` (freeze) and the
+phrase: segment f (`uo[5]`) lights once the PSRAM is detected, and
+echoes come in at 350 ms (K4 absent); K2 turns the echo up or down
+without changing how long it rings on. Switch on `ui[5]` (freeze) and the
 current echo loops indefinitely; play over it. Turn the delay off and on
 again with freeze still on: the loop comes back.
 
@@ -253,6 +264,8 @@ comparison against an independent Python model, and
   or the Pmod is not connected (with no PSRAM the probe then reads 0 and
   the delay stays a clean pass-through).
 - **Clip LED**: the demoboard's 7-segment decimal point on `uo[7]`.
+- **PSRAM status LED**: `uo[5]` (segment f on the demoboard), lit when the
+  PSRAM is detected; on your own board, an LED + resistor to GND.
 - **True bypass**: a latching 3PDT footswitch: guitar to the common pole;
   one throw straight to the output jack, the other through preamp -> ADC ->
   tile -> DAC -> output; the spare pole does the bypass LED/ground job. The

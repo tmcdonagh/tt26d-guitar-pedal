@@ -66,23 +66,28 @@ def knob_steady(v):
     return k.value
 
 
-TREM_INC_ABSENT = 437   # K1 absent: ~5 Hz (2^22 / 437 = 9598 frames)
+TREM_INC_ABSENT = 437   # K3 absent: ~5 Hz (2^22 / 437 = 9598 frames)
 
 
-def trem_inc(k1):
-    """Per-frame phase increment from the K1 knob value (None = absent)."""
-    if k1 is None:
+def trem_inc(k3):
+    """Per-frame phase increment from the K3 (speed) knob value (None =
+    absent; Rev B5: was K1)."""
+    if k3 is None:
         return TREM_INC_ABSENT
-    v = knob_steady(k1)
+    v = knob_steady(k3)
     return (64 + (v & 63)) << (v >> 6)
 
 
-def trem_gain(p):
-    """22-bit phase -> triangle tri (8-bit) -> gain 256 - tri/2 - tri/4
-    (75% depth, 66..256)."""
+def trem_gain(p, k2v=None):
+    """22-bit phase -> triangle tri (8-bit) -> gain. Rev B5: with the
+    steady K2 value k2v, gain = 256 - ((tri * k2v) >> 8) (depth 0..~100%,
+    2..256; the RTL's chain-step-2 multiply); K2 absent (None) keeps
+    256 - tri/2 - tri/4 (75% depth, 66..256)."""
     t = (p >> 13) & 0xFF
     if (p >> 21) & 1:
         t ^= 0xFF
+    if k2v is not None:
+        return 256 - ((t * k2v) >> 8)
     return 256 - (t >> 1) - (t >> 2)
 
 
@@ -145,22 +150,13 @@ def comp(s, g):
     return sat16((s * g) >> 8)
 
 
-DRIVE_ABSENT = 1024   # K3 absent: x4 (Q4.8)
+DRIVE = 2041   # Rev B5: fixed drive x7.97 (Q4.8; the old K3 knob maximum)
 
 
-def drive_q8(k3):
-    """Dist drive (Q4.8) from the K3 knob value (None = absent):
-    256 + 7*v (x1 .. x7.97), x4 when absent."""
-    if k3 is None:
-        return DRIVE_ABSENT
-    v = knob_steady(k3)
-    return 256 + (v << 3) - v
-
-
-def dist(s, drive_q8=DRIVE_ABSENT):
+def dist(s, drive_q8=DRIVE):
     """Diode-knee PWL on w = (sat_mag(s) * drive_q8) >> 8 (Q4.8 drive, no
     intermediate saturation; w < 2^18): slope 1 to 8192, 1/4 to 32768, 1/16
-    above (max 28.6k at drive x7.97; 20479 at the default x4)."""
+    above (max 28.6k at the fixed drive x7.97)."""
     w = (smag(s) * drive_q8) >> 8
     if w <= 8192:
         o = w
@@ -183,11 +179,12 @@ GATE_OPEN_L, GATE_CLOSE_L, GATE_MAX = 256, 128, 256
 TONE_KT_ABSENT = 2
 
 
-def tone_kt(k2):
-    """Tone shift from the K2 knob value (None = absent)."""
-    if k2 is None:
+def tone_kt(k1):
+    """Tone shift from the K1 (tone) knob value (None = absent; Rev B5:
+    was K2)."""
+    if k1 is None:
         return TONE_KT_ABSENT
-    return 4 - (knob_steady(k2) >> 6)
+    return 4 - (knob_steady(k1) >> 6)
 
 
 class ToneGate:
@@ -228,9 +225,9 @@ class ToneGate:
 PHASER_INC_ABSENT = 87   # prov: 2^22 / 87 = 48210 frames ~ 1.0 Hz
 
 
-def phaser_inc(k1):
-    """Phaser phase increment: trem_inc(k1) with K1 present, else 87."""
-    return PHASER_INC_ABSENT if k1 is None else trem_inc(k1)
+def phaser_inc(k3):
+    """Phaser phase increment: trem_inc(k3) with K3 present, else 87."""
+    return PHASER_INC_ABSENT if k3 is None else trem_inc(k3)
 
 
 def phaser_coef(p):
@@ -267,9 +264,9 @@ class Phaser:
         return (s4 + s) >> 1
 
 
-def trem(s, p):
+def trem(s, p, k2v=None):
     """(s * gain) >>> 8 (the shared multiplier); |out| <= |s|, no clamp."""
-    return (s * trem_gain(p)) >> 8
+    return (s * trem_gain(p, k2v)) >> 8
 
 
 # Delay (Rev B3, Task 22): PT2399-style echo in the external PSRAM. One
@@ -282,8 +279,10 @@ def trem(s, p):
 #   rd   = (ok && filled) ? the previous frame's read : 0
 #   lp  += (rd - lp) >>> 2                                  (16-bit state)
 #   mixv = (lp >>> 2) + (lp >>> 3) + (lp >>> 6)              (*prov* ~0.39)
-#   out = en5 ? sat16(x + mixv) : x      (x = the trem-stage output s6)
-#   wv   = out (the feedback uses the same mix; both are *prov* separately)
+#   (x = the trem-stage output s6)
+#   wv   = en5 ? sat16(x + mixv) : x   (the feedback: fixed ~0.39 repeats)
+#   out  = en5 ? sat16(x + ((lp * k2v) >> 8)) : x with K2 (Rev B5 level;
+#          K2 absent: out = wv, the B4 mix)
 #   w    = quant12(wv): sign-magnitude, |wv| with the low 4 bits cleared,
 #          sign reapplied (magnitude-symmetric)
 #   SPI: write w at word widx; read (widx + 1 - dly) mod 32768; widx += 1
@@ -345,13 +344,16 @@ class Delay:
             self.ring = [(((mem[2 * a] << 8) | mem[2 * a + 1]) + 32768) % 65536 - 32768
                          for a in range(32768)]
 
-    def step(self, x, en5, freeze=False):
+    def step(self, x, en5, freeze=False, k2v=None):
         """One frame. freeze (Rev B3 final, ui[5]): the ring write word is
         quant12(rd) — the word just read, the loop recirculates unchanged
         and no new audio enters — instead of quant12(out). Independent of
         the delay enable en5 (a loop frozen while bypassed plays when the
         delay comes back on); rd is 0 before `filled`, so freezing an
-        unfilled ring holds silence."""
+        unfilled ring holds silence. k2v (Rev B5, the steady K2 value or
+        None = absent) sets only what is heard: out = sat16(x + ((lp *
+        k2v) >> 8)); the ring still takes B4's sat16(x + mixv), so the
+        repeats stay fixed at ~0.39."""
         f = self.f
         self.f += 1
         ok = self.psram and f >= 17
@@ -366,10 +368,11 @@ class Delay:
         rd = self.rd_prev if (ok and self.filled) else 0
         self.lp += (rd - self.lp) >> 2
         mixv = (self.lp >> 2) + (self.lp >> 3) + (self.lp >> 6)
-        out = sat16(x + mixv) if en5 else x
+        fb = sat16(x + mixv) if en5 else x
+        out = sat16(x + ((self.lp * k2v) >> 8)) if (en5 and k2v is not None) else fb
         if ok:
             a = self.widx
-            self.ring[a] = quant12(rd if freeze else out)
+            self.ring[a] = quant12(rd if freeze else fb)
             self.rd_prev = self.ring[(a + 1 - self.dly) % 32768]
             self.widx = (a + 1) % 32768
             self.fill_cnt += 1
@@ -402,12 +405,13 @@ class Chain:
     def __init__(self, k1=None, k2=None, k3=None, tgb=False, k4=None,
                  fill=32768, psram=True, reprobe=False):
         self.cst = Comp()
-        self.tg = ToneGate(tone_kt(k2))
-        self.inc = trem_inc(k1)
-        self.pinc = phaser_inc(k1)
+        self.tg = ToneGate(tone_kt(k1))       # Rev B5 knob map: K1 tone,
+        self.inc = trem_inc(k3)               # K3 speed (trem + phaser),
+        self.pinc = phaser_inc(k3)            # K2 level + depth, K4 time
         self.ph = Phaser()
         self.pp = 0
-        self.dq = drive_q8(k3)
+        self.dq = DRIVE
+        self.k2v = None if k2 is None else knob_steady(k2)   # K2 level + depth
         self.tgb = tgb
         self.p = 0
         self.frame = 0
@@ -438,10 +442,10 @@ class Chain:
         if en_i & EN_PHASER:
             s = ph
         if en_i & EN_TREM:
-            s = trem(s, self.p)
+            s = trem(s, self.p, self.k2v)
         # step 12: the delay (Rev B3); the ring write + read are part of
         # the same frame (the engine issues them after chain_done)
-        s = self.dly.step(s, en_i & EN_DELAY, bool(en_i & EN_FREEZE))
+        s = self.dly.step(s, en_i & EN_DELAY, bool(en_i & EN_FREEZE), self.k2v)
         return s, s3
 
 
@@ -455,26 +459,23 @@ def switch_frame(at):
 
 def render(xs, en, k1=None, k2=None, k3=None, tgb=False, tap=None, k4=None,
            psram=True, fill=32768, sched=()):
-    """k1 (0..255 or None = absent) sets the trem and phaser rate; k2 (None = absent)
-    the tone shift; k3 the dist drive (drive_q8); k4 (0..255 or None = absent)
-    the delay time (Rev B3: the PSRAM echo, delay_target); psram False
+    """Rev B5 knob map (each 0..255 or None = absent): k1 the tone shift;
+    k2 the echo level + trem depth; k3 the trem and phaser rate (speed);
+    k4 the delay time (the PSRAM echo, delay_target). The dist drive is
+    fixed (DRIVE, x7.97). psram False
     models an absent PSRAM chip (ok = 0: dry output, no ring writes);
     fill = FILL_FRAMES (the tb parameter override in the short-horizon
     tests); tgb (tone/gate bypass, model-only; unused since fuzz was removed).
     en is the switch value held from reset: it takes effect at
-    frame EN_SETTLE (debounce). The knob value is knob_steady(k1) from
-    frame 0: valid because trem only reads it from EN_SETTLE on, long
-    after the reader's first measurement (fast startup, ~34 frames).
-    K2 timing approximation: golden applies K2's tone shift from frame 0,
-    while the RTL uses the absent default (kt 2) for the first ~34 frames
-    until the reader's first measurement. ytone is a state, but the two
-    trajectories merge by frame <= 173 on the excerpt, and `check` is
-    bit-exact, so a future non-merge would fail loudly.
-    K3 is likewise steady from frame 0, and that is exact: the dist stage
-    reads K3 only once en[2] takes effect (EN_SETTLE, reader settled by
-    then), and dist has no state of its own (unlike ytone, whose
-    pre-EN_SETTLE history is a state), so frames before EN_SETTLE never
-    see the drive.
+    frame EN_SETTLE (debounce). Each knob value is knob_steady(k) from
+    frame 0: valid for k2/k3/k4 because their consumers only act from
+    EN_SETTLE on, long after the reader's first measurement (fast
+    startup, ~34 frames).
+    K1 timing approximation: golden applies K1's tone shift from frame 0,
+    while the RTL uses the absent default (kt 2) until the reader's first
+    measurement of K1. ytone is a state, but the two trajectories merge
+    quickly on the excerpt, and `check` is bit-exact, so a future
+    non-merge would fail loudly.
     tap (a list) collects each frame's dist-stage output s3, the value
     the tone filter sees (the RTL cs value held at step 4, sampled by test.py _s3_monitor)."""
     ch = Chain(k1, k2, k3, tgb, k4, fill, psram)
