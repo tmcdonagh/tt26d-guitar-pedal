@@ -4,7 +4,7 @@
 /* This testbench just instantiates the module and makes some convenient wires
    that can be driven / tested by the cocotb test.py.
 */
-module tb #(parameter FILL_FRAMES = 64) ();   // cocotb RTL runs use the short delay fill horizon (the brief); the GL netlist keeps 32768
+module tb #(parameter FILL_FRAMES = 64, parameter RP_TICKS = 1) ();   // cocotb RTL runs use the short delay fill horizon (the brief); the GL netlist keeps 32768
 
   // Dump the signals to a FST file. You can view it with gtkwave or surfer.
   initial begin
@@ -57,7 +57,7 @@ module tb #(parameter FILL_FRAMES = 64) ();   // cocotb RTL runs use the short d
 `ifdef GL_TEST
   tt_um_tmcdonagh_guitar_pedal user_project (   // the flat netlist has no parameters
 `else
-  tt_um_tmcdonagh_guitar_pedal #(.FILL_FRAMES(FILL_FRAMES)) user_project (
+  tt_um_tmcdonagh_guitar_pedal #(.FILL_FRAMES(FILL_FRAMES), .RP_TICKS(RP_TICKS)) user_project (
 `endif
 
       // Include power ports for the Gate Level test:

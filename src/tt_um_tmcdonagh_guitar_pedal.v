@@ -26,7 +26,9 @@
 `default_nettype none
 
 module tt_um_tmcdonagh_guitar_pedal #(
-    parameter FILL_FRAMES = 32768   // delay fill horizon; tests may override to 64 (RTL runs only)
+    parameter FILL_FRAMES = 32768,  // delay fill horizon; tests may override to 64 (RTL runs only)
+    parameter RP_TICKS = 32         // Rev B6 auto-reprobe interval in debounce ticks (x 256 frames = 8192);
+                                    // a power of 2, <= 32; tests use 1 (RTL runs only)
 ) (
     input  wire [7:0] ui_in,    // Dedicated inputs
     output wire [7:0] uo_out,   // Dedicated outputs
@@ -134,6 +136,7 @@ module tt_um_tmcdonagh_guitar_pedal #(
   end
 
   wire [5:0] en = sw[5:0];   // en[4] (ui[4]) = delay enable (reprobes the PSRAM on its rising edge); en[5] = freeze
+                             // (Rev B6: the B6 trails ui[6] / test tone ui[7] were cut for 2x2 area)
 
   wire [15:0] s0 = sample_in;
 
@@ -530,11 +533,13 @@ module tt_um_tmcdonagh_guitar_pedal #(
   //   rd  = (ok && filled) ? rdata : 0           (the previous frame's
   //         read; ok is high for every frame >= 17: the probe
   //         completes mid-frame 16, the first write is frame 17's)
-  //   lp += (rd - lp) >>> 2                      (16-bit state)
+  //   lp += (rd - lp) >>> 1                      (16-bit state; Rev B6
+  //         alpha 1/2, corner ~5.3 kHz at 48 kHz, was >>> 2 ~2.2 kHz)
   // fb (feedback, the repeats): en[4] ? sat16(cs + mixv) : cs with
   //   mixv = (lp >>> 2) + (lp >>> 3) + (lp >>> 6)  (*prov* ~0.39)
   // out (step 12, Rev B5, what is heard): en[4] ? sat16(cs + lvl) : cs,
-  //   lvl = K2 present ? (lp * value2) >>> 8 (0 .. ~1.0) : mixv (B4)
+  //   lvl = K2 present ? (lp * value2) >>> 7 (Rev B6: 0 .. ~1.99, K2 128
+  //         = unity; 17-bit signed) : lp (unity, Rev B6)
   // w (for the go) = quant12(fb): |fb| with the low 4 bits cleared,
   //   sign reapplied; registered at the step-12 advance, stable through
   //   the transaction (the engine reads wdata bit by bit).
@@ -547,17 +552,20 @@ module tt_um_tmcdonagh_guitar_pedal #(
   localparam [14:0] DLY_ABSENT = 15'd16800;   // *prov* 350 ms
   reg  [14:0] dly_len;         // echo delay in frames (slews toward tgt)
   reg  [14:0] dly_widx;        // ring write index (mod 32768)
-  reg  [15:0] dly_fill;        // writes since ok rose
   reg         dly_filled;
   reg  [15:0] dly_w;           // the write word (stable through the go)
-  reg  [8:0]  dly_fc;          // frames since reset, saturating at 511 (the EN_SETTLE gate)
+  // the EN_SETTLE gate (Rev B6 area: two flags off the debounce divider,
+  // was a 9-bit saturating frame count): dly_w1 sets at sample_valid 256
+  // (deb_div 0), dly_set at sample_valid 511 (deb_div 255 after the wrap)
+  // -- the same edge the old count reached 511
+  reg         dly_w1, dly_set;
   reg         dly_pend;        // a write was accepted at the last chain_done
   reg         ok_q;            // ok one clk ago (rising-edge detect)
 
   wire [9:0]  k4_q   = {3'b000, k4_value[5:0]} + 10'd64;
   wire [9:0]  k4_sh  = k4_q << k4_value[7:6];
   wire [14:0] k4_tgt = ({5'b00000, k4_sh} << 5) - ({5'b00000, k4_sh} << 2);
-  wire [14:0] dly_tgt = (&dly_fc) ? (k4_present ? k4_tgt : DLY_ABSENT)
+  wire [14:0] dly_tgt = dly_set ? (k4_present ? k4_tgt : DLY_ABSENT)
                                             : DLY_ABSENT;
   wire signed [15:0] dly_diff = $signed({1'b0, dly_tgt}) - $signed({1'b0, dly_len});
   wire signed [15:0] spi_rdata;                        // the engine's read word
@@ -566,7 +574,7 @@ module tt_um_tmcdonagh_guitar_pedal #(
   // truncates the parenthesized 16-bit subexpression under the shift)
   wire signed [16:0] dly_rd17  = {dly_rd[15], dly_rd};  // sign-extended
   wire signed [16:0] dly_lp17  = {dly_lp[15], dly_lp};
-  wire signed [16:0] dly_lstep = (dly_rd17 - dly_lp17) >>> 2;
+  wire signed [16:0] dly_lstep = (dly_rd17 - dly_lp17) >>> 1;   // Rev B6: alpha 1/2 (~5.3 kHz)
   /* verilator lint_off UNUSEDSIGNAL */  // [16] duplicates the sign of [15] (the sum stays between rd and lp)
   wire signed [16:0] dly_lp_nx = dly_lp17 + dly_lstep;   // stays 16-bit (between rd and lp)
   /* verilator lint_on UNUSEDSIGNAL */
@@ -583,14 +591,16 @@ module tt_um_tmcdonagh_guitar_pedal #(
   wire [15:0] dly_sat = dly_ovf ? (dly_sum[16] ? 16'h8000 : 16'h7FFF) : dly_sum[15:0];
   // dly_fb: the ring feedback (B4's fixed ~0.39 mix: the repeats).
   wire [15:0] dly_fb = en[4] ? dly_sat : cs;
-  // Rev B5 echo level (K2, step 12 through the shared multiplier): what
-  // is heard = sat16(cs + ((lp * value2) >>> 8)); K2 absent -> the B4
-  // mix. |lp * value2| < 2^23, so p[23:8] holds it; dly_lp only changes
-  // on the sample_valid edge, so it is stable through step 12.
-  wire signed [15:0] dly_lvl   = k2_present ? mul_p[23:8] : dly_mixv;
-  wire signed [16:0] dly_psum  = dly_cs17 + {dly_lvl[15], dly_lvl};
-  wire        dly_povf = (dly_psum[16] != dly_psum[15]);
-  wire [15:0] dly_out = en[4] ? (dly_povf ? (dly_psum[16] ? 16'h8000 : 16'h7FFF) : dly_psum[15:0])
+  // Echo level (K2, step 12 through the shared multiplier; Rev B6 0 ..
+  // ~2x): what is heard = sat16(cs + ((lp * value2) >>> 7)); K2 absent ->
+  // unity (lp, = K2 128; Rev B6, was the B4 ~0.39 mix). |lp * value2| < 2^23, so p[23:7] holds it as a 17-bit
+  // signed level (up to +-65280); the sum runs at 18 bits, then sat16.
+  // dly_lp only changes on the sample_valid edge, so it is stable
+  // through step 12.
+  wire signed [16:0] dly_lvl   = k2_present ? mul_p[23:7] : {dly_lp[15], dly_lp};   // absent: unity (Rev B6)
+  wire signed [17:0] dly_psum  = {dly_cs17[16], dly_cs17} + {dly_lvl[16], dly_lvl};
+  wire        dly_povf = (dly_psum[17:15] != 3'b000) && (dly_psum[17:15] != 3'b111);
+  wire [15:0] dly_out = en[4] ? (dly_povf ? (dly_psum[17] ? 16'h8000 : 16'h7FFF) : dly_psum[15:0])
                               : cs;
 
   // Freeze (Rev B3 final, en[5] = ui[5]): the write word is quant12 of
@@ -608,21 +618,22 @@ module tt_um_tmcdonagh_guitar_pedal #(
   always @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       dly_len <= DLY_ABSENT; dly_widx <= 15'd0; dly_lp <= 16'sd0;
-      dly_fill <= 16'd0; dly_filled <= 1'b0;
-      dly_fc <= 9'd0; dly_pend <= 1'b0; ok_q <= 1'b0;
+      dly_filled <= 1'b0;
+      dly_w1 <= 1'b0; dly_set <= 1'b0; dly_pend <= 1'b0; ok_q <= 1'b0;
     end else begin
       ok_q <= spi_ok;
-      if (spi_ok && !ok_q) begin           // ok rising: (re)start the fill
-        dly_fill  <= 16'd0;
-        dly_filled <= 1'b0;
-      end
+      // Rev B6 area: the fill count IS the write index (widx counts the
+      // writes since ok rose: it restarts at the ok rising edge below, so
+      // a re-detected chip refills from address 0; was a separate 16-bit
+      // dly_fill). widx == FILL_FRAMES - 1 at a go = the FILL_FRAMES-th
+      // write.
       if (chain_done && spi_ok) begin      // the go is accepted: one write
-        dly_fill <= dly_fill + 16'd1;
-        if (dly_fill == FILL_FRAMES - 1) dly_filled <= 1'b1;
+        if ({1'b0, dly_widx} == FILL_FRAMES - 1) dly_filled <= 1'b1;
         dly_pend <= 1'b1;
       end
       if (sample_valid) begin
-        if (!(&dly_fc)) dly_fc <= dly_fc + 9'd1;   // saturate: never wraps back under EN_SETTLE
+        if (deb_div == 8'd0)            dly_w1  <= 1'b1;
+        if (dly_w1 && deb_div == 8'hFF) dly_set <= 1'b1;
         // the delay time holds while frozen (en[5]): a K4 move would
         // otherwise re-slew the read pointer through a ring that only
         // recirculates, smearing the loop into one held word
@@ -636,6 +647,10 @@ module tt_um_tmcdonagh_guitar_pedal #(
           dly_pend <= 1'b0;
         end
       end
+      if (spi_ok && !ok_q) begin           // ok rising: (re)start the fill (last: wins)
+        dly_widx   <= 15'd0;
+        dly_filled <= 1'b0;
+      end
     end
   end
 
@@ -643,14 +658,45 @@ module tt_um_tmcdonagh_guitar_pedal #(
   always @(posedge clk or negedge rst_n)
     if (!rst_n) en5_q <= 1'b0;
     else        en5_q <= en[4];
+
+  // Rev B6 auto-reprobe: while the delay is on and no chip is detected,
+  // rerun the probe every RP_TICKS debounce ticks (32 x 256 = 8192 frames
+  // = 0.17 s at 48 kHz), 16 times after reset or a delay-on edge (~2.7 s),
+  // so a PSRAM whose rail comes up late is found without a DIP toggle and
+  // a board with no PSRAM goes quiet (no SPI ticking near the audio).
+  // rp_n counts the ticks spent waiting (en[4] & ~ok) and restarts at
+  // every delay-on edge; retry k fires on the tick that ends its RP_TICKS
+  // span. The pulse sits on the deb_tick (= sample_strobe) clk, like the
+  // edge reprobe (never at chain_done).
+  localparam integer RP_M_I   = RP_TICKS - 1;
+  localparam integer RP_END_I = 16 * RP_TICKS - 1;
+  localparam [8:0]   RP_M     = RP_M_I[8:0];     // tick-in-span mask
+  localparam [8:0]   RP_END   = RP_END_I[8:0];   // the 16th retry's tick
+  wire       dly_edge = en[4] & ~en5_q;
+  reg  [8:0] rp_n;       // ticks waited in this window
+  reg        rp_done;    // all 16 retries spent
+  wire       rp_wait  = deb_tick & en[4] & ~spi_ok & ~rp_done;
+  wire       rp_due   = rp_wait & ((rp_n & RP_M) == RP_M);
+  always @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      rp_n <= 9'd0; rp_done <= 1'b0;
+    end else if (dly_edge) begin
+      rp_n <= 9'd0; rp_done <= 1'b0;
+    end else if (rp_wait) begin
+      rp_n <= rp_n + 9'd1;
+      if (rp_n == RP_END) rp_done <= 1'b1;
+    end
+  end
+
   psram_spi psram (.clk(clk), .rst_n(rst_n),
                    .go(chain_done & spi_ok), .hold(1'b0),
                    .wdata(dly_w),
                    .waddr_w(dly_widx),
                    .raddr_w(dly_widx + 15'd1 - dly_len),
-                   // the delay-on edge reprobes only while no chip is detected
-                   // (Rev B3 final): a working chip keeps its ring + filled
-                   .miso(uio_in[7]), .reprobe(en[4] & ~en5_q & ~spi_ok),
+                   // the delay-on edge (Rev B3 final) and the auto-reprobe
+                   // (Rev B6) reprobe only while no chip is detected: a
+                   // working chip keeps its ring + filled
+                   .miso(uio_in[7]), .reprobe((dly_edge | rp_due) & ~spi_ok),
                    .sck(spi_sck), .cs_n(spi_cs_n), .mosi(spi_mosi),
                    .rdata(spi_rdata), .ok(spi_ok), .busy(spi_busy));
 

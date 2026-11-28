@@ -15,7 +15,6 @@ import math
 # en bits = debounced ui_in[5:0] (Rev B3 final, switches in chain order)
 EN_COMP, EN_DIST, EN_PHASER, EN_TREM, EN_DELAY, EN_FREEZE = 1, 2, 4, 8, 16, 32
 
-
 def sat16(v):
     return max(-32768, min(32767, v))
 
@@ -311,6 +310,12 @@ def quant12(w):
     return -m if w < 0 else m
 
 
+def echo_level(lp, k2v):
+    """Rev B6 echo level heard at K2 = k2v: (lp * k2v) >> 7, 0 .. ~1.99x
+    (K2 128 = unity, B5's full-up level). 17-bit signed (|lp * 255| < 2^23)."""
+    return (lp * k2v) >> 7
+
+
 class Delay:
     """The delay stage's per-frame state (dly, lp, the ring write index,
     the fill counter). step() is one frame in the golden order above."""
@@ -327,6 +332,7 @@ class Delay:
         self.fill_cnt = 0
         self.filled = False
         self.rd_prev = 0
+        self.w = None
         self.f = 0
         self.fill = fill
         self.psram = psram
@@ -350,10 +356,11 @@ class Delay:
         and no new audio enters — instead of quant12(out). Independent of
         the delay enable en5 (a loop frozen while bypassed plays when the
         delay comes back on); rd is 0 before `filled`, so freezing an
-        unfilled ring holds silence. k2v (Rev B5, the steady K2 value or
-        None = absent) sets only what is heard: out = sat16(x + ((lp *
-        k2v) >> 8)); the ring still takes B4's sat16(x + mixv), so the
-        repeats stay fixed at ~0.39."""
+        unfilled ring holds silence. k2v (the steady K2 value or None =
+        absent) sets only what is heard: out = sat16(x + echo_level(lp,
+        k2v)) (Rev B6: 0 .. ~2x; absent = unity, lp); the ring still takes B4's sat16(x +
+        mixv), so the repeats stay fixed at ~0.39. self.w = the ring write
+        word (None on a frame with no write)."""
         f = self.f
         self.f += 1
         ok = self.psram and f >= 17
@@ -366,13 +373,16 @@ class Delay:
             elif self.dly > tgt:
                 self.dly -= 1
         rd = self.rd_prev if (ok and self.filled) else 0
-        self.lp += (rd - self.lp) >> 2
+        self.lp += (rd - self.lp) >> 1      # Rev B6: alpha 1/2 (corner ~5.3 kHz at 48 kHz)
         mixv = (self.lp >> 2) + (self.lp >> 3) + (self.lp >> 6)
         fb = sat16(x + mixv) if en5 else x
-        out = sat16(x + ((self.lp * k2v) >> 8)) if (en5 and k2v is not None) else fb
+        # Rev B6: K2 absent -> unity level (lp), the same as K2 = 128
+        lvl = self.lp if k2v is None else echo_level(self.lp, k2v)
+        out = sat16(x + lvl) if en5 else x
+        self.w = None
         if ok:
             a = self.widx
-            self.ring[a] = quant12(rd if freeze else fb)
+            self.w = self.ring[a] = quant12(rd if freeze else fb)
             self.rd_prev = self.ring[(a + 1 - self.dly) % 32768]
             self.widx = (a + 1) % 32768
             self.fill_cnt += 1

@@ -66,15 +66,20 @@ through bit-exactly:
 - **Delay** (`ui[4]`, needs the PSRAM Pmod): a PT2399-style echo. Every
   frame the chip writes the output (with 12 bits of magnitude) into a
   32768-word ring in an external SPI PSRAM and reads the word written
-  `dly` frames earlier. The echo is low-passed (it darkens a little on each
-  repeat). What you hear is the dry signal plus the echo at a level set by
-  K2 (none to about 1.0, unity; about 0.39 with no K2 fitted). What is
+  `dly` frames earlier. The echo is low-passed (corner about 5.3 kHz, so
+  it darkens a little on each repeat). What you hear is the dry signal plus
+  the echo at a level set by K2: none to about 2x, so the top half of the
+  knob puts the echo above the dry signal (noon is unity, and so is no K2
+  fitted). What is
   written back is the dry signal plus the echo at a fixed 0.39, so the
   echo repeats and fades at the same rate whatever the level knob says. K4 sets the time from about 37
   ms to 593 ms (350 ms with no K4 fitted); a knob change glides the time
   (one frame per frame, a tape-like pitch bend). The echo starts once the
   ring has been filled (about 0.7 s after power-up). With no PSRAM fitted
-  the delay is a clean pass-through.
+  the delay is a clean pass-through. While the delay is on and no PSRAM is
+  detected, the chip retries the probe every 0.17 s, up to 16 times (about
+  2.7 s) after power-up or each time the delay is switched on, so a PSRAM
+  whose supply comes up late is still found.
 - **Freeze** (`ui[5]`): while on, the delay ring stops taking new audio and
   writes back exactly what it reads, so the current echo loops forever,
   unchanged (no further darkening or fading), under the dry signal. Freeze
@@ -123,10 +128,11 @@ Pmod's flash chip select (CS0) to keep the flash deselected.
 
 **PSRAM status LED.** `uo[5]` (segment f on the demoboard) is **1** while
 the PSRAM is detected: it lights about 16 frames after reset once the probe
-passes, and stays dark with no chip, a chip that fails the probe, or a
-chip that was not powered at reset. If the delay is silent, check this
-first: dark means flip the delay switch (`ui[4]`) off and on to reprobe,
-then check the Pmod wiring and its 3.3 V supply.
+passes, and stays dark with no chip or a chip that fails the probe. With
+the delay on, a missing chip is retried every 0.17 s for about 2.7 s; if
+the LED is still dark after that, flip the delay switch (`ui[4]`) off and
+on to start another round, then check the Pmod wiring and its 3.3 V
+supply.
 
 ## Signal table
 
@@ -166,7 +172,7 @@ while discharging their capacitor, inputs otherwise.
 | Knob | Pin | Absent | Effect of raw value v (0..255) |
 |---|---|---|---|
 | K1 | uio[2] | corner ~2.2 kHz | tone shift kt = 4 - v[7:6], alpha = 2^-kt, corner = -ln(1-alpha) x 48000 / 2pi: kt 4 ~490 Hz, kt 3 ~1.0 kHz, kt 2 ~2.2 kHz, kt 1 ~5.3 kHz (low to high v) |
-| K2 | uio[3] | echo ~0.39, trem depth 75% | echo level = v / 256 (0 .. ~1.0, heard only; the repeats stay at ~0.39); trem gain = 256 - ((tri x v) >> 8), tri 0..255 (depth 0 .. ~100%) |
+| K2 | uio[3] | echo unity, trem depth 75% | echo level = v / 128 (0 .. ~2.0, 128 = unity, heard only; the repeats stay at ~0.39); trem gain = 256 - ((tri x v) >> 8), tri 0..255 (depth 0 .. ~100%) |
 | K3 | uio[4] | trem ~5 Hz, phaser ~1.0 Hz | trem + phaser rate: inc = (64 + v[5:0]) << v[7:6]; f = inc x 48000 / 2^22 = 0.73 .. 11.6 Hz |
 | K4 | uio[5] | 350 ms | delay time = ((64 + v[5:0]) << v[7:6]) x 28 frames = 1792 .. 28448 frames (37 .. 593 ms) |
 

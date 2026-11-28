@@ -170,7 +170,7 @@ module tb_audio_gl;
     dummy = $value$plusargs("K4=%d", k4v);
     dummy = $value$plusargs("PSRAM=%d", psram_en);
     // Rev B3 2x2 pivot: ui[7] = PSRAM MISO (model wired in Task 22);
-    ui_in[5:0] = en_dip[5:0];   // Rev B3 final: ui[5:0] = the DIP enables, chain order
+    ui_in = en_dip[7:0];   // Rev B6: ui[5:0] = the DIP enables (chain order), ui[6] trails, ui[7] test tone
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
@@ -191,8 +191,8 @@ module tb_audio_gl;
     // capture at the end of iteration i (for i ≥ 1) yields log line
     // i−1 = effect of input i−1 — identical alignment to the RTL log.
     for (i = 0; i < n_samples + 1; i = i + 1) begin
-      if (i == at2) ui_in[5:0] = en2[5:0];
-      if (i == at3) ui_in[5:0] = en3[5:0];
+      if (i == at2) ui_in = en2[7:0];
+      if (i == at3) ui_in = en3[7:0];
       word = (i < n_samples) ? mem[i] : 16'h0000;
       // drive one frame's left half: 32 slots x 8 clk, I2S data on ui[0];
       // reassemble the DAC sample from uo_out[3], slots 1..16, mid-slot

@@ -92,7 +92,7 @@ CHECK_MODES = [(name, en, None, None, None, None) for name, en in LISTEN_MODES] 
     ("delay_k4hi",   0x10, None, None, None, 255,  1),  # dly 28448 (~593 ms)
     ("delay_nopsram", 0x10, None, None, None, None, 0),  # no chip: ok = 0, dry
     ("delay_k2lo",   0x10, None, 0,    None, None, 1),  # Rev B5 level 0: dry heard, ring still fills
-    ("delay_k2hi",   0x10, None, 255,  None, None, 1),  # Rev B5 level ~1.0, repeats fixed ~0.39
+    ("delay_k2hi",   0x10, None, 255,  None, None, 1),  # Rev B6 level ~2.0, repeats fixed ~0.39
     ("distdelay",    0x12, None, None, None, None, 1),  # dist into the delay
     # the freeze modes (Rev B3 final): ui[5] holds the ring (write word =
     # the word just read); switch changes at input frames 96000 / 192000

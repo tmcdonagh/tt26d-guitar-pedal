@@ -178,7 +178,7 @@ module tb_audio;
     // Rev B3 2x2 pivot: the octave switch is gone; ui[7] is the PSRAM MISO
     // (the psram_model is wired here in Task 22).
     // (en[5] = delay enable on ui[6]).
-    ui_in[5:0] = en_dip[5:0];   // Rev B3 final: ui[5:0] = the DIP enables, chain order
+    ui_in = en_dip[7:0];   // Rev B6: ui[5:0] = the DIP enables (chain order), ui[6] trails, ui[7] test tone
 
     // samples go to stdout (captured per-mode by the .log file) — $fopen
     // with a string filename is not portable across Verilator/Icarus
@@ -195,8 +195,8 @@ module tb_audio;
     rst_n = 1'b1;
 
     for (i = 0; i < n_samples; i = i + 1) begin
-      if (i == at2) ui_in[5:0] = en2[5:0];
-      if (i == at3) ui_in[5:0] = en3[5:0];
+      if (i == at2) ui_in = en2[7:0];
+      if (i == at3) ui_in = en3[7:0];
       word = mem[i];
       if (i == EN_SETTLE - 1) begin
         k1_ref  = dut.k1_value;

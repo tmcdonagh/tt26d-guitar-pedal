@@ -1892,7 +1892,8 @@ async def test_psram_absent(dut):
     """No PSRAM: uio[7] (the MISO) is just the tb's drive level, so the
     probe reads 0x0000 (low) or 0xFFFF (high) and fails with both phases:
     ok = 0, no go traffic. With the delay switch (ui[4]) on, the debounced en[4] rises at
-    the debounce (strobe 512) and reprobes once, which fails again.
+    the debounce (strobe 512) and reprobes, which fails again; Rev B6
+    then retries 16 times (test_psram_auto_reprobe pins the spacing).
     CE# then stays high."""
     try:
         for sw in (0, 1):
@@ -1910,6 +1911,10 @@ async def test_psram_absent(dut):
                 assert more, "en[4] rising must reprobe"
                 assert [_key(t) for t in more[-6:]] == want[-6:], f"reprobe {mon.summary(more)}"
                 assert not [t for t in more if t["n"] == 48 and t["addr"] < 0x010000], "go traffic"
+            if sw and _reprobe_frames(dut) == 256:
+                # Rev B6: the delay-on edge opens a 16-retry auto-reprobe
+                # window (256-frame spacing on RTL runs); quiet after it
+                await ClockCycles(dut.clk, 17 * 256 * 512)
             n = len(mon.txns)
             await ClockCycles(dut.clk, 100 * 512)
             assert len(mon.txns) == n and int(dut.uo_out.value) >> 1 & 1, \
@@ -1946,6 +1951,51 @@ async def test_psram_status_pin(dut):
         for f in range(30):
             await ClockCycles(dut.clk, 512)
             assert int(dut.uo_out[5].value) == 0, f"uo[5] high with no PSRAM (MISO {miso}), frame {f + 1}"
+
+
+def _reprobe_frames(dut):
+    """The auto-reprobe spacing in frames: 256 x the RTL RP_TICKS parameter
+    (tb.v: 1 on RTL runs -> 256; the flat GL netlist keeps 32 -> 8192)."""
+    if _probe(dut, "dly_len") is None:
+        return 8192
+    return 256 * int(dut.RP_TICKS.value)
+
+
+@cocotb.test()
+async def test_psram_auto_reprobe(dut):
+    """Rev B6 auto-reprobe: while the delay is on and no chip is detected,
+    the probe reruns every REPROBE_FRAMES frames, at most 16 times after
+    reset / each delay-on edge (a late PSRAM rail is picked up without a
+    DIP toggle, and a board with no PSRAM goes quiet after the window).
+    No chip, delay on from reset (MISO low): probes at frame 16 (reset),
+    at the delay-on debounce, then 16 retries spaced exactly
+    REPROBE_FRAMES apart, then none. Then a chip fitted late (after the
+    delay-on edge): the next retry finds it, uo[5] rises, go traffic runs.
+    RTL: RP_TICKS 1 (tb.v) -> 256 frames; GL: 8192, the late-chip part only."""
+    rf = _reprobe_frames(dut)
+    frame_ps = 512 * CLK_PERIOD_PS
+    try:
+        if rf == 256:
+            mon, t_rst = await psram_start(dut, ui=EN_DELAY, present=False)
+            await ClockCycles(dut.clk, (600 + 18 * rf + 300) * 512)
+            starts = [round((t["t0"] - t_rst) / frame_ps) for t in mon.txns if t["cmd"] == 0x66]
+            assert len(starts) == 18, f"probe starts (frames) {starts}"
+            gaps = [b - a for a, b in zip(starts[1:], starts[2:])]
+            assert all(abs(g - rf) <= 1 for g in gaps), f"retry spacing {gaps} != {rf}"
+            assert not [t for t in mon.txns if t["n"] == 48 and t["addr"] < 0x010000], "go traffic"
+            assert int(dut.uo_out[5].value) == 0
+            _check_bus(dut, mon)
+        # late chip: absent through reset and the delay-on edge, fitted at frame 600
+        mon, t_rst = await psram_start(dut, ui=EN_DELAY, present=False, uio=0)
+        await ClockCycles(dut.clk, 600 * 512)
+        assert int(dut.uo_out[5].value) == 0, "uo[5] high with no chip"
+        dut.psram_en.value = 1
+        await ClockCycles(dut.clk, (rf + 40) * 512)
+        assert int(dut.uo_out[5].value) == 1, f"late chip not found within {rf + 40} frames"
+        await ClockCycles(dut.clk, 4 * 512)
+        assert _go_pairs(mon.txns), "no go traffic after the late chip was found"
+    finally:
+        psram_off(dut)
 
 
 @cocotb.test()
@@ -2089,7 +2139,7 @@ async def _delay_hist(dut, hist, xs, compare=True):
     outs = await fast_frames(dut, xs)
     hist.xs += list(xs)
     want = golden_model.render(hist.xs, hist.en, k2=hist.k2, k4=hist.k4,
-                               fill=hist.fill, psram=hist.psram)
+                               fill=hist.fill, psram=hist.psram, sched=hist.sched)
     for j, o in enumerate(outs if compare else []):
         assert o == want[base - 1 + j], \
             f"frame {base - 1 + j}: out {o} != golden {want[base - 1 + j]}"
@@ -2103,6 +2153,12 @@ class DelayHist:
     def __init__(self, en, k4=None, fill=32768, psram=True, k2=None):
         self.en, self.k4, self.fill, self.psram, self.k2 = en, k4, fill, psram, k2
         self.xs = [0] * START_FRAME
+        self.sched = []     # ((input frame, en), ..): switch changes made mid-run
+
+    def switch(self, dut, en):
+        """Set the DIPs to en before the next driven frame (golden sched)."""
+        dut.ui_in.value = en
+        self.sched.append((len(self.xs), en))
 
 
 async def _dly_w_frames(dut, hist, xs):
@@ -2118,20 +2174,26 @@ async def _dly_w_frames(dut, hist, xs):
 
 @cocotb.test()
 async def test_echo_level(dut):
-    """Rev B5: K2 sets the echo level, out = sat16(dry + ((lp * v2) >> 8))
-    (K2 absent: B4's ~0.39 mix). Needs make -B FILL_FRAMES=64: the ring is
+    """Rev B6: K2 sets the echo level, out = sat16(dry + ((lp * v2) >> 7)),
+    0 .. ~2x, K2 128 = unity (K2 absent: unity too, Rev B6). Needs make -B FILL_FRAMES=64: the ring is
     then `filled` at frame ~81 and every read returns the PSRAM model's
     full-scale LFSR fill (dly is ~16800, nothing written that far back),
     so lp is busy every frame. Per K2 in (0, 128, 255, absent), fresh
     reset: 200 zero frames then a +-32767 square (100 frames): every word
     == golden; K2 = 0 -> output == dry exactly; and (golden) the K2 = 255
-    echo is >= 2.4x louder than the absent one; no wrap at the rails."""
+    echo is >= 1.8x the K2 = 128 one (2x, less the rail clipping) and K2
+    absent is word-for-word the K2 = 128 output (unity); no wrap at the
+    rails. The level
+    formula itself is pinned first (runs in every suite mode)."""
+    assert golden_model.echo_level(10000, 128) == 10000, "K2 128 must be unity"
+    assert golden_model.echo_level(10000, 255) == 19921, "K2 255 must be ~1.99x"
+    assert golden_model.echo_level(-32768, 255) == -65280, "17-bit level at the rail"
     kp2 = knob_pin(dut, 1, None)
     try:
         dut.psram_en.value = 1
         dut.psram_so_dly_ps.value = 0
         fill = None
-        sums = {}
+        sums, runs = {}, {}
         sq = [32767 if (i // 10) % 2 == 0 else -32767 for i in range(100)]
         for i, v in enumerate((0, 128, 255, None)):
             kp2.v = v
@@ -2148,7 +2210,9 @@ async def test_echo_level(dut):
                 assert any(echo), f"K2 {v}: no echo (lp never moved)"
             assert all(-32768 <= o <= 32767 for o in outs)
             sums[v] = sum(abs(o) for o in echo)
-        assert sums[255] >= 2.4 * sums[None], f"level 255 vs absent {sums}"
+            runs[v] = outs
+        assert runs[None] == runs[128], "K2 absent must play the echo at unity (= K2 128)"
+        assert sums[255] >= 1.8 * sums[128], f"level 255 vs 128 {sums}"
     finally:
         kp2.v = None                # leave K2 absent for later tests
         dut.psram_en.value = 0       # and the PSRAM unfitted (the tb default)
@@ -2301,7 +2365,7 @@ async def test_all_dips_on(dut):
     data source shares a ui pin, so the switches cannot fight anything:
     the PSRAM still probes OK and every frame equals the golden chain
     with all six enables (comp, dist, phaser, trem, delay, freeze) in
-    force, ui[7:6] ignored."""
+    force, ui[7:6] ignored (Rev B6's trails / test tone were cut)."""
     dut.psram_en.value = 1
     dut.psram_so_dly_ps.value = 0
     try:
@@ -2309,7 +2373,7 @@ async def test_all_dips_on(dut):
         ok = _ok(dut)
         assert ok in (None, 1), "PSRAM must probe OK with every DIP on"
         fill = _fill_param(dut)
-        hist = DelayHist(0x3F, fill=32768 if fill is None else fill)
+        hist = DelayHist(0xFF, fill=32768 if fill is None else fill)
         xs = [(i * 2731) % 40000 - 20000 for i in range(64)]
         await _delay_hist(dut, hist, xs)
         assert int(dut.psram_err.value) == 0, "PSRAM protocol error with every DIP on"
